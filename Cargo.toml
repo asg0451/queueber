@@ -1,0 +1,11 @@
+[package]
+name = "queueber"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+capnp = "0.21.4"
+color-eyre = "0.6.5"
+
+[build-dependencies]
+capnpc = "0.21.2"
