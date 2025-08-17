@@ -17,6 +17,9 @@ use crate::protocol;
 const AVAILABLE_PREFIX: &[u8] = b"available/";
 const IN_PROGRESS_PREFIX: &[u8] = b"in_progress/";
 const VISIBILITY_INDEX_PREFIX: &[u8] = b"visibility_index/";
+const LEASE_PREFIX: &[u8] = b"leases/";
+
+// TODO: should these keys be capnproto structs themselves instead of just byte arrays? like maybe..
 
 pub struct Storage {
     db: DB,
@@ -38,7 +41,9 @@ impl Storage {
         &self,
         (id, item): (&'i [u8], protocol::item::Reader<'i>),
     ) -> Result<()> {
-        let (main_key, visibility_index_key) = make_keys(id, item, AVAILABLE_PREFIX)?;
+        let main_key = make_main_key(id, AVAILABLE_PREFIX)?;
+        let visibility_index_key =
+            make_visibility_index_key(id, item.get_visibility_timeout_secs())?;
 
         // make stored item to insert
         let mut simsg = message::Builder::new_default();
@@ -97,14 +102,20 @@ impl Storage {
 
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
+        let lease_key = make_lease_key(&lease);
+        let mut lease_entry = message::Builder::new_default();
+        let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
+        let mut lease_entry_keys = lease_entry_builder.init_keys(n as _);
 
         let mut polled_items = Vec::with_capacity(n);
 
-        for kv in iter {
-            let (_idx_key, main_key) = kv?;
+        let mut in_progress_batch = WriteBatchWithTransaction::<false>::default();
+
+        for (i, kv) in iter.enumerate() {
+            let (idx_key, main_key) = kv?;
 
             debug_assert_eq!(
-                &_idx_key[..VISIBILITY_INDEX_PREFIX.len()],
+                &idx_key[..VISIBILITY_INDEX_PREFIX.len()],
                 VISIBILITY_INDEX_PREFIX
             );
 
@@ -136,9 +147,27 @@ impl Storage {
             polled_item.set_contents(stored_item.get_contents()?);
             polled_item.set_id(stored_item.get_id()?);
             let polled_item = builder.into_typed().into_reader();
-
             polled_items.push(polled_item);
+
+            // move the item to in progress
+            let new_main_key = make_main_key(stored_item.get_id()?, IN_PROGRESS_PREFIX)?;
+            in_progress_batch.delete(&main_key);
+            in_progress_batch.put(&new_main_key, &main_value);
+
+            // remove the visibility index entry
+            in_progress_batch.delete(&idx_key);
+
+            // add the lease entry key
+            lease_entry_keys.set(i as _, &main_key[AVAILABLE_PREFIX.len()..]);
+            // TODO: ^ is a good example of why we should use capnproto structs for keys
         }
+
+        // add the lease to the lease set
+        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
+        serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
+        in_progress_batch.put(&lease_key, &lease_entry_bs);
+
+        self.db.write(in_progress_batch)?;
 
         Ok((lease, polled_items))
     }
@@ -149,40 +178,47 @@ type Lease = [u8; 16];
 
 // TODO: is there a way to do this without allocating / with an arena or smth? i'd like to avoid allocating in the hot path
 // returns (main key, visibility index key)
-fn make_keys<'i>(
-    id: &'i [u8],
-    item: protocol::item::Reader<'i>,
-    main_prefix: &'static [u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let vts = item.get_visibility_timeout_secs();
-
-    // TODO: use a mockable clock
-    let now = std::time::SystemTime::now();
-    let visible_ts_bs = (now + std::time::Duration::from_secs(vts))
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs()
-        .to_le_bytes();
-
+fn make_main_key<'i>(id: &'i [u8], main_prefix: &'static [u8]) -> Result<Vec<u8>> {
     let mut main_key = Vec::with_capacity(main_prefix.len() + id.len());
     main_key.extend_from_slice(main_prefix);
     main_key.extend_from_slice(id);
 
+    Ok(main_key)
+}
+
+fn make_visibility_index_key<'i>(id: &'i [u8], visibility_timeout_secs: u64) -> Result<Vec<u8>> {
+    // TODO: use a mockable clock
+    let now = std::time::SystemTime::now();
+    let visible_ts_bs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        .to_le_bytes();
+
     let mut visibility_index_key =
-        Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + visible_ts_bs.len());
+        Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + visible_ts_bs.len() + 1 + id.len());
     visibility_index_key.extend_from_slice(VISIBILITY_INDEX_PREFIX);
     visibility_index_key.extend_from_slice(&visible_ts_bs);
+    visibility_index_key.extend_from_slice(b"/");
+    visibility_index_key.extend_from_slice(id);
 
-    Ok((main_key, visibility_index_key))
+    Ok(visibility_index_key)
+}
+
+fn make_lease_key(lease: &Lease) -> Vec<u8> {
+    let mut lease_key = Vec::with_capacity(LEASE_PREFIX.len() + lease.len());
+    lease_key.extend_from_slice(LEASE_PREFIX);
+    lease_key.extend_from_slice(lease);
+    lease_key
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol;
-    use capnp::message::{Builder, HeapAllocator, Reader};
+    use capnp::message::{Builder, HeapAllocator};
 
     #[test]
-    fn e2e_test() -> Result<()> {
+    fn e2e_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .init();
@@ -199,6 +235,19 @@ mod tests {
         let si = entries[0].get()?;
         assert_eq!(si.get_id()?, b"42");
         assert_eq!(si.get_contents()?, b"hello");
+
+        // check lease
+        let lease_key = make_lease_key(&lease);
+        let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
+        let lease_entry = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get(0)?, b"42");
+
         Ok(())
     }
 

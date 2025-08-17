@@ -54,3 +54,7 @@ struct StoredItem {
     visibilityTsIndexKey @1 :Data;
     id @2 :Data;
 }
+
+struct LeaseEntry {
+    keys @0 :List(Data);
+}
