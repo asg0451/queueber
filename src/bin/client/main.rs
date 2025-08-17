@@ -3,7 +3,7 @@ use color_eyre::Result;
 
 use futures::AsyncReadExt;
 
-use queueber::protocol::queue;
+use queueber::protocol::{self, queue};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,13 +26,30 @@ async fn main() -> Result<()> {
 
             tokio::task::spawn_local(rpc_system);
 
+            let mut item_builder = capnp::message::Builder::new_default();
+            let mut item = item_builder.init_root::<protocol::item::Builder>();
+            item.set_contents(b"hello");
+            item.set_visibility_timeout_secs(10);
+            let an_item = item.into_reader();
+
             let mut request = queue_client.add_request();
-            request.get().init_req().set_contents(b"hello");
-            request.get().init_req().set_visibility_timeout_secs(10);
+            let req = request.get().init_req();
+            let mut items = req.get_items()?;
+            // the caveats are basically that if the schema version of the req is older than the schema version of the item, we'll lose the new data in the item.
+            // that doesnt sound realistic though.
+            items.set_with_caveats(0, an_item)?;
 
             let reply = request.send().promise.await?;
 
-            println!("received: {:?}", reply.get()?.get_resp()?.get_id());
+            println!(
+                "received: {:?}",
+                reply
+                    .get()?
+                    .get_resp()?
+                    .get_ids()?
+                    .iter()
+                    .collect::<Vec<_>>()
+            );
             Ok(())
         })
         .await

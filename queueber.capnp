@@ -5,16 +5,16 @@ $Rust.parentModule("protocol");
 
 
 struct AddRequest {
-    contents @0 :Data;
-    visibilityTimeoutSecs @1 :UInt64;
+    items @0 :List(Item);
 }
 
 struct AddResponse {
-    id @0 :Data;
+    ids @0 :List(Data);
 }
 
 struct RemoveRequest {
     id @0 :Data;
+    lease @1 :Data;
 }
 
 struct RemoveResponse {
@@ -22,21 +22,29 @@ struct RemoveResponse {
 }
 
 struct PollRequest {
-    visibilityTimeoutSecs @0 :UInt64;
+    leaseValiditySecs @0 :UInt64;
 }
 
 struct Item {
-    id @0 :Data;
-    contents @1 :Data;
-    visibilityTimeoutSecs @2 :UInt64;
+    contents @0 :Data;
+    # unset/ignored when adding
+    visibilityTimeoutSecs @1 :UInt64;
 }
 
 struct PollResponse {
     items @0 :List(Item);
+    lease @1 :Data;
 }
 
 interface Queue {
     add @00 (req :AddRequest) -> (resp :AddResponse);
     remove @01 (req :RemoveRequest) -> (resp :RemoveResponse);
     poll @02 (req :PollRequest) -> (resp :PollResponse);
+}
+
+
+# internal stuff (TODO: move to own file)
+struct StoredItem {
+    item @0 :Item;
+    visibilityTsIndexKey @1 :Data;
 }

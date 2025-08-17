@@ -1,11 +1,7 @@
-
 use capnp::capability::Promise;
 
 use crate::{
-    protocol::{
-        item,
-        queue::{AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults},
-    },
+    protocol::queue::{AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults},
     storage::Storage,
 };
 
@@ -22,45 +18,43 @@ impl Server {
 }
 
 impl crate::protocol::queue::Server for Server {
-    fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), ::capnp::Error> {
+    fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), capnp::Error> {
         let req = params.get()?.get_req()?;
-        let contents = req.get_contents()?;
-        let visibility_timeout_secs = req.get_visibility_timeout_secs();
+        // let contents = req.get_contents()?;
+        // let visibility_timeout_secs = req.get_visibility_timeout_secs();
 
-        let id = uuid::Uuid::now_v7();
-        let id = id.as_bytes();
+        let items = req.get_items()?;
 
-        // make an item
-        let mut message = capnp::message::Builder::new_default();
-        let mut item = message.init_root::<item::Builder>();
-        item.set_id(id);
-        item.set_contents(contents);
-        item.set_visibility_timeout_secs(visibility_timeout_secs);
-
-        let mut buf = Vec::new();
-        capnp::serialize_packed::write_message(&mut buf, &message)?;
+        let ids = items
+            .iter()
+            .map(|_| uuid::Uuid::now_v7().as_bytes().to_vec())
+            .collect::<Vec<_>>();
 
         self.storage
-            .put(id, &buf)
+            .add_available_items(ids.iter().map(AsRef::as_ref).zip(items.iter()))
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-        results.get().init_resp().set_id(id);
+        // build the response
+        let mut ids_builder = results.get().init_resp().get_ids()?;
+        for (i, id) in ids.iter().enumerate() {
+            ids_builder.set(i as u32, id);
+        }
 
         Promise::ok(())
     }
 
-    fn remove(&mut self, _: RemoveParams, _: RemoveResults) -> Promise<(), ::capnp::Error> {
-        Promise::err(::capnp::Error::unimplemented(
+    fn remove(&mut self, _: RemoveParams, _: RemoveResults) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
             "method queue::Server::remove not implemented".to_string(),
         ))
     }
 
-    fn poll(&mut self, _: PollParams, _: PollResults) -> Promise<(), ::capnp::Error> {
+    fn poll(&mut self, _: PollParams, _: PollResults) -> Promise<(), capnp::Error> {
         // Promise::from_future(req.send().promise.and_then(move |response| {
         //     results.get().set_y(response.get()?.get_y());
         //     Ok(())
         // }))
-        Promise::err(::capnp::Error::unimplemented(
+        Promise::err(capnp::Error::unimplemented(
             "method queue::Server::poll not implemented".to_string(),
         ))
     }

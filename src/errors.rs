@@ -10,6 +10,10 @@ pub enum Error {
     Other(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("rocksdb error: {0}")]
     Rocksdb(#[from] rocksdb::Error),
+    #[error("assertion failed: {0}")]
+    AssertionFailed(String),
+    #[error("system time error: {0}")]
+    SystemTime(#[from] std::time::SystemTimeError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
