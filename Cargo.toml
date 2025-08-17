@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-capnp = "0.21.4"
+capnp = { version = "0.21.4", features = ["rpc_try"] }
 capnp-rpc = "0.21.0"
 color-eyre = "0.6.5"
+futures = { version = "0.3.31", features = ["io-compat"] }
 thiserror = "2.0.15"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = { version = "0.7.16", features = ["compat", "full"] }
+tracing = { version = "0.1.41", features = ["async-await", "log"] }
 
 [build-dependencies]
 capnpc = "0.21.2"
