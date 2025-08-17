@@ -1,9 +1,9 @@
-use std::net::ToSocketAddrs;
+use std::{net::ToSocketAddrs, path::Path};
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use color_eyre::Result;
 use futures::AsyncReadExt;
-use queueber::server::Server;
+use queueber::{server::Server, storage::Storage};
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
 // for how to send stuff across threads; so we can parallelize the work..?
@@ -12,7 +12,8 @@ use queueber::server::Server;
 async fn main() -> Result<()> {
     let addr = "127.0.0.1:9090".to_socket_addrs()?.next().unwrap();
 
-    let server = Server::new();
+    let storage = Storage::new(Path::new("/tmp/queueber/data"))?;
+    let server = Server::new(storage);
 
     tokio::task::LocalSet::new()
         .run_until(async move {

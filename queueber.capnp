@@ -10,11 +10,11 @@ struct AddRequest {
 }
 
 struct AddResponse {
-    id @0 :UInt64;
+    id @0 :Data;
 }
 
 struct RemoveRequest {
-    id @0 :UInt64;
+    id @0 :Data;
 }
 
 struct RemoveResponse {
@@ -26,7 +26,7 @@ struct PollRequest {
 }
 
 struct Item {
-    id @0 :UInt64;
+    id @0 :Data;
     contents @1 :Data;
     visibilityTimeoutSecs @2 :UInt64;
 }

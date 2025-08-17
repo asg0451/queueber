@@ -8,6 +8,8 @@ pub enum Error {
     Capnp(#[from] capnp::Error),
     #[error("other error: {0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("rocksdb error: {0}")]
+    Rocksdb(#[from] rocksdb::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
