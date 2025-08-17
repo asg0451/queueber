@@ -1,5 +1,5 @@
 use capnp::message::{self, TypedReader};
-use capnp::{serialize, serialize_packed};
+use capnp::serialize_packed;
 use rocksdb::{DB, Options, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
@@ -44,6 +44,7 @@ impl Storage {
         let mut simsg = message::Builder::new_default();
         let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
         stored_item.set_contents(item.get_contents()?);
+        stored_item.set_id(id);
         stored_item.set_visibility_ts_index_key(&visibility_index_key);
         let mut contents = Vec::with_capacity(simsg.size_in_words() * 8); // TODO: reuse
         serialize_packed::write_message(&mut contents, &simsg)?;
@@ -52,6 +53,15 @@ impl Storage {
         batch.put(&main_key, &contents);
         batch.put(&visibility_index_key, &main_key);
         self.db.write(batch)?;
+
+        tracing::debug!(
+            "inserted item: ({}: {}), ({}: {})",
+            String::from_utf8_lossy(&main_key),
+            String::from_utf8_lossy(&contents),
+            String::from_utf8_lossy(&visibility_index_key),
+            String::from_utf8_lossy(&main_key)
+        );
+
         Ok(())
     }
 
@@ -92,6 +102,12 @@ impl Storage {
 
         for kv in iter {
             let (_idx_key, main_key) = kv?;
+
+            debug_assert_eq!(
+                &_idx_key[..VISIBILITY_INDEX_PREFIX.len()],
+                VISIBILITY_INDEX_PREFIX
+            );
+
             let main_value = self.db.get(&main_key)?.ok_or_else(|| {
                 Error::AssertionFailed(format!(
                     "database integrity violated: main key not found: {:?}",
@@ -105,12 +121,23 @@ impl Storage {
             )?;
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
+            debug_assert!(stored_item.get_id()?.len() > 0);
+            debug_assert_eq!(stored_item.get_id()?, &main_key[AVAILABLE_PREFIX.len()..]);
+
+            tracing::debug!(
+                "got stored item: {{id: {}, contents: {}}}",
+                String::from_utf8_lossy(&stored_item.get_id()?),
+                String::from_utf8_lossy(stored_item.get_contents()?)
+            );
+
             // build the polled item
             let mut builder = message::Builder::new_default(); // TODO: reduce allocs
             let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
             polled_item.set_contents(stored_item.get_contents()?);
             polled_item.set_id(stored_item.get_id()?);
-            polled_items.push(builder.into_typed().into_reader());
+            let polled_item = builder.into_typed().into_reader();
+
+            polled_items.push(polled_item);
         }
 
         Ok((lease, polled_items))
@@ -156,9 +183,13 @@ mod tests {
 
     #[test]
     fn e2e_test() -> Result<()> {
-        tracing_subscriber::fmt::init();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
 
-        let storage = Storage::new(Path::new("test_db")).unwrap();
+        let storage = Storage::new(Path::new("/tmp/queueber_test_db")).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all("/tmp/queueber_test_db").unwrap());
+
         let mut message = Builder::new_default();
         let item = make_item(&mut message);
         storage.add_available_item((b"42", item)).unwrap();

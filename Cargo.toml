@@ -19,3 +19,6 @@ uuid = { version = "1.18.0", features = ["std", "v4", "v7", "zerocopy"] }
 
 [build-dependencies]
 capnpc = "0.21.2"
+
+[dev-dependencies]
+scopeguard = "1.2.0"
