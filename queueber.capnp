@@ -32,8 +32,13 @@ struct Item {
 }
 
 struct PollResponse {
-    items @0 :List(Item);
+    items @0 :List(PolledItem);
     lease @1 :Data;
+}
+
+struct PolledItem {
+    contents @0 :Data;
+    id @1 :Data;
 }
 
 interface Queue {
@@ -47,4 +52,5 @@ interface Queue {
 struct StoredItem {
     contents @0 :Data;
     visibilityTsIndexKey @1 :Data;
+    id @2 :Data;
 }

@@ -1,7 +1,9 @@
 use capnp::capability::Promise;
 
 use crate::{
-    protocol::queue::{AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults},
+    protocol::queue::{
+        AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
+    },
     storage::Storage,
 };
 
@@ -30,6 +32,7 @@ impl crate::protocol::queue::Server for Server {
             .map(|_| uuid::Uuid::now_v7().as_bytes().to_vec())
             .collect::<Vec<_>>();
 
+        // TODO: do we need to run this in an io thread pool or smth?
         self.storage
             .add_available_items(ids.iter().map(AsRef::as_ref).zip(items.iter()))
             .map_err(|e| capnp::Error::failed(e.to_string()))?;

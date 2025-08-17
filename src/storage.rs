@@ -3,6 +3,7 @@ use capnp::{serialize, serialize_packed};
 use rocksdb::{DB, Options, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
+use uuid::Uuid;
 
 use crate::errors::{Error, Result};
 use crate::protocol;
@@ -31,6 +32,7 @@ impl Storage {
         Ok(Self { db })
     }
 
+    // id+item -> store stored_item and visibility index entry
     #[tracing::instrument(skip(self))]
     pub fn add_available_item<'i>(
         &self,
@@ -68,10 +70,27 @@ impl Storage {
     pub fn get_next_available_entries(
         &self,
         n: usize,
-    ) -> impl Iterator<Item = Result<TypedReader<serialize::OwnedSegments, protocol::stored_item::Owned>>>
-    {
+    ) -> Result<(
+        Lease,
+        Vec<
+            TypedReader<
+                capnp::message::Builder<message::HeapAllocator>,
+                protocol::polled_item::Owned,
+            >,
+        >,
+    )> {
         let iter = self.db.prefix_iterator(VISIBILITY_INDEX_PREFIX).take(n);
-        iter.map(|kv| {
+
+        // move these items to in progress and create a lease
+        // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
+        // TODO: can we do better?
+
+        // TODO: use a mockable clock
+        let lease = Uuid::now_v7().into_bytes();
+
+        let mut polled_items = Vec::with_capacity(n);
+
+        for kv in iter {
             let (_idx_key, main_key) = kv?;
             let main_value = self.db.get(&main_key)?.ok_or_else(|| {
                 Error::AssertionFailed(format!(
@@ -80,16 +99,26 @@ impl Storage {
                 ))
             })?;
 
-            let message = serialize_packed::read_message(
+            let stored_item_message = serialize_packed::read_message(
                 BufReader::new(&main_value[..]), // TODO: avoid allocation
                 message::ReaderOptions::new(),
             )?;
-            let t: TypedReader<serialize::OwnedSegments, protocol::stored_item::Owned> =
-                TypedReader::new(message);
-            Ok(t)
-        })
+            let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
+
+            // build the polled item
+            let mut builder = message::Builder::new_default(); // TODO: reduce allocs
+            let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
+            polled_item.set_contents(stored_item.get_contents()?);
+            polled_item.set_id(stored_item.get_id()?);
+            polled_items.push(builder.into_typed().into_reader());
+        }
+
+        Ok((lease, polled_items))
     }
 }
+
+// it's a uuidv7
+type Lease = [u8; 16];
 
 // TODO: is there a way to do this without allocating / with an arena or smth? i'd like to avoid allocating in the hot path
 // returns (main key, visibility index key)
@@ -127,15 +156,17 @@ mod tests {
 
     #[test]
     fn e2e_test() -> Result<()> {
+        tracing_subscriber::fmt::init();
+
         let storage = Storage::new(Path::new("test_db")).unwrap();
         let mut message = Builder::new_default();
         let item = make_item(&mut message);
         storage.add_available_item((b"42", item)).unwrap();
-        let entries = storage
-            .get_next_available_entries(1)
-            .collect::<Result<Vec<_>>>()?;
+        let (lease, entries) = storage.get_next_available_entries(1)?;
+        assert!(!lease.iter().all(|b| *b == 0));
         assert_eq!(entries.len(), 1);
         let si = entries[0].get()?;
+        assert_eq!(si.get_id()?, b"42");
         assert_eq!(si.get_contents()?, b"hello");
         Ok(())
     }
