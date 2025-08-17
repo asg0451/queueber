@@ -1,5 +1,9 @@
 @0xbab6e22de0402699;
 
+using Rust = import "rust.capnp";
+$Rust.parentModule("protocol");
+
+
 struct AddRequest {
     contents @0 :Data;
     visibilityTimeoutSecs @1 :UInt64;
