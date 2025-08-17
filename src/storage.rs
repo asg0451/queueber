@@ -79,7 +79,7 @@ impl Storage {
         Ok(())
     }
 
-    // TODO: move to in progress
+    #[allow(clippy::type_complexity)]
     pub fn get_next_available_entries(
         &self,
         n: usize,
@@ -134,12 +134,12 @@ impl Storage {
             )?;
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
-            debug_assert!(stored_item.get_id()?.len() > 0);
+            debug_assert!(!stored_item.get_id()?.is_empty());
             debug_assert_eq!(stored_item.get_id()?, &main_key[AVAILABLE_PREFIX.len()..]);
 
             tracing::debug!(
                 "got stored item: {{id: {}, contents: {}}}",
-                String::from_utf8_lossy(&stored_item.get_id()?),
+                String::from_utf8_lossy(stored_item.get_id()?),
                 String::from_utf8_lossy(stored_item.get_contents()?)
             );
 
@@ -180,7 +180,7 @@ type Lease = [u8; 16];
 
 // TODO: is there a way to do this without allocating / with an arena or smth? i'd like to avoid allocating in the hot path
 // returns (main key, visibility index key)
-fn make_main_key<'i>(id: &'i [u8], main_prefix: &'static [u8]) -> Result<Vec<u8>> {
+fn make_main_key(id: &[u8], main_prefix: &'static [u8]) -> Result<Vec<u8>> {
     let mut main_key = Vec::with_capacity(main_prefix.len() + id.len());
     main_key.extend_from_slice(main_prefix);
     main_key.extend_from_slice(id);
@@ -188,7 +188,7 @@ fn make_main_key<'i>(id: &'i [u8], main_prefix: &'static [u8]) -> Result<Vec<u8>
     Ok(main_key)
 }
 
-fn make_visibility_index_key<'i>(id: &'i [u8], visibility_timeout_secs: u64) -> Result<Vec<u8>> {
+fn make_visibility_index_key(id: &[u8], visibility_timeout_secs: u64) -> Result<Vec<u8>> {
     // TODO: use a mockable clock
     let now = std::time::SystemTime::now();
     let visible_ts_bs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
