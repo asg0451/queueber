@@ -2,7 +2,7 @@
 
 - [ ] (minor) set the rocksdb setting that helps with prefix scans
 - [ ] (minor) make newtype safety stuff for db keys
-- [ ] (minor) proper command setup (cli args, etc)
+- [X] (minor) proper command setup (cli args, etc)
 - [X] (minor) ci
 - [ ] (minor) rocksdb settings tuning
 - [ ] (major) server concurrency (either normally or via partitioning)
