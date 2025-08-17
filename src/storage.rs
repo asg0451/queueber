@@ -1,6 +1,6 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize_packed;
-use rocksdb::{DB, Options, WriteBatchWithTransaction};
+use rocksdb::{BlockBasedOptions, DB, Options, SliceTransform, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
@@ -26,8 +26,22 @@ pub struct Storage {
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
         let mut opts = Options::default();
-        // TODO: for more efficient prefix-partitioned scans:
-        // opts.set_prefix_extractor(SliceTransform::create("prefix",...?
+        // Configure prefix extractor and block-based bloom filters to speed up
+        // prefix scans like `db.prefix_iterator(VISIBILITY_INDEX_PREFIX)`.
+        // See: https://github.com/facebook/rocksdb/wiki/Prefix-Seek
+        // We use a capped prefix so keys shorter than the cap remain in-domain.
+        let visibility_prefix_len = VISIBILITY_INDEX_PREFIX.len();
+        let prefix_extractor = SliceTransform::create_capped_prefix(visibility_prefix_len);
+        opts.set_prefix_extractor(prefix_extractor);
+
+        // Block-based bloom filter with prefix awareness. We also disable
+        // whole-key filtering so prefix bloom is used for iterators.
+        let mut block_opts = BlockBasedOptions::default();
+        // ~10 bits per key is a common trade-off; do not use block-based bloom.
+        block_opts.set_bloom_filter(10.0, false);
+        block_opts.set_whole_key_filtering(false);
+        opts.set_block_based_table_factory(&block_opts);
+
         opts.create_if_missing(true);
         let db = DB::open(&opts, path)?;
         Ok(Self { db })
