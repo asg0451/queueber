@@ -41,7 +41,7 @@ impl Storage {
         // make stored item to insert
         let mut simsg = message::Builder::new_default();
         let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
-        stored_item.set_item(item)?;
+        stored_item.set_contents(item.get_contents()?);
         stored_item.set_visibility_ts_index_key(&visibility_index_key);
         let mut contents = Vec::with_capacity(simsg.size_in_words() * 8); // TODO: reuse
         serialize_packed::write_message(&mut contents, &simsg)?;
@@ -136,8 +136,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         assert_eq!(entries.len(), 1);
         let si = entries[0].get()?;
-        assert_eq!(si.get_item()?.get_contents()?, b"hello");
-        assert_eq!(si.get_item()?.get_visibility_timeout_secs(), 10);
+        assert_eq!(si.get_contents()?, b"hello");
         Ok(())
     }
 

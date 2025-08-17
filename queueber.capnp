@@ -45,6 +45,6 @@ interface Queue {
 
 # internal stuff (TODO: move to own file)
 struct StoredItem {
-    item @0 :Item;
+    contents @0 :Data;
     visibilityTsIndexKey @1 :Data;
 }
