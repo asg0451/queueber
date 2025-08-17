@@ -1,18 +1,32 @@
-use std::{net::ToSocketAddrs, path::Path};
+use std::{net::ToSocketAddrs, path::PathBuf};
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
+use clap::Parser;
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
 // for how to send stuff across threads; so we can parallelize the work..?
 
+#[derive(Parser, Debug)]
+#[command(name = "queueber-server", version, about = "Queueber server")] 
+struct Args {
+    /// Address to listen on (host:port)
+    #[arg(short = 'l', long = "listen", default_value = "127.0.0.1:9090")]
+    listen: String,
+
+    /// Data directory for RocksDB
+    #[arg(short = 'd', long = "data-dir", default_value = "/tmp/queueber/data")]
+    data_dir: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let addr = "127.0.0.1:9090".to_socket_addrs()?.next().unwrap();
+    let args = Args::parse();
+    let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
-    let storage = Storage::new(Path::new("/tmp/queueber/data"))?;
+    let storage = Storage::new(&args.data_dir)?;
     let server = Server::new(storage);
 
     tokio::task::LocalSet::new()

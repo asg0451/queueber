@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 capnp = { version = "0.21.4", features = ["rpc_try"] }
 capnp-rpc = "0.21.0"
+clap = { version = "4.5.20", features = ["derive"] }
 color-eyre = "0.6.5"
 futures = { version = "0.3.31", features = ["io-compat"] }
 rocksdb = "0.24.0"
