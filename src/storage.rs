@@ -12,14 +12,12 @@ use crate::protocol;
 // "available/" + id -> stored_item{item, visibility_ts_index_key}
 // "in_progress/" + id -> stored_item{item, visibility_ts_index_key}
 // "visibility_index/" + visibility_ts -> id
-// "leases/" + lease -> lease_info ? TODO
+// "leases/" + lease -> lease_entry{keys}
 
 const AVAILABLE_PREFIX: &[u8] = b"available/";
 const IN_PROGRESS_PREFIX: &[u8] = b"in_progress/";
 const VISIBILITY_INDEX_PREFIX: &[u8] = b"visibility_index/";
 const LEASE_PREFIX: &[u8] = b"leases/";
-
-// TODO: should these keys be capnproto structs themselves instead of just byte arrays? like maybe..
 
 pub struct Storage {
     db: DB,
@@ -159,7 +157,7 @@ impl Storage {
 
             // add the lease entry key
             lease_entry_keys.set(i as _, &main_key[AVAILABLE_PREFIX.len()..]);
-            // TODO: ^ is a good example of why we should use capnproto structs for keys
+            // TODO: make newtype safety stuff for these
         }
 
         // add the lease to the lease set
