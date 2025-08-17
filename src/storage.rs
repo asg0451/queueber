@@ -117,12 +117,16 @@ impl Storage {
                 VISIBILITY_INDEX_PREFIX
             );
 
-            let main_value = self.db.get(&main_key)?.ok_or_else(|| {
-                Error::AssertionFailed(format!(
-                    "database integrity violated: main key not found: {:?}",
-                    &main_key
-                ))
-            })?;
+            let main_value = self
+                .db
+                .get(&main_key)?
+                .ok_or_else(|| Error::AssertionFailed {
+                    msg: format!(
+                        "database integrity violated: main key not found: {:?}",
+                        &main_key
+                    ),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                })?;
 
             let stored_item_message = serialize_packed::read_message(
                 BufReader::new(&main_value[..]), // TODO: avoid allocation

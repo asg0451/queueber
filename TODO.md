@@ -2,6 +2,9 @@
 
 - [ ] (minor) set the rocksdb setting that helps with prefix scans
 - [ ] (minor) make newtype safety stuff for db keys
+- [ ] (minor) proper command setup (cli args, etc)
+- [ ] (minor) ci
+- [ ] (minor) rocksdb settings tuning
 - [ ] (feat) implement lease expiry
 - [ ] (feat) implement poll in server
 - [ ] (feat) implement remove

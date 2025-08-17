@@ -38,7 +38,7 @@ impl crate::protocol::queue::Server for Server {
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         // build the response
-        let mut ids_builder = results.get().init_resp().get_ids()?;
+        let mut ids_builder = results.get().init_resp().init_ids(ids.len() as u32);
         for (i, id) in ids.iter().enumerate() {
             ids_builder.set(i as u32, id);
         }

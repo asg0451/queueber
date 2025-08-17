@@ -1,9 +1,10 @@
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use color_eyre::Result;
+use color_eyre::{Result, eyre::eyre};
+use uuid::Uuid;
 
 use futures::AsyncReadExt;
 
-use queueber::protocol::{self, queue};
+use queueber::protocol::queue;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,29 +27,27 @@ async fn main() -> Result<()> {
 
             tokio::task::spawn_local(rpc_system);
 
-            let mut item_builder = capnp::message::Builder::new_default();
-            let mut item = item_builder.init_root::<protocol::item::Builder>();
-            item.set_contents(b"hello");
-            item.set_visibility_timeout_secs(10);
-            let an_item = item.into_reader();
-
             let mut request = queue_client.add_request();
             let req = request.get().init_req();
-            let mut items = req.get_items()?;
-            // the caveats are basically that if the schema version of the req is older than the schema version of the item, we'll lose the new data in the item.
-            // that doesnt sound realistic though.
-            items.set_with_caveats(0, an_item)?;
+            let items = req.init_items(1);
+            let mut item = items.get(0);
+            item.set_contents(b"hello");
+            item.set_visibility_timeout_secs(10);
 
             let reply = request.send().promise.await?;
 
+            let ids = reply.get()?.get_resp()?.get_ids()?;
+
             println!(
-                "received: {:?}",
-                reply
-                    .get()?
-                    .get_resp()?
-                    .get_ids()?
-                    .iter()
-                    .collect::<Vec<_>>()
+                "received {:?} ids: {:?}",
+                ids.len(),
+                ids.iter()
+                    .map(|id| id
+                        .map_err(|e| eyre!("some error idk: {:?}", e))
+                        .and_then(
+                            |id| Uuid::from_slice(id).map_err(|e| eyre!("invalid uuid: {:?}", e))
+                        ))
+                    .collect::<Result<Vec<_>, _>>()?
             );
             Ok(())
         })
