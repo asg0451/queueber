@@ -214,7 +214,9 @@ impl Storage {
 
         // Validate lease exists
         let lease_value_opt = self.db.get(&lease_key)?;
-        let Some(lease_value) = lease_value_opt else { return Ok(false); };
+        let Some(lease_value) = lease_value_opt else {
+            return Ok(false);
+        };
 
         // Parse lease entry and verify it contains the id
         let lease_msg = serialize_packed::read_message(
@@ -277,6 +279,7 @@ mod tests {
     use super::*;
     use crate::protocol;
     use capnp::message::{Builder, HeapAllocator};
+    use uuid::Uuid;
 
     #[test]
     fn e2e_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -388,6 +391,137 @@ mod tests {
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
         let keys = lease_entry.get_keys()?;
         assert!(keys.len() >= 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_item_with_correct_lease_updates_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_remove_update";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add two items
+        let mut msg1 = Builder::new_default();
+        let item1 = make_item(&mut msg1);
+        storage.add_available_item((b"id1", item1)).unwrap();
+        let mut msg2 = Builder::new_default();
+        let item2 = make_item(&mut msg2);
+        storage.add_available_item((b"id2", item2)).unwrap();
+
+        // poll both
+        let (lease, entries) = storage.get_next_available_entries(2)?;
+        assert_eq!(entries.len(), 2);
+
+        // remove id1 under the lease
+        let removed = storage.remove_in_progress_item(b"id1", &lease)?;
+        assert!(removed);
+
+        // id1 gone from in_progress, id2 remains
+        let mut inprog_id1 = Vec::new();
+        inprog_id1.extend_from_slice(IN_PROGRESS_PREFIX);
+        inprog_id1.extend_from_slice(b"id1");
+        assert!(storage.db.get(&inprog_id1)?.is_none());
+
+        let mut inprog_id2 = Vec::new();
+        inprog_id2.extend_from_slice(IN_PROGRESS_PREFIX);
+        inprog_id2.extend_from_slice(b"id2");
+        assert!(storage.db.get(&inprog_id2)?.is_some());
+
+        // lease entry should contain only id2
+        let lease_key = make_lease_key(&lease);
+        let lease_value = storage.db.get(&lease_key)?.ok_or("lease missing")?;
+        let lease_entry = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get(0)?, b"id2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_last_item_deletes_lease_entry() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_remove_last";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add one item and poll
+        let mut msg = Builder::new_default();
+        let item = make_item(&mut msg);
+        storage.add_available_item((b"only", item)).unwrap();
+        let (lease, entries) = storage.get_next_available_entries(1)?;
+        assert_eq!(entries.len(), 1);
+
+        // remove under lease
+        assert!(storage.remove_in_progress_item(b"only", &lease)?);
+
+        // in_progress entry gone
+        let mut inprog = Vec::new();
+        inprog.extend_from_slice(IN_PROGRESS_PREFIX);
+        inprog.extend_from_slice(b"only");
+        assert!(storage.db.get(&inprog)?.is_none());
+
+        // lease entry deleted
+        let lease_key = make_lease_key(&lease);
+        assert!(storage.db.get(&lease_key)?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_with_wrong_lease_is_noop() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_remove_wrong_lease";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add one item and poll
+        let mut msg = Builder::new_default();
+        let item = make_item(&mut msg);
+        storage.add_available_item((b"only", item)).unwrap();
+        let (lease, entries) = storage.get_next_available_entries(1)?;
+        assert_eq!(entries.len(), 1);
+
+        // attempt removal with a different lease (non-existent)
+        let wrong_lease: [u8; 16] = Uuid::now_v7().into_bytes();
+        assert_ne!(lease, wrong_lease);
+        let removed = storage.remove_in_progress_item(b"only", &wrong_lease)?;
+        assert!(!removed);
+
+        // in_progress still exists
+        let mut inprog = Vec::new();
+        inprog.extend_from_slice(IN_PROGRESS_PREFIX);
+        inprog.extend_from_slice(b"only");
+        assert!(storage.db.get(&inprog)?.is_some());
+
+        // original lease entry still exists and contains the id
+        let lease_key = make_lease_key(&lease);
+        let lease_value = storage.db.get(&lease_key)?.ok_or("lease missing")?;
+        let lease_entry = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get(0)?, b"only");
 
         Ok(())
     }

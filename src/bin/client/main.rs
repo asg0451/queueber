@@ -1,6 +1,6 @@
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use clap::{Parser, Subcommand};
-use color_eyre::{Result, eyre::eyre};
+use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::protocol::queue;
 use uuid::Uuid;
