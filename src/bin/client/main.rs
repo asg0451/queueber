@@ -33,6 +33,12 @@ enum Commands {
         /// How long the lease should be valid on the server (seconds)
         #[arg(short = 'l', long = "lease", default_value_t = 30)]
         lease_validity_secs: u64,
+        /// Maximum number of items to return
+        #[arg(short = 'n', long = "num", default_value_t = 1)]
+        num_items: u32,
+        /// How long to wait for items before returning (seconds)
+        #[arg(short = 't', long = "timeout", default_value_t = 0)]
+        timeout_secs: u64,
     },
 }
 
@@ -90,10 +96,14 @@ async fn main() -> Result<()> {
                 }
                 Commands::Poll {
                     lease_validity_secs,
+                    num_items,
+                    timeout_secs,
                 } => {
                     let mut request = queue_client.poll_request();
                     let mut req = request.get().init_req();
                     req.set_lease_validity_secs(lease_validity_secs);
+                    req.set_num_items(num_items);
+                    req.set_timeout_secs(timeout_secs);
 
                     let reply = request.send().promise.await?;
                     let resp = reply.get()?.get_resp()?;

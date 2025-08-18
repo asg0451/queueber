@@ -52,12 +52,16 @@ impl crate::protocol::queue::Server for Server {
         ))
     }
 
-    fn poll(&mut self, _params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
-        // For now, ignore the requested lease validity and return up to 1 item.
-        // Later we can thread lease validity through the storage layer.
+    fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
+        let req = params.get()?.get_req()?;
+        let _lease_validity_secs = req.get_lease_validity_secs();
+        let num_items = match req.get_num_items() { 0 => 1, n => n as usize };
+        let _timeout_secs = req.get_timeout_secs();
+
+        // For now, ignore lease validity and timeout, and just fetch up to num_items.
         let (lease, items) = self
             .storage
-            .get_next_available_entries(1)
+            .get_next_available_entries(num_items)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let mut resp = results.get().init_resp();
