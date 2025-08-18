@@ -49,9 +49,9 @@ impl Storage {
         let now = std::time::SystemTime::now();
         let visible_ts_secs_le = (now
             + std::time::Duration::from_secs(item.get_visibility_timeout_secs()))
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            .to_le_bytes();
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        .to_le_bytes();
 
         let visibility_index_key =
             VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs_le, id);
@@ -105,15 +105,12 @@ impl Storage {
             >,
         >,
     )> {
-        let iter = self
-            .db
-            .prefix_iterator(VisibilityIndexKey::PREFIX)
-            .take(n);
+        let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX).take(n);
 
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
         // TODO: can we do better?
-        
+
         // TODO: RACE CONDITION - concurrent polls can hand out the same messages!
         // The current implementation reads items with a prefix iterator and then moves them to in_progress,
         // but there's no locking between the read and write operations. Multiple concurrent polls could
@@ -134,7 +131,10 @@ impl Storage {
         for (i, kv) in iter.enumerate() {
             let (idx_key, main_key) = kv?;
 
-            debug_assert_eq!(&idx_key[..VisibilityIndexKey::PREFIX.len()], VisibilityIndexKey::PREFIX);
+            debug_assert_eq!(
+                &idx_key[..VisibilityIndexKey::PREFIX.len()],
+                VisibilityIndexKey::PREFIX
+            );
 
             let main_value = self
                 .db
@@ -203,17 +203,17 @@ impl Storage {
     #[tracing::instrument(skip(self))]
     pub fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
         // Build keys
-        let in_progress_key = make_main_key(id, IN_PROGRESS_PREFIX)?;
-        let lease_key = make_lease_key(lease);
+        let in_progress_key = InProgressKey::from_id(id);
+        let lease_key = LeaseKey::from_lease_bytes(lease);
 
         // Validate item exists in in_progress
-        let in_progress_value_opt = self.db.get(&in_progress_key)?;
+        let in_progress_value_opt = self.db.get(in_progress_key.as_ref())?;
         if in_progress_value_opt.is_none() {
             return Ok(false);
         }
 
         // Validate lease exists
-        let lease_value_opt = self.db.get(&lease_key)?;
+        let lease_value_opt = self.db.get(lease_key.as_ref())?;
         let Some(lease_value) = lease_value_opt else {
             return Ok(false);
         };
@@ -246,11 +246,11 @@ impl Storage {
 
         // Prepare batch: delete in_progress item; update or delete lease entry
         let mut batch = WriteBatchWithTransaction::<false>::default();
-        batch.delete(&in_progress_key);
+        batch.delete(in_progress_key.as_ref());
 
         if kept_keys.is_empty() {
             // No items remain under this lease; remove lease entry
-            batch.delete(&lease_key);
+            batch.delete(lease_key.as_ref());
         } else {
             // Rebuild lease entry with remaining keys
             let mut msg = message::Builder::new_default();
@@ -261,7 +261,7 @@ impl Storage {
             }
             let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
             serialize_packed::write_message(&mut buf, &msg)?;
-            batch.put(&lease_key, &buf);
+            batch.put(lease_key.as_ref(), &buf);
         }
 
         self.db.write(batch)?;
@@ -352,15 +352,10 @@ mod tests {
 
         // Inspect in-progress entries and ensure indexes/available entries were removed
         for id in [&b"id1"[..], &b"id2"[..]] {
-            let in_progress_key = {
-                let mut k = Vec::new();
-                k.extend_from_slice(IN_PROGRESS_PREFIX);
-                k.extend_from_slice(id);
-                k
-            };
+            let in_progress_key = InProgressKey::from_id(id);
             let value = storage
                 .db
-                .get(&in_progress_key)?
+                .get(in_progress_key.as_ref())?
                 .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
@@ -371,10 +366,8 @@ mod tests {
             let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
 
             // available entry must be gone
-            let mut avail_key = Vec::new();
-            avail_key.extend_from_slice(AVAILABLE_PREFIX);
-            avail_key.extend_from_slice(id);
-            assert!(storage.db.get(&avail_key)?.is_none());
+            let avail_key = AvailableKey::from_id(id);
+            assert!(storage.db.get(avail_key.as_ref())?.is_none());
 
             // visibility index entry must be gone
             let idx_key = stored_item.get_visibility_ts_index_key()?;
@@ -382,8 +375,11 @@ mod tests {
         }
 
         // lease entry exists and has keys (at least the ones we set)
-        let lease_key = make_lease_key(&lease);
-        let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage
+            .db
+            .get(lease_key.as_ref())?
+            .ok_or("lease not found")?;
         let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
@@ -423,19 +419,15 @@ mod tests {
         assert!(removed);
 
         // id1 gone from in_progress, id2 remains
-        let mut inprog_id1 = Vec::new();
-        inprog_id1.extend_from_slice(IN_PROGRESS_PREFIX);
-        inprog_id1.extend_from_slice(b"id1");
-        assert!(storage.db.get(&inprog_id1)?.is_none());
+        let inprog_id1 = InProgressKey::from_id(b"id1");
+        assert!(storage.db.get(inprog_id1.as_ref())?.is_none());
 
-        let mut inprog_id2 = Vec::new();
-        inprog_id2.extend_from_slice(IN_PROGRESS_PREFIX);
-        inprog_id2.extend_from_slice(b"id2");
-        assert!(storage.db.get(&inprog_id2)?.is_some());
+        let inprog_id2 = InProgressKey::from_id(b"id2");
+        assert!(storage.db.get(inprog_id2.as_ref())?.is_some());
 
         // lease entry should contain only id2
-        let lease_key = make_lease_key(&lease);
-        let lease_value = storage.db.get(&lease_key)?.ok_or("lease missing")?;
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
         let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
@@ -470,14 +462,12 @@ mod tests {
         assert!(storage.remove_in_progress_item(b"only", &lease)?);
 
         // in_progress entry gone
-        let mut inprog = Vec::new();
-        inprog.extend_from_slice(IN_PROGRESS_PREFIX);
-        inprog.extend_from_slice(b"only");
-        assert!(storage.db.get(&inprog)?.is_none());
+        let inprog = InProgressKey::from_id(b"only");
+        assert!(storage.db.get(inprog.as_ref())?.is_none());
 
         // lease entry deleted
-        let lease_key = make_lease_key(&lease);
-        assert!(storage.db.get(&lease_key)?.is_none());
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        assert!(storage.db.get(lease_key.as_ref())?.is_none());
 
         Ok(())
     }
@@ -506,14 +496,12 @@ mod tests {
         assert!(!removed);
 
         // in_progress still exists
-        let mut inprog = Vec::new();
-        inprog.extend_from_slice(IN_PROGRESS_PREFIX);
-        inprog.extend_from_slice(b"only");
-        assert!(storage.db.get(&inprog)?.is_some());
+        let inprog = InProgressKey::from_id(b"only");
+        assert!(storage.db.get(inprog.as_ref())?.is_some());
 
         // original lease entry still exists and contains the id
-        let lease_key = make_lease_key(&lease);
-        let lease_value = storage.db.get(&lease_key)?.ok_or("lease missing")?;
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
         let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
