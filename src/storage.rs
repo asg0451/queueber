@@ -6,6 +6,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::errors::{Error, Result};
+use crate::keys::{self, Lease, AVAILABLE_PREFIX, IN_PROGRESS_PREFIX, VISIBILITY_INDEX_PREFIX};
 use crate::protocol;
 
 // DB SCHEMA:
@@ -13,11 +14,6 @@ use crate::protocol;
 // "in_progress/" + id -> stored_item{item, visibility_ts_index_key}
 // "visibility_index/" + visibility_ts -> id
 // "leases/" + lease -> lease_entry{keys}
-
-const AVAILABLE_PREFIX: &[u8] = b"available/";
-const IN_PROGRESS_PREFIX: &[u8] = b"in_progress/";
-const VISIBILITY_INDEX_PREFIX: &[u8] = b"visibility_index/";
-const LEASE_PREFIX: &[u8] = b"leases/";
 
 pub struct Storage {
     db: DB,
@@ -53,9 +49,9 @@ impl Storage {
         &self,
         (id, item): (&'i [u8], protocol::item::Reader<'i>),
     ) -> Result<()> {
-        let main_key = make_main_key(id, AVAILABLE_PREFIX)?;
+        let main_key = keys::make_main_key(id, AVAILABLE_PREFIX)?;
         let visibility_index_key =
-            make_visibility_index_key(id, item.get_visibility_timeout_secs())?;
+            keys::make_visibility_index_key(id, item.get_visibility_timeout_secs())?;
 
         // make stored item to insert
         let mut simsg = message::Builder::new_default();
@@ -111,24 +107,9 @@ impl Storage {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         
-        // Create a range iterator that efficiently scans only visible items
-        // The visibility index key format is: visibility_index/ + timestamp + "/" + id
-        // Since timestamps are stored as little-endian bytes and keys are ordered,
-        // we can create a range from the start to a key that represents the current timestamp
-        let start_key = VISIBILITY_INDEX_PREFIX.to_vec();
-        
-        // Create an end key that represents the maximum timestamp for the current time
-        // We add 1 to the current timestamp to create an exclusive upper bound
-        let end_timestamp = now + 1;
-        let end_timestamp_bytes = end_timestamp.to_le_bytes();
-        let mut end_key = Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + end_timestamp_bytes.len());
-        end_key.extend_from_slice(VISIBILITY_INDEX_PREFIX);
-        end_key.extend_from_slice(&end_timestamp_bytes);
-        
-        // Use a range iterator that scans from start_key to end_key (exclusive)
-        // This leverages the ordered nature of the keys for efficient prefix scanning
-        // and automatically stops when we reach keys with timestamps >= end_timestamp
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
+        // Use a simple prefix iterator and filter by timestamp
+        // This is simpler and more reliable than complex range-based approaches
+        let iter = self.db.prefix_iterator(VISIBILITY_INDEX_PREFIX);
 
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
@@ -136,7 +117,7 @@ impl Storage {
 
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
-        let lease_key = make_lease_key(&lease);
+        let lease_key = keys::make_lease_key(&lease);
 
         let mut polled_items = Vec::with_capacity(n);
         let mut lease_keys = Vec::with_capacity(n);
@@ -151,33 +132,12 @@ impl Storage {
                 VISIBILITY_INDEX_PREFIX
             );
 
-            // Stop if we've reached the end of our range (keys with timestamps >= end_timestamp)
-            if idx_key.as_ref() >= end_key.as_slice() {
-                break;
-            }
-
-            // Extract timestamp from visibility index key for validation
-            // Key format: visibility_index/ + timestamp + "/" + id
-            let timestamp_start = VISIBILITY_INDEX_PREFIX.len();
-            let timestamp_end = idx_key[timestamp_start..]
-                .iter()
-                .position(|&b| b == b'/')
-                .ok_or_else(|| Error::AssertionFailed {
-                    msg: "Invalid visibility index key format".to_string(),
-                    backtrace: std::backtrace::Backtrace::capture(),
-                })? + timestamp_start;
+            // Extract timestamp from visibility index key
+            let item_timestamp = keys::extract_timestamp_from_visibility_key(&idx_key)?;
             
-            let timestamp_bytes = &idx_key[timestamp_start..timestamp_end];
-            let item_timestamp = u64::from_le_bytes(
-                timestamp_bytes.try_into().map_err(|_| Error::AssertionFailed {
-                    msg: "Invalid timestamp bytes in visibility index key".to_string(),
-                    backtrace: std::backtrace::Backtrace::capture(),
-                })?
-            );
-            
-            // Double-check that the item is actually visible (defensive programming)
+            // Skip items that are not yet visible
             if item_timestamp > now {
-                break;
+                continue;
             }
             
             // Stop if we've processed enough items
@@ -220,7 +180,7 @@ impl Storage {
             polled_items.push(polled_item);
 
             // move the item to in progress
-            let new_main_key = make_main_key(stored_item.get_id()?, IN_PROGRESS_PREFIX)?;
+            let new_main_key = keys::make_main_key(stored_item.get_id()?, IN_PROGRESS_PREFIX)?;
             in_progress_batch.delete(&main_key);
             in_progress_batch.put(&new_main_key, &main_value);
 
@@ -251,43 +211,7 @@ impl Storage {
     }
 }
 
-// it's a uuidv7
-type Lease = [u8; 16];
 
-// TODO: is there a way to do this without allocating / with an arena or smth? i'd like to avoid allocating in the hot path
-// returns (main key, visibility index key)
-fn make_main_key(id: &[u8], main_prefix: &'static [u8]) -> Result<Vec<u8>> {
-    let mut main_key = Vec::with_capacity(main_prefix.len() + id.len());
-    main_key.extend_from_slice(main_prefix);
-    main_key.extend_from_slice(id);
-
-    Ok(main_key)
-}
-
-fn make_visibility_index_key(id: &[u8], visibility_timeout_secs: u64) -> Result<Vec<u8>> {
-    // TODO: use a mockable clock
-    let now = std::time::SystemTime::now();
-    let visible_ts_bs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs()
-        .to_le_bytes();
-
-    let mut visibility_index_key =
-        Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + visible_ts_bs.len() + 1 + id.len());
-    visibility_index_key.extend_from_slice(VISIBILITY_INDEX_PREFIX);
-    visibility_index_key.extend_from_slice(&visible_ts_bs);
-    visibility_index_key.extend_from_slice(b"/");
-    visibility_index_key.extend_from_slice(id);
-
-    Ok(visibility_index_key)
-}
-
-fn make_lease_key(lease: &Lease) -> Vec<u8> {
-    let mut lease_key = Vec::with_capacity(LEASE_PREFIX.len() + lease.len());
-    lease_key.extend_from_slice(LEASE_PREFIX);
-    lease_key.extend_from_slice(lease);
-    lease_key
-}
 
 #[cfg(test)]
 mod tests {
@@ -315,7 +239,7 @@ mod tests {
         assert_eq!(si.get_contents()?, b"hello");
 
         // check lease
-        let lease_key = make_lease_key(&lease);
+        let lease_key = keys::make_lease_key(&lease);
         let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
         let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
@@ -393,7 +317,7 @@ mod tests {
         }
 
         // lease entry exists and has keys (at least the ones we set)
-        let lease_key = make_lease_key(&lease);
+        let lease_key = keys::make_lease_key(&lease);
         let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
         let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
