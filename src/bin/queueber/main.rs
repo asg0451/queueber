@@ -5,6 +5,7 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
+use std::sync::Arc;
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
 // for how to send stuff across threads; so we can parallelize the work..?
@@ -26,8 +27,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
-    let storage = std::sync::Arc::new(Storage::new(&args.data_dir)?);
-    let server = Server::new(storage);
+    let storage = Arc::new(Storage::new(&args.data_dir)?);
+    let server = Server::new(Arc::clone(&storage));
 
     tokio::task::LocalSet::new()
         .run_until(async move {

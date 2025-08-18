@@ -3,6 +3,7 @@ use capnp::message::{Builder, HeapAllocator, TypedReader};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+use crate::errors::{Error, Result};
 use crate::{
     protocol::queue::{
         AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
@@ -13,48 +14,78 @@ use crate::{
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs
 pub struct Server {
-    storage: std::sync::Arc<Storage>,
+    storage: Arc<Storage>,
     notify: Arc<Notify>,
 }
 
 impl Server {
-    pub fn new(storage: std::sync::Arc<Storage>) -> Self {
-        Self { storage, notify: Arc::new(Notify::new()) }
+    pub fn new(storage: Arc<Storage>) -> Self {
+        Self {
+            storage,
+            notify: Arc::new(Notify::new()),
+        }
     }
 }
 
 impl crate::protocol::queue::Server for Server {
     fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        // let contents = req.get_contents()?;
-        // let visibility_timeout_secs = req.get_visibility_timeout_secs();
-
+        let req = params.get()?;
+        let req = req.get_req()?;
         let items = req.get_items()?;
 
-        let ids = items
+        // Generate ids upfront and copy request data into owned memory so we can move
+        // it into a blocking task (capnp readers are not Send).
+        let ids: Vec<Vec<u8>> = items
             .iter()
             .map(|_| uuid::Uuid::now_v7().as_bytes().to_vec())
-            .collect::<Vec<_>>();
+            .collect();
 
-        // TODO: do we need to run this in an io thread pool or smth?
-        self
-            .storage
-            .add_available_items(ids.iter().map(AsRef::as_ref).zip(items.iter()))
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let items_owned = items
+            .iter()
+            .map(|item| -> Result<_> {
+                let contents = item.get_contents()?.to_vec();
+                let vis = item.get_visibility_timeout_secs();
+                Ok((contents, vis))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(Into::<capnp::Error>::into)?;
 
-        // Notify any waiters that new items may be available
-        self.notify.notify_waiters();
+        let storage = Arc::clone(&self.storage);
+        let notify = Arc::clone(&self.notify);
+        let ids_for_resp = ids.clone();
 
-        // build the response
-        let mut ids_builder = results.get().init_resp().init_ids(ids.len() as u32);
-        for (i, id) in ids.iter().enumerate() {
-            ids_builder.set(i as u32, id);
-        }
+        Promise::from_future(async move {
+            // Offload RocksDB work to the blocking thread pool.
+            tokio::task::spawn_blocking(move || {
+                let iter = ids
+                    .iter()
+                    .map(|id| id.as_slice())
+                    .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+                storage.add_available_items_from_parts(iter)
+            })
+            .await
+            .map_err(Into::<Error>::into)??;
 
-        Promise::ok(())
+            // Notify any waiters that new items may be available
+            notify.notify_waiters();
+
+            // Build the response on the RPC thread.
+            let mut ids_builder = results
+                .get()
+                .init_resp()
+                .init_ids(ids_for_resp.len() as u32);
+            for (i, id) in ids_for_resp.iter().enumerate() {
+                ids_builder.set(i as u32, id);
+            }
+            Ok(())
+        })
     }
 
-    fn remove(&mut self, params: RemoveParams, mut results: RemoveResults) -> Promise<(), capnp::Error> {
+    fn remove(
+        &mut self,
+        params: RemoveParams,
+        mut results: RemoveResults,
+    ) -> Promise<(), capnp::Error> {
         let req = params.get()?.get_req()?;
         let id = req.get_id()?;
         let lease_bytes = req.get_lease()?;
@@ -68,7 +99,7 @@ impl crate::protocol::queue::Server for Server {
         let removed = self
             .storage
             .remove_in_progress_item(id, &lease)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            .map_err(Into::into)?;
 
         results.get().init_resp().set_removed(removed);
         Promise::ok(())
@@ -81,7 +112,10 @@ impl crate::protocol::queue::Server for Server {
         Promise::from_future(async move {
             let req = params.get()?.get_req()?;
             let _lease_validity_secs = req.get_lease_validity_secs();
-            let num_items = match req.get_num_items() { 0 => 1, n => n as usize };
+            let num_items = match req.get_num_items() {
+                0 => 1,
+                n => n as usize,
+            };
             let timeout_secs = req.get_timeout_secs();
 
             // Fast path: try immediately
@@ -103,18 +137,18 @@ impl crate::protocol::queue::Server for Server {
             }
 
             let (lease, items) = storage
-                .get_next_available_entries(num_items)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            write_poll_response(&lease, items, &mut results)
+                .get_next_available_entries(num_items)?;
+            write_poll_response(&lease, items, &mut results)?;
+            Ok(())
         })
     }
 }
 
 fn write_poll_response(
     lease: &[u8; 16],
-    items: Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>, 
+    items: Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>,
     results: &mut crate::protocol::queue::PollResults,
-) -> Result<(), capnp::Error> {
+) -> Result<()> {
     let mut resp = results.get().init_resp();
     resp.set_lease(lease);
 
