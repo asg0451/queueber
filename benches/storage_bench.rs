@@ -168,12 +168,11 @@ fn ensure_server_started() -> &'static ServerHandle {
                 use queueber::server::Server;
                 use queueber::protocol::queue::Client as QueueClient;
                 use std::sync::Arc;
-                use tokio::sync::Notify;
+                // removed notify
                 let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
                 let storage = Arc::new(Storage::new(&data_path).unwrap());
-                let notify = Arc::new(Notify::new());
-                let server = Server::new(storage, notify);
-                let queue_client: QueueClient = capnp_rpc::new_client(server);
+                let server = Server::new(storage);
+                let queue_client: QueueClient = capnp_rpc::new_client(server.0);
                 // Signal readiness once bound and client is created
                 let _ = ready_tx.send(());
 

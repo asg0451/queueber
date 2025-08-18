@@ -18,6 +18,7 @@ use crate::{
 pub struct Server {
 	storage: Arc<Storage>,
 	notify: Arc<Notify>,
+	#[allow(dead_code)]
 	shutdown_tx: watch::Sender<bool>,
 }
 
