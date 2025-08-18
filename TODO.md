@@ -9,6 +9,6 @@
 - [ ] (major) server/storage partitioning?
 - [ ] (major) move storage to an io thread pool
 - [ ] (feat) implement lease expiry
-- [ ] (feat) implement poll in server
+- [X] (feat) implement poll in server
 - [ ] (feat) implement remove
 - [ ] (feat) implement extend

@@ -221,9 +221,9 @@ mod tests {
 
     #[test]
     fn e2e_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
-            .init();
+            .try_init();
 
         let storage = Storage::new(Path::new("/tmp/queueber_test_db")).unwrap();
         scopeguard::defer!(std::fs::remove_dir_all("/tmp/queueber_test_db").unwrap());
@@ -249,6 +249,79 @@ mod tests {
         let keys = lease_entry.get_keys()?;
         assert_eq!(keys.len(), 1);
         assert_eq!(keys.get(0)?, b"42");
+
+        Ok(())
+    }
+
+    #[test]
+    fn poll_moves_multiple_items_and_updates_indexes() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_multi";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add two items
+        let mut message = Builder::new_default();
+        let item = make_item(&mut message);
+        storage.add_available_item((b"id1", item)).unwrap();
+        let mut message2 = Builder::new_default();
+        let item2 = make_item(&mut message2);
+        storage.add_available_item((b"id2", item2)).unwrap();
+
+        // poll two items
+        let (lease, entries) = storage.get_next_available_entries(2)?;
+        assert!(!lease.iter().all(|b| *b == 0));
+        assert_eq!(entries.len(), 2);
+
+        // collect ids
+        let mut polled_ids = entries
+            .iter()
+            .map(|e| e.get().and_then(|pi| Ok(pi.get_id()?.to_vec())))
+            .collect::<std::result::Result<Vec<_>, capnp::Error>>()?;
+        polled_ids.sort();
+        assert_eq!(polled_ids, vec![b"id1".to_vec(), b"id2".to_vec()]);
+
+        // Inspect in-progress entries and ensure indexes/available entries were removed
+        for id in [&b"id1"[..], &b"id2"[..]] {
+            let in_progress_key = {
+                let mut k = Vec::new();
+                k.extend_from_slice(IN_PROGRESS_PREFIX);
+                k.extend_from_slice(id);
+                k
+            };
+            let value = storage.db.get(&in_progress_key)?.ok_or("in_progress value missing")?;
+
+            // parse stored item to get original visibility index key
+            let msg = serialize_packed::read_message(
+                BufReader::new(&value[..]),
+                message::ReaderOptions::new(),
+            )?;
+            let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
+
+            // available entry must be gone
+            let mut avail_key = Vec::new();
+            avail_key.extend_from_slice(AVAILABLE_PREFIX);
+            avail_key.extend_from_slice(id);
+            assert!(storage.db.get(&avail_key)?.is_none());
+
+            // visibility index entry must be gone
+            let idx_key = stored_item.get_visibility_ts_index_key()?;
+            assert!(storage.db.get(idx_key)?.is_none());
+        }
+
+        // lease entry exists and has keys (at least the ones we set)
+        let lease_key = make_lease_key(&lease);
+        let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
+        let lease_entry = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert!(keys.len() >= 2);
 
         Ok(())
     }
