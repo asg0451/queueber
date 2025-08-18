@@ -32,14 +32,20 @@ impl AvailableKey {
     }
 
     /// Returns the underlying database key bytes.
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 
     /// Returns the item id suffix contained in this key.
-    pub fn id_suffix(&self) -> &[u8] { &self.0[Self::PREFIX.len()..] }
+    pub fn id_suffix(&self) -> &[u8] {
+        &self.0[Self::PREFIX.len()..]
+    }
 }
 
 impl AsRef<[u8]> for AvailableKey {
-    fn as_ref(&self) -> &[u8] { self.as_bytes() }
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
 
 impl InProgressKey {
@@ -52,11 +58,15 @@ impl InProgressKey {
         Self(key)
     }
 
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl AsRef<[u8]> for InProgressKey {
-    fn as_ref(&self) -> &[u8] { self.as_bytes() }
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
 
 impl VisibilityIndexKey {
@@ -74,14 +84,17 @@ impl VisibilityIndexKey {
         Self(key)
     }
 
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 
     /// Parse the visible-at timestamp (secs since epoch) from a visibility index key.
     /// Returns None if the key is malformed or doesn't have enough bytes.
     pub fn parse_visible_ts_secs(idx_key: &[u8]) -> Option<u64> {
         let ts_start = Self::PREFIX.len();
         let ts_end = ts_start + 8;
-        if idx_key.len() < ts_end + 1 { // need at least trailing '/' after ts
+        if idx_key.len() < ts_end + 1 {
+            // need at least trailing '/' after ts
             return None;
         }
         let mut ts_be = [0u8; 8];
@@ -94,13 +107,17 @@ impl VisibilityIndexKey {
     pub fn split_ts_and_id(idx_key: &[u8]) -> Option<(u64, &[u8])> {
         let ts = Self::parse_visible_ts_secs(idx_key)?;
         let id_start = Self::PREFIX.len() + 8 + 1; // prefix + ts + '/'
-        if id_start > idx_key.len() { return None; }
+        if id_start > idx_key.len() {
+            return None;
+        }
         Some((ts, &idx_key[id_start..]))
     }
 }
 
 impl AsRef<[u8]> for VisibilityIndexKey {
-    fn as_ref(&self) -> &[u8] { self.as_bytes() }
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
 
 impl LeaseKey {
@@ -113,10 +130,13 @@ impl LeaseKey {
         Self(key)
     }
 
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl AsRef<[u8]> for LeaseKey {
-    fn as_ref(&self) -> &[u8] { self.as_bytes() }
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
-

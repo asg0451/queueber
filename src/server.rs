@@ -19,15 +19,27 @@ pub struct Server {
 
 impl Server {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage, notify: Arc::new(Notify::new()) }
+        Self {
+            storage,
+            notify: Arc::new(Notify::new()),
+        }
     }
 }
 
 impl crate::protocol::queue::Server for Server {
     fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), capnp::Error> {
-        let req = match params.get() { Ok(r) => r, Err(e) => return Promise::err(e) };
-        let req = match req.get_req() { Ok(r) => r, Err(e) => return Promise::err(e) };
-        let items = match req.get_items() { Ok(it) => it, Err(e) => return Promise::err(e) };
+        let req = match params.get() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let req = match req.get_req() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let items = match req.get_items() {
+            Ok(it) => it,
+            Err(e) => return Promise::err(e),
+        };
 
         // Generate ids upfront and copy request data into owned memory so we can move
         // it into a blocking task (capnp readers are not Send).
@@ -39,10 +51,7 @@ impl crate::protocol::queue::Server for Server {
         let items_owned: Vec<(Vec<u8>, u64)> = items
             .iter()
             .map(|item| {
-                let contents = item
-                    .get_contents()
-                    .unwrap_or_default()
-                    .to_vec();
+                let contents = item.get_contents().unwrap_or_default().to_vec();
                 let vis = item.get_visibility_timeout_secs();
                 (contents, vis)
             })
@@ -63,13 +72,16 @@ impl crate::protocol::queue::Server for Server {
             })
             .await
             .map_err(|e| crate::errors::Error::from(e))? // Join error -> our Error
-            .map_err(|e| capnp::Error::from(e))?;        // our Error -> capnp
+            .map_err(|e| capnp::Error::from(e))?; // our Error -> capnp
 
             // Notify any waiters that new items may be available
             notify.notify_waiters();
 
             // Build the response on the RPC thread.
-            let mut ids_builder = results.get().init_resp().init_ids(ids_for_resp.len() as u32);
+            let mut ids_builder = results
+                .get()
+                .init_resp()
+                .init_ids(ids_for_resp.len() as u32);
             for (i, id) in ids_for_resp.iter().enumerate() {
                 ids_builder.set(i as u32, id);
             }
@@ -77,7 +89,11 @@ impl crate::protocol::queue::Server for Server {
         })
     }
 
-    fn remove(&mut self, params: RemoveParams, mut results: RemoveResults) -> Promise<(), capnp::Error> {
+    fn remove(
+        &mut self,
+        params: RemoveParams,
+        mut results: RemoveResults,
+    ) -> Promise<(), capnp::Error> {
         let req = params.get()?.get_req()?;
         let id = req.get_id()?;
         let lease_bytes = req.get_lease()?;
@@ -104,7 +120,10 @@ impl crate::protocol::queue::Server for Server {
         Promise::from_future(async move {
             let req = params.get()?.get_req()?;
             let _lease_validity_secs = req.get_lease_validity_secs();
-            let num_items = match req.get_num_items() { 0 => 1, n => n as usize };
+            let num_items = match req.get_num_items() {
+                0 => 1,
+                n => n as usize,
+            };
             let timeout_secs = req.get_timeout_secs();
 
             // Fast path: try immediately
@@ -135,7 +154,7 @@ impl crate::protocol::queue::Server for Server {
 
 fn write_poll_response(
     lease: &[u8; 16],
-    items: Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>, 
+    items: Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>,
     results: &mut crate::protocol::queue::PollResults,
 ) -> Result<(), capnp::Error> {
     let mut resp = results.get().init_resp();
