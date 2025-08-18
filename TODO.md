@@ -16,4 +16,4 @@
 - [X] (feat) implement remove
 - [ ] (feat) implement extend
 - [ ] (bugfix) e2e benchmark hangs / improve benchmarks
-- [ ] (bugfix) polling returns early if it's woken by a new message being added, *even if it isnt visible*.
+- [X] (bugfix) polling returns early if it's woken by a new message being added, *even if it isnt visible*.
