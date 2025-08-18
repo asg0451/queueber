@@ -6,8 +6,9 @@
 - [X] (minor) ci
 - [ ] (minor) rocksdb settings tuning
 - [X] (major) server concurrency (either normally or via partitioning)
+- [ ] (major) server parallelism
 - [ ] (major) server/storage sharding
-- [ ] (major) move storage to an io thread pool
+- [X] (major) move storage to an io thread pool
 - [ ] (feat) implement lease expiry via a background thread
 - [X] (feat) implement poll in server
 - [X] (minor) add polling timeout and num_items options

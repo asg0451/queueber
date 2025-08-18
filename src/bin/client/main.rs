@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
             let queue_client: queue::Client =
                 rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
-            tokio::task::spawn_local(rpc_system);
+            let _jh = tokio::task::spawn_local(rpc_system);
 
             match cli.command {
                 Commands::Add {
