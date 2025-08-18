@@ -168,9 +168,11 @@ fn ensure_server_started() -> &'static ServerHandle {
                 use queueber::server::Server;
                 use queueber::protocol::queue::Client as QueueClient;
                 use std::sync::Arc;
+                use tokio::sync::Notify;
                 let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
                 let storage = Arc::new(Storage::new(&data_path).unwrap());
-                let server = Server::new(storage);
+                let notify = Arc::new(Notify::new());
+                let server = Server::new(storage, notify);
                 let queue_client: QueueClient = capnp_rpc::new_client(server);
                 // Signal readiness once bound and client is created
                 let _ = ready_tx.send(());
@@ -191,7 +193,7 @@ fn ensure_server_started() -> &'static ServerHandle {
                             );
                             let rpc_system =
                                 RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
-                            tokio::task::spawn_local(rpc_system);
+                            let _jh = tokio::task::spawn_local(rpc_system);
                         }
                     })
                     .await;
@@ -227,7 +229,7 @@ where
         let queue_client: queue::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
         tokio::task::LocalSet::new()
             .run_until(async move {
-                tokio::task::spawn_local(rpc_system);
+                let _jh = tokio::task::spawn_local(rpc_system);
                 f(queue_client)
             })
             .await

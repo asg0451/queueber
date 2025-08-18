@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
                     .run_until(async move {
                         while let Some(stream) = rx.recv().await {
                             let client = queue_client.clone();
-                            tokio::task::spawn_local(async move {
+                            let _jh = tokio::task::spawn_local(async move {
                                 let (reader, writer) =
                                     tokio_util::compat::TokioAsyncReadCompatExt::compat(stream)
                                         .split();
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
                                 );
                                 let rpc_system =
                                     RpcSystem::new(Box::new(network), Some(client.client));
-                                let _ = tokio::task::spawn_local(rpc_system);
+                                let _jh2 = tokio::task::spawn_local(rpc_system);
                             });
                         }
                     })
