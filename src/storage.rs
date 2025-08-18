@@ -5,7 +5,7 @@ use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::dbkeys::{AvailableKey, InProgressKey, LeaseKey, VisibilityIndexKey};
+use crate::dbkeys::{AvailableKey, InProgressKey, LeaseExpiryIndexKey, LeaseKey, VisibilityIndexKey};
 use crate::errors::{Error, Result};
 use crate::protocol;
 
@@ -127,20 +127,42 @@ impl Storage {
             >,
         >,
     )> {
+        // default lease validity of 30 seconds for callers that don't provide it
+        self.get_next_available_entries_with_lease(n, 30)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn get_next_available_entries_with_lease(
+        &self,
+        n: usize,
+        lease_validity_secs: u64,
+    ) -> Result<(
+        Lease,
+        Vec<
+            TypedReader<
+                capnp::message::Builder<message::HeapAllocator>,
+                protocol::polled_item::Owned,
+            >,
+        >,
+    )> {
         // Iterate over visibility index entries in lexicographic order; since
         // timestamps are encoded big-endian in the key, this corresponds to
         // ascending time order.
         let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
 
         // Determine current time (secs since epoch) to filter visible items.
-        let now_secs: u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        let now = std::time::SystemTime::now();
+        let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
 
         // move these items to in progress and create a lease
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
         let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let lease_expiry_index_key =
+            LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, &lease);
 
         let mut polled_items = Vec::with_capacity(n);
 
@@ -229,6 +251,8 @@ impl Storage {
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
 
         in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
+        // index the lease by expiry time for the background sweeper
+        in_progress_batch.put(lease_expiry_index_key.as_ref(), lease_key.as_ref());
 
         self.db.write(in_progress_batch)?;
 
@@ -303,6 +327,104 @@ impl Storage {
 
         self.db.write(batch)?;
         Ok(true)
+    }
+
+    /// Sweep expired leases: for each expired lease, move any remaining
+    /// in-progress items back to available and delete the lease and its index.
+    /// Returns the number of expired leases processed.
+    pub fn expire_due_leases(&self) -> Result<usize> {
+        let iter = self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
+
+        let now_secs: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+
+        let mut processed = 0usize;
+
+        for kv in iter {
+            let (idx_key, _lease_key_bytes_val) = kv?;
+
+            debug_assert_eq!(
+                &idx_key[..LeaseExpiryIndexKey::PREFIX.len()],
+                LeaseExpiryIndexKey::PREFIX
+            );
+
+            let Some((expiry_ts_secs, lease_bytes)) =
+                LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)
+            else {
+                continue;
+            };
+            if expiry_ts_secs > now_secs {
+                break;
+            }
+
+            let lease_key = LeaseKey::from_lease_bytes(lease_bytes);
+
+            // Load the lease entry; if missing, just delete the expiry index
+            let lease_value_opt = self.db.get(lease_key.as_ref())?;
+            if lease_value_opt.is_none() {
+                let mut batch = WriteBatchWithTransaction::<false>::default();
+                batch.delete(&idx_key);
+                self.db.write(batch)?;
+                processed += 1;
+                continue;
+            }
+            let lease_value = lease_value_opt.unwrap();
+
+            // Parse lease entry keys
+            let lease_msg = serialize_packed::read_message(
+                BufReader::new(&lease_value[..]),
+                message::ReaderOptions::new(),
+            )?;
+            let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+            let keys = lease_entry_reader.get_keys()?;
+
+            let mut batch = WriteBatchWithTransaction::<false>::default();
+
+            // For each id, if it's still in in_progress, move back to available and
+            // restore the visibility index entry with visibility at now
+            for res in keys.iter() {
+                let Ok(id) = res else { continue };
+                let in_progress_key = InProgressKey::from_id(id);
+                if let Some(value) = self.db.get(in_progress_key.as_ref())? {
+                    // Parse stored item to get id and contents
+                    let msg = serialize_packed::read_message(
+                        BufReader::new(&value[..]),
+                        message::ReaderOptions::new(),
+                    )?;
+                    let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
+
+                    // Build a new stored_item with visibility index for now
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs();
+                    let vis_idx_now =
+                        VisibilityIndexKey::from_visible_ts_and_id(now_secs, stored_item.get_id()?);
+
+                    let mut out_msg = message::Builder::new_default();
+                    let mut out_item = out_msg.init_root::<protocol::stored_item::Builder>();
+                    out_item.set_contents(stored_item.get_contents()?);
+                    out_item.set_id(stored_item.get_id()?);
+                    out_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
+                    let mut out_buf = Vec::with_capacity(out_msg.size_in_words() * 8);
+                    serialize_packed::write_message(&mut out_buf, &out_msg)?;
+
+                    let avail_key = AvailableKey::from_id(id);
+                    batch.put(avail_key.as_ref(), &out_buf);
+                    batch.put(vis_idx_now.as_ref(), avail_key.as_ref());
+                    batch.delete(in_progress_key.as_ref());
+                }
+            }
+
+            // Remove the lease entry and its expiry index
+            batch.delete(lease_key.as_ref());
+            batch.delete(&idx_key);
+
+            self.db.write(batch)?;
+            processed += 1;
+        }
+
+        Ok(processed)
     }
 }
 

@@ -21,6 +21,13 @@ pub struct VisibilityIndexKey(Vec<u8>);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseKey(Vec<u8>);
 
+/// Lease expiry index key: `b"lease_expiry/" + expiry_ts_be + b"/" + lease_bytes`.
+///
+/// Notes:
+/// - Timestamp is encoded as 8-byte big-endian to preserve lexicographic ordering by time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseExpiryIndexKey(Vec<u8>);
+
 impl AvailableKey {
     pub const PREFIX: &'static [u8] = b"available/";
 
@@ -136,6 +143,50 @@ impl LeaseKey {
 }
 
 impl AsRef<[u8]> for LeaseKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl LeaseExpiryIndexKey {
+    pub const PREFIX: &'static [u8] = b"lease_expiry/";
+
+    pub fn from_expiry_ts_and_lease(expiry_ts_secs: u64, lease: &[u8]) -> Self {
+        let ts_be = expiry_ts_secs.to_be_bytes();
+        let mut key = Vec::with_capacity(Self::PREFIX.len() + ts_be.len() + 1 + lease.len());
+        key.extend_from_slice(Self::PREFIX);
+        key.extend_from_slice(&ts_be);
+        key.extend_from_slice(b"/");
+        key.extend_from_slice(lease);
+        Self(key)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn parse_expiry_ts_secs(idx_key: &[u8]) -> Option<u64> {
+        let ts_start = Self::PREFIX.len();
+        let ts_end = ts_start + 8;
+        if idx_key.len() < ts_end + 1 {
+            return None;
+        }
+        let mut ts_be = [0u8; 8];
+        ts_be.copy_from_slice(&idx_key[ts_start..ts_end]);
+        Some(u64::from_be_bytes(ts_be))
+    }
+
+    pub fn split_ts_and_lease(idx_key: &[u8]) -> Option<(u64, &[u8])> {
+        let ts = Self::parse_expiry_ts_secs(idx_key)?;
+        let lease_start = Self::PREFIX.len() + 8 + 1; // prefix + ts + '/'
+        if lease_start > idx_key.len() {
+            return None;
+        }
+        Some((ts, &idx_key[lease_start..]))
+    }
+}
+
+impl AsRef<[u8]> for LeaseExpiryIndexKey {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }

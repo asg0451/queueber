@@ -39,3 +39,27 @@ fn concurrent_adds_and_poll_integration() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn expired_leases_requeue_immediately() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let storage = Storage::new(tmp.path()).expect("storage");
+
+    storage.add_available_item_from_parts(b"e1", b"p", 0)?;
+    let (_lease, items) = storage.get_next_available_entries_with_lease(1, 1)?;
+    assert_eq!(items.len(), 1);
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let n = storage.expire_due_leases()?;
+    assert!(n >= 1);
+
+    let (_lease2, items2) = storage.get_next_available_entries(1)?;
+    assert_eq!(items2.len(), 1);
+    Ok(())
+}
+
+// duplicate removed
