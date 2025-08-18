@@ -106,7 +106,22 @@ impl Storage {
             >,
         >,
     )> {
-        let iter = self.db.prefix_iterator(VISIBILITY_INDEX_PREFIX).take(n);
+        // Get current timestamp to filter only visible items
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        
+        // Create a prefix that includes only timestamps <= current time
+        // The visibility index key format is: visibility_index/ + timestamp + "/" + id
+        // We want to iterate over all keys where timestamp <= now
+        // Since timestamps are stored as little-endian bytes, we need to handle this carefully
+        let mut visible_prefix = Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + 8);
+        visible_prefix.extend_from_slice(VISIBILITY_INDEX_PREFIX);
+        
+        // For now, we'll use a simple approach: iterate over all visibility index entries
+        // and filter by timestamp. This could be optimized with a more sophisticated
+        // prefix-based approach, but this is simpler and more reliable.
+        let iter = self.db.prefix_iterator(VISIBILITY_INDEX_PREFIX);
 
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
@@ -115,21 +130,49 @@ impl Storage {
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
         let lease_key = make_lease_key(&lease);
-        let mut lease_entry = message::Builder::new_default();
-        let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
-        let mut lease_entry_keys = lease_entry_builder.init_keys(n as _);
 
         let mut polled_items = Vec::with_capacity(n);
+        let mut lease_keys = Vec::with_capacity(n);
 
         let mut in_progress_batch = WriteBatchWithTransaction::<false>::default();
 
-        for (i, kv) in iter.enumerate() {
+        let mut items_processed = 0;
+        for kv in iter {
             let (idx_key, main_key) = kv?;
 
             debug_assert_eq!(
                 &idx_key[..VISIBILITY_INDEX_PREFIX.len()],
                 VISIBILITY_INDEX_PREFIX
             );
+
+            // Extract timestamp from visibility index key
+            // Key format: visibility_index/ + timestamp + "/" + id
+            let timestamp_start = VISIBILITY_INDEX_PREFIX.len();
+            let timestamp_end = idx_key[timestamp_start..]
+                .iter()
+                .position(|&b| b == b'/')
+                .ok_or_else(|| Error::AssertionFailed {
+                    msg: "Invalid visibility index key format".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                })? + timestamp_start;
+            
+            let timestamp_bytes = &idx_key[timestamp_start..timestamp_end];
+            let item_timestamp = u64::from_le_bytes(
+                timestamp_bytes.try_into().map_err(|_| Error::AssertionFailed {
+                    msg: "Invalid timestamp bytes in visibility index key".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                })?
+            );
+            
+            // Skip items that are not yet visible
+            if item_timestamp > now {
+                continue;
+            }
+            
+            // Stop if we've processed enough items
+            if items_processed >= n {
+                break;
+            }
 
             let main_value = self
                 .db
@@ -174,10 +217,20 @@ impl Storage {
             in_progress_batch.delete(&idx_key);
 
             // add the lease entry key
-            lease_entry_keys.set(i as _, &main_key[AVAILABLE_PREFIX.len()..]);
+            lease_keys.push(main_key[AVAILABLE_PREFIX.len()..].to_vec());
             // TODO: make newtype safety stuff for these
+            
+            items_processed += 1;
         }
 
+        // Create the lease entry with the actual number of keys
+        let mut lease_entry = message::Builder::new_default();
+        let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
+        let mut lease_entry_keys = lease_entry_builder.init_keys(lease_keys.len() as _);
+        for (i, key) in lease_keys.iter().enumerate() {
+            lease_entry_keys.set(i as _, key);
+        }
+        
         // add the lease to the lease set
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
@@ -347,7 +400,76 @@ mod tests {
     fn make_item<'i>(message: &'i mut Builder<HeapAllocator>) -> protocol::item::Reader<'i> {
         let mut item = message.init_root::<protocol::item::Builder>();
         item.set_contents(b"hello");
-        item.set_visibility_timeout_secs(10);
+        item.set_visibility_timeout_secs(0); // Items are immediately visible
         item.into_reader()
+    }
+
+    fn make_item_with_timeout<'i>(
+        message: &'i mut Builder<HeapAllocator>,
+        visibility_timeout_secs: u64,
+    ) -> protocol::item::Reader<'i> {
+        let mut item = message.init_root::<protocol::item::Builder>();
+        item.set_contents(b"hello");
+        item.set_visibility_timeout_secs(visibility_timeout_secs);
+        item.into_reader()
+    }
+
+    #[test]
+    fn poll_filters_invisible_items() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_visibility";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // Add an item that's immediately visible
+        let mut message1 = Builder::new_default();
+        let item1 = make_item_with_timeout(&mut message1, 0);
+        storage.add_available_item((b"visible", item1)).unwrap();
+
+        // Add an item that won't be visible for 10 seconds
+        let mut message2 = Builder::new_default();
+        let item2 = make_item_with_timeout(&mut message2, 10);
+        storage.add_available_item((b"invisible", item2)).unwrap();
+
+        // Poll for items - should only get the visible one
+        let (lease, entries) = storage.get_next_available_entries(10)?;
+        assert!(!lease.iter().all(|b| *b == 0));
+        assert_eq!(entries.len(), 1); // Should only get the visible item
+
+        let si = entries[0].get()?;
+        assert_eq!(si.get_id()?, b"visible");
+        assert_eq!(si.get_contents()?, b"hello");
+
+        Ok(())
+    }
+
+    #[test]
+    fn poll_returns_no_items_when_all_invisible() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_all_invisible";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // Add items that won't be visible for 10 seconds
+        let mut message1 = Builder::new_default();
+        let item1 = make_item_with_timeout(&mut message1, 10);
+        storage.add_available_item((b"invisible1", item1)).unwrap();
+
+        let mut message2 = Builder::new_default();
+        let item2 = make_item_with_timeout(&mut message2, 10);
+        storage.add_available_item((b"invisible2", item2)).unwrap();
+
+        // Poll for items - should get none since all are invisible
+        let (lease, entries) = storage.get_next_available_entries(10)?;
+        assert!(!lease.iter().all(|b| *b == 0));
+        assert_eq!(entries.len(), 0); // Should get no items
+
+        Ok(())
     }
 }
