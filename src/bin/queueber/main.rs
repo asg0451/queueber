@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
-    let storage = Storage::new(&args.data_dir)?;
+    let storage = std::sync::Arc::new(Storage::new(&args.data_dir)?);
     let server = Server::new(storage);
 
     tokio::task::LocalSet::new()

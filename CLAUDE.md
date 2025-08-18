@@ -66,6 +66,12 @@ Connects to server at `localhost:9090` and demonstrates adding an item
 
 The Cap'n Proto schema (`queueber.capnp`) is compiled during build via `build.rs`. Uses Rust nightly toolchain as specified in `rust-toolchain.toml`.
 
+## Code Style Notes
+
+- Prefer iterator combinators (`iter`, `map`, `filter`, `filter_map`, `collect`) over index-based loops when collecting or transforming data.
+- Avoid `map_err` whenever possible; use `?` and convert errors at boundaries.
+- When sharing `Arc<T>`, prefer `Arc::clone(&arc_value)` over calling `.clone()` directly on the variable for clarity and to avoid accidental inner clones.
+
 ## Current State
 
 This is an early-stage implementation. Key unimplemented features noted in TODO.md:
