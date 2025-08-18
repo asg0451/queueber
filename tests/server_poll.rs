@@ -175,3 +175,49 @@ async fn poll_indefinite_wait_wakes_on_add() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn poll_timeout_is_not_cut_short_by_invisible_add() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    let elapsed = with_client(addr, |queue_client| async move {
+        // Start a poll with 1s timeout
+        let mut poll_req = queue_client.poll_request();
+        {
+            let mut req = poll_req.get().init_req();
+            req.set_lease_validity_secs(30);
+            req.set_num_items(1);
+            req.set_timeout_secs(1);
+        }
+
+        // After a short delay, add an item that is NOT yet visible (visibility timeout in future)
+        let client_for_add = queue_client.clone();
+        let add_task = tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut add = client_for_add.add_request();
+            {
+                let req = add.get().init_req();
+                let mut items = req.init_items(1);
+                let mut item = items.reborrow().get(0);
+                item.set_contents(b"invisible for now");
+                item.set_visibility_timeout_secs(5); // not visible yet
+            }
+            let _ = add.send().promise.await.unwrap();
+        });
+
+        let start = Instant::now();
+        let _ = poll_req.send().promise.await.unwrap();
+        add_task.await.unwrap();
+        start.elapsed()
+    })
+    .await;
+
+    // We should still have waited roughly the full timeout (not returned early on notify)
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "elapsed: {:?}",
+        elapsed
+    );
+    assert!(elapsed < Duration::from_secs(3), "elapsed: {:?}", elapsed);
+}
