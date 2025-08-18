@@ -6,6 +6,8 @@ use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
 use std::sync::Arc;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::sync::Notify;
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
 // for how to send stuff across threads; so we can parallelize the work..?
@@ -28,16 +30,28 @@ async fn main() -> Result<()> {
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
     let storage = Arc::new(Storage::new(&args.data_dir)?);
-    let server = Server::new(Arc::clone(&storage));
+    let notify = Arc::new(Notify::new());
 
-    tokio::task::LocalSet::new()
-        .run_until(async move {
-            let listener = tokio::net::TcpListener::bind(&addr).await?;
-            let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-            loop {
-                let (stream, _) = listener.accept().await?;
-                stream.set_nodelay(true)?;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
+
+        let storage_cloned = Arc::clone(&storage);
+        let notify_cloned = Arc::clone(&notify);
+
+        std::thread::spawn(move || {
+            let rt = RuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build per-connection runtime");
+
+            rt.block_on(async move {
+                // Construct server and RPC system within this thread to keep !Send types local
+                let server = Server::new(storage_cloned, notify_cloned);
+                let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
+
                 let (reader, writer) =
                     tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
                 let network = twoparty::VatNetwork::new(
@@ -47,11 +61,16 @@ async fn main() -> Result<()> {
                     Default::default(),
                 );
 
-                let rpc_system =
-                    RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
+                let rpc_system = RpcSystem::new(Box::new(network), Some(queue_client.client));
 
-                tokio::task::spawn_local(rpc_system);
-            }
-        })
-        .await
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async move {
+                        let handle = tokio::task::spawn_local(rpc_system);
+                        let _ = handle.await;
+                    })
+                    .await;
+            });
+        });
+    }
 }
