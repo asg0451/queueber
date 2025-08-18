@@ -47,14 +47,13 @@ impl Storage {
 
         // compute visible-at timestamp and build index key
         let now = std::time::SystemTime::now();
-        let visible_ts_secs_le = (now
+        let visible_ts_secs = (now
             + std::time::Duration::from_secs(item.get_visibility_timeout_secs()))
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs()
-        .to_le_bytes();
+        .as_secs();
 
         let visibility_index_key =
-            VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs_le, id);
+            VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
         // make stored item to insert
         let mut simsg = message::Builder::new_default();
@@ -105,10 +104,9 @@ impl Storage {
             >,
         >,
     )> {
-        // Iterate over all visibility index entries and pick up to n that
-        // are visible as of now. We cannot rely on RocksDB key ordering here
-        // because the timestamp is encoded little-endian in the key, which
-        // does not preserve lexicographic ordering by time.
+        // Iterate over visibility index entries in lexicographic order; since
+        // timestamps are encoded big-endian in the key, this corresponds to
+        // ascending time order.
         let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
 
         // Determine current time (secs since epoch) to filter visible items.
@@ -146,20 +144,13 @@ impl Storage {
                 VisibilityIndexKey::PREFIX
             );
 
-            // Parse visible-at timestamp from the index key:
-            // Key format: b"visibility_index/" + 8 bytes (LE ts) + b"/" + id
-            let ts_start = VisibilityIndexKey::PREFIX.len();
-            let ts_end = ts_start + 8;
-            if idx_key.len() < ts_end + 1 {
-                // Malformed key; skip it defensively
+            // Parse visible-at timestamp using helper; because keys are time-ordered (BE),
+            // we can stop scanning as soon as we hit a future timestamp.
+            let Some(visible_at_secs) = VisibilityIndexKey::parse_visible_ts_secs(&idx_key) else {
                 continue;
-            }
-            let mut ts_le = [0u8; 8];
-            ts_le.copy_from_slice(&idx_key[ts_start..ts_end]);
-            let visible_at_secs = u64::from_le_bytes(ts_le);
-            // Skip entries that are not yet visible
+            };
             if visible_at_secs > now_secs {
-                continue;
+                break;
             }
 
             let main_value = self
