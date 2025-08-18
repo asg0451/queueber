@@ -1,6 +1,6 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize_packed;
-use rocksdb::{DB, Options, WriteBatchWithTransaction};
+use rocksdb::{DB, Options, SliceTransform, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
@@ -16,8 +16,22 @@ pub struct Storage {
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
         let mut opts = Options::default();
-        // TODO: for more efficient prefix-partitioned scans:
-        // opts.set_prefix_extractor(SliceTransform::create("prefix",...?
+        // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
+        // Extract the namespace prefix up to and including the first '/'.
+        // Examples:
+        //  - b"visibility_index/123/abc" -> b"visibility_index/"
+        //  - b"available/42" -> b"available/"
+        //  - b"leases/<uuid>" -> b"leases/"
+        // If a key contains no '/', return the full key.
+        let ns_prefix = SliceTransform::create(
+            "ns_prefix",
+            |key: &[u8]| match key.iter().position(|b| *b == b'/') {
+                Some(idx) => &key[..=idx],
+                None => key,
+            },
+            Some(|_key: &[u8]| true),
+        );
+        opts.set_prefix_extractor(ns_prefix);
         opts.create_if_missing(true);
         let db = DB::open(&opts, path)?;
         Ok(Self { db })
@@ -99,6 +113,12 @@ impl Storage {
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
         // TODO: can we do better?
+        
+        // TODO: RACE CONDITION - concurrent polls can hand out the same messages!
+        // The current implementation reads items with a prefix iterator and then moves them to in_progress,
+        // but there's no locking between the read and write operations. Multiple concurrent polls could
+        // read the same items before any of them complete their write batch, leading to duplicate message
+        // delivery. Need to implement proper locking or use atomic operations to prevent this.
 
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
@@ -192,9 +212,9 @@ mod tests {
 
     #[test]
     fn e2e_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
-            .init();
+            .try_init();
 
         let storage = Storage::new(Path::new("/tmp/queueber_test_db")).unwrap();
         scopeguard::defer!(std::fs::remove_dir_all("/tmp/queueber_test_db").unwrap());
@@ -223,6 +243,83 @@ mod tests {
         let keys = lease_entry.get_keys()?;
         assert_eq!(keys.len(), 1);
         assert_eq!(keys.get(0)?, b"42");
+
+        Ok(())
+    }
+
+    #[test]
+    fn poll_moves_multiple_items_and_updates_indexes()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_multi";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add two items
+        let mut message = Builder::new_default();
+        let item = make_item(&mut message);
+        storage.add_available_item((b"id1", item)).unwrap();
+        let mut message2 = Builder::new_default();
+        let item2 = make_item(&mut message2);
+        storage.add_available_item((b"id2", item2)).unwrap();
+
+        // poll two items
+        let (lease, entries) = storage.get_next_available_entries(2)?;
+        assert!(!lease.iter().all(|b| *b == 0));
+        assert_eq!(entries.len(), 2);
+
+        // collect ids
+        let mut polled_ids = entries
+            .iter()
+            .map(|e| e.get().and_then(|pi| Ok(pi.get_id()?.to_vec())))
+            .collect::<std::result::Result<Vec<_>, capnp::Error>>()?;
+        polled_ids.sort();
+        assert_eq!(polled_ids, vec![b"id1".to_vec(), b"id2".to_vec()]);
+
+        // Inspect in-progress entries and ensure indexes/available entries were removed
+        for id in [&b"id1"[..], &b"id2"[..]] {
+            let in_progress_key = {
+                let mut k = Vec::new();
+                k.extend_from_slice(IN_PROGRESS_PREFIX);
+                k.extend_from_slice(id);
+                k
+            };
+            let value = storage
+                .db
+                .get(&in_progress_key)?
+                .ok_or("in_progress value missing")?;
+
+            // parse stored item to get original visibility index key
+            let msg = serialize_packed::read_message(
+                BufReader::new(&value[..]),
+                message::ReaderOptions::new(),
+            )?;
+            let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
+
+            // available entry must be gone
+            let mut avail_key = Vec::new();
+            avail_key.extend_from_slice(AVAILABLE_PREFIX);
+            avail_key.extend_from_slice(id);
+            assert!(storage.db.get(&avail_key)?.is_none());
+
+            // visibility index entry must be gone
+            let idx_key = stored_item.get_visibility_ts_index_key()?;
+            assert!(storage.db.get(idx_key)?.is_none());
+        }
+
+        // lease entry exists and has keys (at least the ones we set)
+        let lease_key = make_lease_key(&lease);
+        let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
+        let lease_entry = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert!(keys.len() >= 2);
 
         Ok(())
     }
