@@ -1,4 +1,5 @@
 use capnp::capability::Promise;
+use capnp::message::{Builder, HeapAllocator, TypedReader};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -36,7 +37,8 @@ impl crate::protocol::queue::Server for Server {
             .collect::<Vec<_>>();
 
         // TODO: do we need to run this in an io thread pool or smth?
-        self.storage
+        self
+            .storage
             .add_available_items(ids.iter().map(AsRef::as_ref).zip(items.iter()))
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -59,16 +61,15 @@ impl crate::protocol::queue::Server for Server {
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
-        let req = match params.get() { Ok(p) => p.get_req(), Err(e) => return Promise::err(e) };
-        let req = match req { Ok(r) => r, Err(e) => return Promise::err(e) };
-        let _lease_validity_secs = req.get_lease_validity_secs();
-        let num_items = match req.get_num_items() { 0 => 1, n => n as usize };
-        let timeout_secs = req.get_timeout_secs();
-
-        let storage = self.storage.clone();
-        let notify = self.notify.clone();
+        let storage = Arc::clone(&self.storage);
+        let notify = Arc::clone(&self.notify);
 
         Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let _lease_validity_secs = req.get_lease_validity_secs();
+            let num_items = match req.get_num_items() { 0 => 1, n => n as usize };
+            let timeout_secs = req.get_timeout_secs();
+
             // Fast path: try immediately
             if let Ok((lease, items)) = storage.get_next_available_entries(num_items) {
                 write_poll_response(&lease, items, &mut results)?;
@@ -97,7 +98,7 @@ impl crate::protocol::queue::Server for Server {
 
 fn write_poll_response(
     lease: &[u8; 16],
-    items: Vec<capnp::message::TypedReader<capnp::message::Builder<capnp::message::HeapAllocator>, crate::protocol::polled_item::Owned>>, 
+    items: Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>, 
     results: &mut crate::protocol::queue::PollResults,
 ) -> Result<(), capnp::Error> {
     let mut resp = results.get().init_resp();
@@ -105,20 +106,10 @@ fn write_poll_response(
 
     let mut items_builder = resp.init_items(items.len() as u32);
     for (i, typed_polled_item) in items.into_iter().enumerate() {
-        let item_reader = typed_polled_item
-            .get()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let item_reader = typed_polled_item.get()?;
         let mut out_item = items_builder.reborrow().get(i as u32);
-        out_item.set_contents(
-            item_reader
-                .get_contents()
-                .map_err(|e| capnp::Error::failed(e.to_string()))?,
-        );
-        out_item.set_id(
-            item_reader
-                .get_id()
-                .map_err(|e| capnp::Error::failed(e.to_string()))?,
-        );
+        out_item.set_contents(item_reader.get_contents()?);
+        out_item.set_id(item_reader.get_id()?);
     }
     Ok(())
 }
