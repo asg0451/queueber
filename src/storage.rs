@@ -49,9 +49,9 @@ impl Storage {
         let now = std::time::SystemTime::now();
         let visible_ts_secs_le = (now
             + std::time::Duration::from_secs(item.get_visibility_timeout_secs()))
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            .to_le_bytes();
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        .to_le_bytes();
 
         let visibility_index_key =
             VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs_le, id);
@@ -105,15 +105,12 @@ impl Storage {
             >,
         >,
     )> {
-        let iter = self
-            .db
-            .prefix_iterator(VisibilityIndexKey::PREFIX)
-            .take(n);
+        let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX).take(n);
 
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
         // TODO: can we do better?
-        
+
         // TODO: RACE CONDITION - concurrent polls can hand out the same messages!
         // The current implementation reads items with a prefix iterator and then moves them to in_progress,
         // but there's no locking between the read and write operations. Multiple concurrent polls could
@@ -134,7 +131,10 @@ impl Storage {
         for (i, kv) in iter.enumerate() {
             let (idx_key, main_key) = kv?;
 
-            debug_assert_eq!(&idx_key[..VisibilityIndexKey::PREFIX.len()], VisibilityIndexKey::PREFIX);
+            debug_assert_eq!(
+                &idx_key[..VisibilityIndexKey::PREFIX.len()],
+                VisibilityIndexKey::PREFIX
+            );
 
             let main_value = self
                 .db
@@ -197,6 +197,76 @@ impl Storage {
 
         Ok((lease, polled_items))
     }
+
+    /// Remove an in-progress item if the provided lease currently owns it.
+    /// Returns true if an item was removed, false if not found or lease mismatch.
+    #[tracing::instrument(skip(self))]
+    pub fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
+        // Build keys
+        let in_progress_key = InProgressKey::from_id(id);
+        let lease_key = LeaseKey::from_lease_bytes(lease);
+
+        // Validate item exists in in_progress
+        let in_progress_value_opt = self.db.get(in_progress_key.as_ref())?;
+        if in_progress_value_opt.is_none() {
+            return Ok(false);
+        }
+
+        // Validate lease exists
+        let lease_value_opt = self.db.get(lease_key.as_ref())?;
+        let Some(lease_value) = lease_value_opt else {
+            return Ok(false);
+        };
+
+        // Parse lease entry and verify it contains the id
+        let lease_msg = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry_reader.get_keys()?;
+
+        // Build filtered keys excluding the provided id using iterator combinators
+        let mut found = false;
+        let kept_keys: Vec<&[u8]> = keys
+            .iter()
+            .filter_map(|res| match res {
+                Ok(k) if k == id => {
+                    found = true;
+                    None
+                }
+                Ok(k) => Some(k),
+                Err(_) => None,
+            })
+            .collect();
+
+        if !found {
+            return Ok(false);
+        }
+
+        // Prepare batch: delete in_progress item; update or delete lease entry
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        batch.delete(in_progress_key.as_ref());
+
+        if kept_keys.is_empty() {
+            // No items remain under this lease; remove lease entry
+            batch.delete(lease_key.as_ref());
+        } else {
+            // Rebuild lease entry with remaining keys
+            let mut msg = message::Builder::new_default();
+            let builder = msg.init_root::<protocol::lease_entry::Builder>();
+            let mut out_keys = builder.init_keys(kept_keys.len() as u32);
+            for (i, k) in kept_keys.into_iter().enumerate() {
+                out_keys.set(i as u32, k);
+            }
+            let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
+            serialize_packed::write_message(&mut buf, &msg)?;
+            batch.put(lease_key.as_ref(), &buf);
+        }
+
+        self.db.write(batch)?;
+        Ok(true)
+    }
 }
 
 // it's a uuidv7
@@ -209,6 +279,7 @@ mod tests {
     use super::*;
     use crate::protocol;
     use capnp::message::{Builder, HeapAllocator};
+    use uuid::Uuid;
 
     #[test]
     fn e2e_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -281,15 +352,10 @@ mod tests {
 
         // Inspect in-progress entries and ensure indexes/available entries were removed
         for id in [&b"id1"[..], &b"id2"[..]] {
-            let in_progress_key = {
-                let mut k = Vec::new();
-                k.extend_from_slice(IN_PROGRESS_PREFIX);
-                k.extend_from_slice(id);
-                k
-            };
+            let in_progress_key = InProgressKey::from_id(id);
             let value = storage
                 .db
-                .get(&in_progress_key)?
+                .get(in_progress_key.as_ref())?
                 .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
@@ -300,10 +366,8 @@ mod tests {
             let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
 
             // available entry must be gone
-            let mut avail_key = Vec::new();
-            avail_key.extend_from_slice(AVAILABLE_PREFIX);
-            avail_key.extend_from_slice(id);
-            assert!(storage.db.get(&avail_key)?.is_none());
+            let avail_key = AvailableKey::from_id(id);
+            assert!(storage.db.get(avail_key.as_ref())?.is_none());
 
             // visibility index entry must be gone
             let idx_key = stored_item.get_visibility_ts_index_key()?;
@@ -311,8 +375,11 @@ mod tests {
         }
 
         // lease entry exists and has keys (at least the ones we set)
-        let lease_key = make_lease_key(&lease);
-        let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage
+            .db
+            .get(lease_key.as_ref())?
+            .ok_or("lease not found")?;
         let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
@@ -320,6 +387,129 @@ mod tests {
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
         let keys = lease_entry.get_keys()?;
         assert!(keys.len() >= 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_item_with_correct_lease_updates_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_remove_update";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add two items
+        let mut msg1 = Builder::new_default();
+        let item1 = make_item(&mut msg1);
+        storage.add_available_item((b"id1", item1)).unwrap();
+        let mut msg2 = Builder::new_default();
+        let item2 = make_item(&mut msg2);
+        storage.add_available_item((b"id2", item2)).unwrap();
+
+        // poll both
+        let (lease, entries) = storage.get_next_available_entries(2)?;
+        assert_eq!(entries.len(), 2);
+
+        // remove id1 under the lease
+        let removed = storage.remove_in_progress_item(b"id1", &lease)?;
+        assert!(removed);
+
+        // id1 gone from in_progress, id2 remains
+        let inprog_id1 = InProgressKey::from_id(b"id1");
+        assert!(storage.db.get(inprog_id1.as_ref())?.is_none());
+
+        let inprog_id2 = InProgressKey::from_id(b"id2");
+        assert!(storage.db.get(inprog_id2.as_ref())?.is_some());
+
+        // lease entry should contain only id2
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
+        let lease_entry = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get(0)?, b"id2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_last_item_deletes_lease_entry() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_remove_last";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add one item and poll
+        let mut msg = Builder::new_default();
+        let item = make_item(&mut msg);
+        storage.add_available_item((b"only", item)).unwrap();
+        let (lease, entries) = storage.get_next_available_entries(1)?;
+        assert_eq!(entries.len(), 1);
+
+        // remove under lease
+        assert!(storage.remove_in_progress_item(b"only", &lease)?);
+
+        // in_progress entry gone
+        let inprog = InProgressKey::from_id(b"only");
+        assert!(storage.db.get(inprog.as_ref())?.is_none());
+
+        // lease entry deleted
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        assert!(storage.db.get(lease_key.as_ref())?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_with_wrong_lease_is_noop() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_remove_wrong_lease";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add one item and poll
+        let mut msg = Builder::new_default();
+        let item = make_item(&mut msg);
+        storage.add_available_item((b"only", item)).unwrap();
+        let (lease, entries) = storage.get_next_available_entries(1)?;
+        assert_eq!(entries.len(), 1);
+
+        // attempt removal with a different lease (non-existent)
+        let wrong_lease: [u8; 16] = Uuid::now_v7().into_bytes();
+        assert_ne!(lease, wrong_lease);
+        let removed = storage.remove_in_progress_item(b"only", &wrong_lease)?;
+        assert!(!removed);
+
+        // in_progress still exists
+        let inprog = InProgressKey::from_id(b"only");
+        assert!(storage.db.get(inprog.as_ref())?.is_some());
+
+        // original lease entry still exists and contains the id
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
+        let lease_entry = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.get(0)?, b"only");
 
         Ok(())
     }

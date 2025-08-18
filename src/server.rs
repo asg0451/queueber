@@ -46,10 +46,24 @@ impl crate::protocol::queue::Server for Server {
         Promise::ok(())
     }
 
-    fn remove(&mut self, _: RemoveParams, _: RemoveResults) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "method queue::Server::remove not implemented".to_string(),
-        ))
+    fn remove(&mut self, params: RemoveParams, mut results: RemoveResults) -> Promise<(), capnp::Error> {
+        let req = params.get()?.get_req()?;
+        let id = req.get_id()?;
+        let lease_bytes = req.get_lease()?;
+
+        if lease_bytes.len() != 16 {
+            return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
+        }
+        let mut lease: [u8; 16] = [0; 16];
+        lease.copy_from_slice(lease_bytes);
+
+        let removed = self
+            .storage
+            .remove_in_progress_item(id, &lease)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        results.get().init_resp().set_removed(removed);
+        Promise::ok(())
     }
 
     fn poll(&mut self, _params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
