@@ -21,12 +21,20 @@ struct Args {
     /// Data directory for RocksDB
     #[arg(short = 'd', long = "data-dir", default_value = "/tmp/queueber/data")]
     data_dir: PathBuf,
+
+    /// Wipe the data directory before starting
+    #[arg(short = 'w', long = "wipe")]
+    wipe: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
+
+    if args.wipe {
+        std::fs::remove_dir_all(&args.data_dir)?;
+    }
 
     let storage = Arc::new(Storage::new(&args.data_dir)?);
     let notify = Arc::new(Notify::new());
