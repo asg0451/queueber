@@ -1,15 +1,15 @@
 use capnp::message::Builder as CapnpBuilder;
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
+use futures::AsyncReadExt;
 use queueber::protocol;
+use queueber::protocol::queue;
 use queueber::storage::Storage;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
 use std::thread::JoinHandle;
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use futures::AsyncReadExt;
-use queueber::protocol::queue;
 
 fn bench_add_messages(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_add");
@@ -74,9 +74,7 @@ fn bench_remove_messages(c: &mut Criterion) {
                         .expect("add_available_item");
                 }
 
-                let (lease, polled) = storage
-                    .get_next_available_entries(num_items)
-                    .expect("poll");
+                let (lease, polled) = storage.get_next_available_entries(num_items).expect("poll");
 
                 let mut ids: Vec<Vec<u8>> = Vec::with_capacity(polled.len());
                 for typed in polled.into_iter() {
@@ -126,9 +124,7 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
                 (dir, storage)
             },
             |(_dir, storage)| {
-                let _ = storage
-                    .get_next_available_entries(num_items)
-                    .expect("poll");
+                let _ = storage.get_next_available_entries(num_items).expect("poll");
             },
             BatchSize::SmallInput,
         );
@@ -165,10 +161,10 @@ fn ensure_server_started() -> &'static ServerHandle {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                use queueber::server::Server;
                 use queueber::protocol::queue::Client as QueueClient;
+                use queueber::server::Server;
                 use std::sync::Arc;
-                // removed notify
+
                 let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
                 let storage = Arc::new(Storage::new(&data_path).unwrap());
                 let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
@@ -184,16 +180,17 @@ fn ensure_server_started() -> &'static ServerHandle {
                             let (stream, _) = listener.accept().await.unwrap();
                             stream.set_nodelay(true).unwrap();
                             let (reader, writer) =
-                                tokio_util::compat::TokioAsyncReadCompatExt::compat(stream)
-                                    .split();
+                                tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
                             let network = twoparty::VatNetwork::new(
                                 futures::io::BufReader::new(reader),
                                 futures::io::BufWriter::new(writer),
                                 rpc_twoparty_capnp::Side::Server,
                                 Default::default(),
                             );
-                            let rpc_system =
-                                RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
+                            let rpc_system = RpcSystem::new(
+                                Box::new(network),
+                                Some(queue_client.clone().client),
+                            );
                             let _jh = tokio::task::spawn_local(rpc_system);
                         }
                     })
@@ -202,7 +199,11 @@ fn ensure_server_started() -> &'static ServerHandle {
         });
         // Wait until the server thread signals readiness
         let _ = ready_rx.recv();
-        ServerHandle { _thread: thread, _data_dir: data_dir, addr }
+        ServerHandle {
+            _thread: thread,
+            _data_dir: data_dir,
+            addr,
+        }
     })
 }
 
@@ -329,8 +330,7 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                             let resp = reply.get().unwrap().get_resp().unwrap();
                             let lease = resp.get_lease().unwrap().to_vec();
                             let items = resp.get_items().unwrap();
-                            let mut ids: Vec<Vec<u8>> =
-                                Vec::with_capacity(items.len() as usize);
+                            let mut ids: Vec<Vec<u8>> = Vec::with_capacity(items.len() as usize);
                             for i in 0..items.len() {
                                 ids.push(items.get(i).get_id().unwrap().to_vec());
                             }
@@ -367,4 +367,3 @@ criterion_group!(
     bench_e2e_add_poll_remove
 );
 criterion_main!(benches);
-
