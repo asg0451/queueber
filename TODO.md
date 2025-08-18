@@ -1,7 +1,7 @@
 # TODOs (beyond inline comments)
 
 - [ ] (minor) set the rocksdb setting that helps with prefix scans
-- [ ] (minor) make newtype safety stuff for db keys
+- [X] (minor) make newtype safety stuff for db keys
 - [X] (minor) proper command setup (cli args, etc)
 - [X] (minor) ci
 - [ ] (minor) rocksdb settings tuning
