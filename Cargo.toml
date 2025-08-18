@@ -32,4 +32,3 @@ criterion = { version = "0.5" }
 [[bench]]
 name = "storage_bench"
 harness = false
-profile = "release"
