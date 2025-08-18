@@ -36,10 +36,10 @@ impl Server {
 						}
 					}
 					Ok(Err(e)) => {
-						tracing::error!("lease expiry sweep error: {e}");
+						panic!("lease expiry sweep error: {e}");
 					}
 					Err(join_err) => {
-						tracing::error!("lease expiry task join error: {join_err}");
+						panic!("lease expiry task join error: {join_err}");
 					}
 				}
 				tokio::time::sleep(Duration::from_millis(500)).await;
@@ -135,6 +135,9 @@ impl crate::protocol::queue::Server for Server {
 		Promise::from_future(async move {
 			let req = params.get()?.get_req()?;
 			let lease_validity_secs = req.get_lease_validity_secs();
+			if lease_validity_secs == 0 {
+				return Err(capnp::Error::failed("invariant: leaseValiditySecs must be > 0".to_string()));
+			}
 			let num_items = match req.get_num_items() {
 				0 => 1,
 				n => n as usize,

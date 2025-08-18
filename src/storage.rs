@@ -382,22 +382,36 @@ impl Storage {
             let mut batch = WriteBatchWithTransaction::<false>::default();
 
             // For each id, if it's still in in_progress, move back to available and
-            // restore the visibility index entry
+            // restore the visibility index entry with visibility at now
             for res in keys.iter() {
                 let Ok(id) = res else { continue };
                 let in_progress_key = InProgressKey::from_id(id);
                 if let Some(value) = self.db.get(in_progress_key.as_ref())? {
-                    // Parse stored item to get original visibility index key
+                    // Parse stored item to get id and contents
                     let msg = serialize_packed::read_message(
                         BufReader::new(&value[..]),
                         message::ReaderOptions::new(),
                     )?;
                     let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
-                    let visibility_idx_key = stored_item.get_visibility_ts_index_key()?;
+
+                    // Build a new stored_item with visibility index for now
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs();
+                    let vis_idx_now =
+                        VisibilityIndexKey::from_visible_ts_and_id(now_secs, stored_item.get_id()?);
+
+                    let mut out_msg = message::Builder::new_default();
+                    let mut out_item = out_msg.init_root::<protocol::stored_item::Builder>();
+                    out_item.set_contents(stored_item.get_contents()?);
+                    out_item.set_id(stored_item.get_id()?);
+                    out_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
+                    let mut out_buf = Vec::with_capacity(out_msg.size_in_words() * 8);
+                    serialize_packed::write_message(&mut out_buf, &out_msg)?;
 
                     let avail_key = AvailableKey::from_id(id);
-                    batch.put(avail_key.as_ref(), &value);
-                    batch.put(visibility_idx_key, avail_key.as_ref());
+                    batch.put(avail_key.as_ref(), &out_buf);
+                    batch.put(vis_idx_now.as_ref(), avail_key.as_ref());
                     batch.delete(in_progress_key.as_ref());
                 }
             }
