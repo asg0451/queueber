@@ -9,7 +9,6 @@ use crate::{
     },
     storage::Storage,
 };
-use std::sync::Arc;
 
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs

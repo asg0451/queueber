@@ -99,28 +99,32 @@ impl Storage {
         contents: &[u8],
         visibility_timeout_secs: u64,
     ) -> Result<()> {
-        let main_key = make_main_key(id, AVAILABLE_PREFIX)?;
-        let visibility_index_key = make_visibility_index_key(id, visibility_timeout_secs)?;
+        let main_key = AvailableKey::from_id(id);
+        let now = std::time::SystemTime::now();
+        let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let visibility_index_key = VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
         let mut simsg = message::Builder::new_default();
         let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
         stored_item.set_contents(contents);
         stored_item.set_id(id);
-        stored_item.set_visibility_ts_index_key(&visibility_index_key);
+        stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
         let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
         serialize_packed::write_message(&mut stored_contents, &simsg)?;
 
         let mut batch = WriteBatchWithTransaction::<false>::default();
-        batch.put(&main_key, &stored_contents);
-        batch.put(&visibility_index_key, &main_key);
+        batch.put(main_key.as_ref(), &stored_contents);
+        batch.put(visibility_index_key.as_ref(), main_key.as_ref());
         self.db.write(batch)?;
 
         tracing::debug!(
             "inserted item (from parts): ({}: {}), ({}: {})",
-            String::from_utf8_lossy(&main_key),
+            String::from_utf8_lossy(main_key.as_ref()),
             String::from_utf8_lossy(&stored_contents),
-            String::from_utf8_lossy(&visibility_index_key),
-            String::from_utf8_lossy(&main_key)
+            String::from_utf8_lossy(visibility_index_key.as_ref()),
+            String::from_utf8_lossy(main_key.as_ref())
         );
 
         Ok(())
