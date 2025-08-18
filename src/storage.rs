@@ -138,15 +138,6 @@ impl Storage {
             .as_secs();
 
         // move these items to in progress and create a lease
-        // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
-        // TODO: can we do better?
-
-        // TODO: RACE CONDITION - concurrent polls can hand out the same messages!
-        // The current implementation reads items with a prefix iterator and then moves them to in_progress,
-        // but there's no locking between the read and write operations. Multiple concurrent polls could
-        // read the same items before any of them complete their write batch, leading to duplicate message
-        // delivery. Need to implement proper locking or use atomic operations to prevent this.
-
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
         let lease_key = LeaseKey::from_lease_bytes(&lease);
@@ -222,29 +213,21 @@ impl Storage {
 
             // remove the visibility index entry
             in_progress_batch.delete(&idx_key);
-
-            // Defer lease entry construction; we'll write it after we know
-            // the exact number of items collected.
-            // TODO: make newtype safety stuff for these
         }
 
-        // Build the lease entry with exactly the number of collected items.
+        // Build the lease entry by re-reading the IDs from the polled_items
+        // vector. capnp lists aren't dynamically sized so we need to know how
+        // many to init before we start writing (?)
         let mut lease_entry = message::Builder::new_default();
         let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
         let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
-        // We need to reconstruct the list of IDs from in-progress entries we just moved.
-        // Gather IDs by reading them back from the in-progress keys present in the batch is
-        // cumbersome; instead, rebuild by scanning the DB again would be inefficient. To keep
-        // things simple, we re-read the keys from the batch state we still have locally: the
-        // polled_items vector mirrors the selected items in order, so we will re-open each
-        // in-progress entry's ID from polled_items.
-        // Note: polled_items readers contain the ID; we can access it again here.
         for (i, typed_item) in polled_items.iter().enumerate() {
             let item_reader: protocol::polled_item::Reader = typed_item.get()?;
             lease_entry_keys.set(i as u32, item_reader.get_id()?);
         }
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
+
         in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
 
         self.db.write(in_progress_batch)?;

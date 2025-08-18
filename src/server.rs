@@ -118,13 +118,13 @@ impl crate::protocol::queue::Server for Server {
             };
             let timeout_secs = req.get_timeout_secs();
 
-            // Fast path: try immediately
-            if let Ok((lease, items)) = storage.get_next_available_entries(num_items) {
+            let (lease, items) = storage.get_next_available_entries(num_items)?;
+            if !items.is_empty() {
                 write_poll_response(&lease, items, &mut results)?;
                 return Ok(());
             }
 
-            // Otherwise, wait for notification or timeout, then try again once
+            // Wait to be notified of new data for timeout_secs (0 means wait indefinitely)
             if timeout_secs > 0 {
                 let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
                 tokio::select! {
@@ -132,13 +132,13 @@ impl crate::protocol::queue::Server for Server {
                     _ = timeout => {},
                 }
             } else {
-                // Wait indefinitely until something is added
                 notify.notified().await;
             }
 
-            let (lease, items) = storage
-                .get_next_available_entries(num_items)?;
-            write_poll_response(&lease, items, &mut results)?;
+            let (lease, items) = storage.get_next_available_entries(num_items)?;
+            if !items.is_empty() {
+                write_poll_response(&lease, items, &mut results)?;
+            }
             Ok(())
         })
     }
