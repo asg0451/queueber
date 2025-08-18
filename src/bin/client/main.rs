@@ -34,6 +34,15 @@ enum Commands {
         #[arg(short = 'l', long = "lease", default_value_t = 30)]
         lease_validity_secs: u64,
     },
+    /// Remove an item by id under a lease
+    Remove {
+        /// The item id (UUID string) to remove
+        #[arg(short = 'i', long = "id")]
+        id: String,
+        /// The lease id (UUID string) that owns the item
+        #[arg(short = 'l', long = "lease")]
+        lease: String,
+    },
 }
 
 #[tokio::main]
@@ -123,6 +132,24 @@ async fn main() -> Result<()> {
                             );
                         }
                     }
+                    Ok(())
+                }
+                Commands::Remove { id, lease } => {
+                    let id_bytes = uuid::Uuid::parse_str(&id)
+                        .map_err(|e| eyre!("invalid id uuid: {e}"))?
+                        .into_bytes();
+                    let lease_bytes = uuid::Uuid::parse_str(&lease)
+                        .map_err(|e| eyre!("invalid lease uuid: {e}"))?
+                        .into_bytes();
+
+                    let mut request = queue_client.remove_request();
+                    let mut req = request.get().init_req();
+                    req.set_id(&id_bytes);
+                    req.set_lease(&lease_bytes);
+
+                    let reply = request.send().promise.await?;
+                    let removed = reply.get()?.get_resp()?.get_removed();
+                    println!("removed: {}", removed);
                     Ok(())
                 }
             }

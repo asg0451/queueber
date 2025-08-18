@@ -197,6 +197,72 @@ impl Storage {
 
         Ok((lease, polled_items))
     }
+
+    /// Remove an in-progress item if the provided lease currently owns it.
+    /// Returns true if an item was removed, false if not found or lease mismatch.
+    #[tracing::instrument(skip(self))]
+    pub fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
+        // Build keys
+        let in_progress_key = make_main_key(id, IN_PROGRESS_PREFIX)?;
+        let lease_key = make_lease_key(lease);
+
+        // Validate item exists in in_progress
+        let in_progress_value_opt = self.db.get(&in_progress_key)?;
+        if in_progress_value_opt.is_none() {
+            return Ok(false);
+        }
+
+        // Validate lease exists
+        let lease_value_opt = self.db.get(&lease_key)?;
+        let Some(lease_value) = lease_value_opt else { return Ok(false); };
+
+        // Parse lease entry and verify it contains the id
+        let lease_msg = serialize_packed::read_message(
+            BufReader::new(&lease_value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry_reader.get_keys()?;
+
+        // Build filtered keys excluding the provided id
+        let mut kept_keys: Vec<&[u8]> = Vec::with_capacity(keys.len().saturating_sub(1) as usize);
+        let mut found = false;
+        for i in 0..keys.len() {
+            let k = keys.get(i)?;
+            if k == id {
+                found = true;
+            } else {
+                kept_keys.push(k);
+            }
+        }
+
+        if !found {
+            return Ok(false);
+        }
+
+        // Prepare batch: delete in_progress item; update or delete lease entry
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        batch.delete(&in_progress_key);
+
+        if kept_keys.is_empty() {
+            // No items remain under this lease; remove lease entry
+            batch.delete(&lease_key);
+        } else {
+            // Rebuild lease entry with remaining keys
+            let mut msg = message::Builder::new_default();
+            let builder = msg.init_root::<protocol::lease_entry::Builder>();
+            let mut out_keys = builder.init_keys(kept_keys.len() as u32);
+            for (i, k) in kept_keys.into_iter().enumerate() {
+                out_keys.set(i as u32, k);
+            }
+            let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
+            serialize_packed::write_message(&mut buf, &msg)?;
+            batch.put(&lease_key, &buf);
+        }
+
+        self.db.write(batch)?;
+        Ok(true)
+    }
 }
 
 // it's a uuidv7
