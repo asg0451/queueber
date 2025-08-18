@@ -1,6 +1,6 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize_packed;
-use rocksdb::{DB, Options, WriteBatchWithTransaction};
+use rocksdb::{DB, Options, SliceTransform, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
@@ -26,8 +26,22 @@ pub struct Storage {
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
         let mut opts = Options::default();
-        // TODO: for more efficient prefix-partitioned scans:
-        // opts.set_prefix_extractor(SliceTransform::create("prefix",...?
+        // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
+        // Extract the namespace prefix up to and including the first '/'.
+        // Examples:
+        //  - b"visibility_index/123/abc" -> b"visibility_index/"
+        //  - b"available/42" -> b"available/"
+        //  - b"leases/<uuid>" -> b"leases/"
+        // If a key contains no '/', return the full key.
+        let ns_prefix = SliceTransform::create(
+            "ns_prefix",
+            |key: &[u8]| match key.iter().position(|b| *b == b'/') {
+                Some(idx) => &key[..=idx],
+                None => key,
+            },
+            Some(|_key: &[u8]| true),
+        );
+        opts.set_prefix_extractor(ns_prefix);
         opts.create_if_missing(true);
         let db = DB::open(&opts, path)?;
         Ok(Self { db })

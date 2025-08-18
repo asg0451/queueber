@@ -10,5 +10,6 @@
 - [ ] (major) move storage to an io thread pool
 - [ ] (feat) implement lease expiry
 - [X] (feat) implement poll in server
+- [ ] (minor) add polling timeout and num_items options
 - [ ] (feat) implement remove
 - [ ] (feat) implement extend
