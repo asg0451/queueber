@@ -86,13 +86,7 @@ async fn main() -> Result<()> {
                         "received {:?} ids: {:?}",
                         ids.len(),
                         ids.iter()
-                            .map(|id| {
-                                id.map_err(|e| eyre!("some error idk: {:?}", e))
-                                    .and_then(|id| {
-                                        Uuid::from_slice(id)
-                                            .map_err(|e| eyre!("invalid uuid: {:?}", e))
-                                    })
-                            })
+                            .map(|id| -> Result<Uuid> { Ok(Uuid::from_slice(id?)?) })
                             .collect::<Result<Vec<_>, _>>()?
                     );
                     Ok(())
@@ -135,12 +129,8 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 Commands::Remove { id, lease } => {
-                    let id_bytes = uuid::Uuid::parse_str(&id)
-                        .map_err(|e| eyre!("invalid id uuid: {e}"))?
-                        .into_bytes();
-                    let lease_bytes = uuid::Uuid::parse_str(&lease)
-                        .map_err(|e| eyre!("invalid lease uuid: {e}"))?
-                        .into_bytes();
+                    let id_bytes = uuid::Uuid::parse_str(&id)?.into_bytes();
+                    let lease_bytes = uuid::Uuid::parse_str(&lease)?.into_bytes();
 
                     let mut request = queue_client.remove_request();
                     let mut req = request.get().init_req();

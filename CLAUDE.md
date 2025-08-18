@@ -60,6 +60,7 @@ Connects to server at `localhost:9090` and demonstrates adding an item
 ### Code Style Notes
 
 - Prefer iterator combinators (`iter`, `map`, `filter`, `filter_map`, `collect`) over index-based loops when collecting or transforming data.
+- Avoid `map_err` whenever possible.
 
 ### Schema Generation
 
