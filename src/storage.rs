@@ -558,7 +558,7 @@ mod tests {
         item.set_visibility_timeout_secs(visibility_secs);
         item.into_reader()
     }
-
+  
     #[test]
     fn poll_does_not_return_future_items() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt()
