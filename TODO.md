@@ -9,7 +9,7 @@
 - [ ] (major) server parallelism
 - [ ] (major) server/storage sharding
 - [X] (major) move storage to an io thread pool
-- [ ] (feat) implement lease expiry via a background thread
+- [X] (feat) implement lease expiry via a background thread
 - [X] (feat) implement poll in server
 - [X] (minor) add polling timeout and num_items options
 - [ ] (major) fix race condition: concurrent polls can hand out the same messages

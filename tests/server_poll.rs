@@ -2,7 +2,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 
 use queueber::protocol::queue;
@@ -37,10 +37,11 @@ fn start_test_server() -> TestServerHandle {
             use std::sync::Arc;
             use tokio::sync::Notify;
 
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let storage = Arc::new(Storage::new(&data_path).unwrap());
             let notify = Arc::new(Notify::new());
-            let server = Server::new(storage, notify);
+            let server = Server::new(storage, notify, shutdown_tx);
             let queue_client: QueueClient = capnp_rpc::new_client(server);
 
             // Indicate that the server is ready to accept connections
@@ -71,7 +72,11 @@ fn start_test_server() -> TestServerHandle {
     // Wait for readiness signal
     let _ = ready_rx.recv();
 
-    TestServerHandle { _data_dir: data_dir, _thread: thread, addr }
+    TestServerHandle {
+        _data_dir: data_dir,
+        _thread: thread,
+        addr,
+    }
 }
 
 async fn with_client<F, Fut, R>(addr: SocketAddr, f: F) -> R
@@ -116,7 +121,11 @@ async fn poll_times_out_after_waiting_when_empty() {
     .await;
 
     // Expect we waited at least ~1s, and not an excessively long time
-    assert!(elapsed >= Duration::from_millis(900), "elapsed: {:?}", elapsed);
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "elapsed: {:?}",
+        elapsed
+    );
     assert!(elapsed < Duration::from_secs(3), "elapsed: {:?}", elapsed);
 }
 
@@ -166,4 +175,3 @@ async fn poll_indefinite_wait_wakes_on_add() {
     })
     .await;
 }
-
