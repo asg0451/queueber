@@ -105,7 +105,16 @@ impl Storage {
             >,
         >,
     )> {
-        let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX).take(n);
+        // Iterate over all visibility index entries and pick up to n that
+        // are visible as of now. We cannot rely on RocksDB key ordering here
+        // because the timestamp is encoded little-endian in the key, which
+        // does not preserve lexicographic ordering by time.
+        let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
+
+        // Determine current time (secs since epoch) to filter visible items.
+        let now_secs: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
 
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
@@ -120,21 +129,38 @@ impl Storage {
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        let mut lease_entry = message::Builder::new_default();
-        let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
-        let mut lease_entry_keys = lease_entry_builder.init_keys(n as _);
 
         let mut polled_items = Vec::with_capacity(n);
 
         let mut in_progress_batch = WriteBatchWithTransaction::<false>::default();
 
-        for (i, kv) in iter.enumerate() {
+        for kv in iter {
+            if polled_items.len() >= n {
+                break;
+            }
+
             let (idx_key, main_key) = kv?;
 
             debug_assert_eq!(
                 &idx_key[..VisibilityIndexKey::PREFIX.len()],
                 VisibilityIndexKey::PREFIX
             );
+
+            // Parse visible-at timestamp from the index key:
+            // Key format: b"visibility_index/" + 8 bytes (LE ts) + b"/" + id
+            let ts_start = VisibilityIndexKey::PREFIX.len();
+            let ts_end = ts_start + 8;
+            if idx_key.len() < ts_end + 1 {
+                // Malformed key; skip it defensively
+                continue;
+            }
+            let mut ts_le = [0u8; 8];
+            ts_le.copy_from_slice(&idx_key[ts_start..ts_end]);
+            let visible_at_secs = u64::from_le_bytes(ts_le);
+            // Skip entries that are not yet visible
+            if visible_at_secs > now_secs {
+                continue;
+            }
 
             let main_value = self
                 .db
@@ -183,12 +209,26 @@ impl Storage {
             // remove the visibility index entry
             in_progress_batch.delete(&idx_key);
 
-            // add the lease entry key
-            lease_entry_keys.set(i as _, stored_item.get_id()?);
+            // Defer lease entry construction; we'll write it after we know
+            // the exact number of items collected.
             // TODO: make newtype safety stuff for these
         }
 
-        // add the lease to the lease set
+        // Build the lease entry with exactly the number of collected items.
+        let mut lease_entry = message::Builder::new_default();
+        let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
+        let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
+        // We need to reconstruct the list of IDs from in-progress entries we just moved.
+        // Gather IDs by reading them back from the in-progress keys present in the batch is
+        // cumbersome; instead, rebuild by scanning the DB again would be inefficient. To keep
+        // things simple, we re-read the keys from the batch state we still have locally: the
+        // polled_items vector mirrors the selected items in order, so we will re-open each
+        // in-progress entry's ID from polled_items.
+        // Note: polled_items readers contain the ID; we can access it again here.
+        for (i, typed_item) in polled_items.iter().enumerate() {
+            let item_reader: protocol::polled_item::Reader = typed_item.get()?;
+            lease_entry_keys.set(i as u32, item_reader.get_id()?);
+        }
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
         in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
@@ -515,9 +555,56 @@ mod tests {
     }
 
     fn make_item<'i>(message: &'i mut Builder<HeapAllocator>) -> protocol::item::Reader<'i> {
+        make_item_with_visibility(message, 0)
+    }
+
+    fn make_item_with_visibility<'i>(
+        message: &'i mut Builder<HeapAllocator>,
+        visibility_secs: u64,
+    ) -> protocol::item::Reader<'i> {
         let mut item = message.init_root::<protocol::item::Builder>();
         item.set_contents(b"hello");
-        item.set_visibility_timeout_secs(10);
+        item.set_visibility_timeout_secs(visibility_secs);
         item.into_reader()
+    }
+
+    #[test]
+    fn poll_does_not_return_future_items() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_future_visibility";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add one item with future visibility (e.g., 60 seconds)
+        let mut msg = Builder::new_default();
+        let item = make_item_with_visibility(&mut msg, 60);
+        let id = b"future";
+        storage.add_available_item((id, item)).unwrap();
+
+        // Poll should return no items yet
+        let (_lease, entries) = storage.get_next_available_entries(1)?;
+        assert_eq!(entries.len(), 0);
+
+        // The item should still be in available, not in in_progress, and its index should remain
+        let avail_key = AvailableKey::from_id(id);
+        assert!(storage.db.get(avail_key.as_ref())?.is_some());
+
+        let inprog_key = InProgressKey::from_id(id);
+        assert!(storage.db.get(inprog_key.as_ref())?.is_none());
+
+        // Read stored item to get its visibility index key and ensure it still exists
+        let value = storage.db.get(avail_key.as_ref())?.ok_or("missing available value")?;
+        let msg = serialize_packed::read_message(
+            std::io::BufReader::new(&value[..]),
+            message::ReaderOptions::new(),
+        )?;
+        let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
+        let idx_key = stored_item.get_visibility_ts_index_key()?;
+        assert!(storage.db.get(idx_key)?.is_some());
+
+        Ok(())
     }
 }
