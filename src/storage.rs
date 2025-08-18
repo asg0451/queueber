@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn e2e_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
 
         let storage = Storage::new(Path::new("/tmp/queueber_test_db")).unwrap();
@@ -502,7 +502,7 @@ mod tests {
     fn poll_moves_multiple_items_and_updates_indexes()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
 
         let db_path = "/tmp/queueber_test_db_multi";
@@ -575,7 +575,7 @@ mod tests {
     fn remove_item_with_correct_lease_updates_state()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
 
         let db_path = "/tmp/queueber_test_db_remove_update";
@@ -624,7 +624,7 @@ mod tests {
     fn remove_last_item_deletes_lease_entry() -> std::result::Result<(), Box<dyn std::error::Error>>
     {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
 
         let db_path = "/tmp/queueber_test_db_remove_last";
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn remove_with_wrong_lease_is_noop() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
 
         let db_path = "/tmp/queueber_test_db_remove_wrong_lease";
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn poll_does_not_return_future_items() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
 
         let db_path = "/tmp/queueber_test_db_future_visibility";
@@ -755,7 +755,7 @@ mod tests {
     fn concurrent_adds_and_poll_integration() -> Result<()> {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
-            .with_env_filter("concurrency=gdebug")
+            .with_env_filter("concurrency=debug")
             .try_init();
 
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -246,7 +246,7 @@ async fn poll_wait_wakes_when_item_becomes_visible() {
                 let mut items = req.init_items(1);
                 let mut item = items.reborrow().get(0);
                 item.set_contents(b"delayed visible");
-                item.set_visibility_timeout_secs(1);
+                item.set_visibility_timeout_secs(2);
             }
             let _ = add.send().promise.await.unwrap();
         });
