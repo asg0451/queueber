@@ -5,19 +5,9 @@ use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
 
+use crate::dbkeys::{AvailableKey, InProgressKey, LeaseKey, VisibilityIndexKey};
 use crate::errors::{Error, Result};
 use crate::protocol;
-
-// DB SCHEMA:
-// "available/" + id -> stored_item{item, visibility_ts_index_key}
-// "in_progress/" + id -> stored_item{item, visibility_ts_index_key}
-// "visibility_index/" + visibility_ts -> id
-// "leases/" + lease -> lease_entry{keys}
-
-const AVAILABLE_PREFIX: &[u8] = b"available/";
-const IN_PROGRESS_PREFIX: &[u8] = b"in_progress/";
-const VISIBILITY_INDEX_PREFIX: &[u8] = b"visibility_index/";
-const LEASE_PREFIX: &[u8] = b"leases/";
 
 pub struct Storage {
     db: DB,
@@ -53,30 +43,39 @@ impl Storage {
         &self,
         (id, item): (&'i [u8], protocol::item::Reader<'i>),
     ) -> Result<()> {
-        let main_key = make_main_key(id, AVAILABLE_PREFIX)?;
+        let main_key = AvailableKey::from_id(id);
+
+        // compute visible-at timestamp and build index key
+        let now = std::time::SystemTime::now();
+        let visible_ts_secs_le = (now
+            + std::time::Duration::from_secs(item.get_visibility_timeout_secs()))
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            .to_le_bytes();
+
         let visibility_index_key =
-            make_visibility_index_key(id, item.get_visibility_timeout_secs())?;
+            VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs_le, id);
 
         // make stored item to insert
         let mut simsg = message::Builder::new_default();
         let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
         stored_item.set_contents(item.get_contents()?);
         stored_item.set_id(id);
-        stored_item.set_visibility_ts_index_key(&visibility_index_key);
+        stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
         let mut contents = Vec::with_capacity(simsg.size_in_words() * 8); // TODO: reuse
         serialize_packed::write_message(&mut contents, &simsg)?;
 
         let mut batch = WriteBatchWithTransaction::<false>::default();
-        batch.put(&main_key, &contents);
-        batch.put(&visibility_index_key, &main_key);
+        batch.put(main_key.as_ref(), &contents);
+        batch.put(visibility_index_key.as_ref(), main_key.as_ref());
         self.db.write(batch)?;
 
         tracing::debug!(
             "inserted item: ({}: {}), ({}: {})",
-            String::from_utf8_lossy(&main_key),
+            String::from_utf8_lossy(main_key.as_ref()),
             String::from_utf8_lossy(&contents),
-            String::from_utf8_lossy(&visibility_index_key),
-            String::from_utf8_lossy(&main_key)
+            String::from_utf8_lossy(visibility_index_key.as_ref()),
+            String::from_utf8_lossy(main_key.as_ref())
         );
 
         Ok(())
@@ -106,7 +105,10 @@ impl Storage {
             >,
         >,
     )> {
-        let iter = self.db.prefix_iterator(VISIBILITY_INDEX_PREFIX).take(n);
+        let iter = self
+            .db
+            .prefix_iterator(VisibilityIndexKey::PREFIX)
+            .take(n);
 
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
@@ -120,7 +122,7 @@ impl Storage {
 
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
-        let lease_key = make_lease_key(&lease);
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
         let mut lease_entry = message::Builder::new_default();
         let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
         let mut lease_entry_keys = lease_entry_builder.init_keys(n as _);
@@ -132,10 +134,7 @@ impl Storage {
         for (i, kv) in iter.enumerate() {
             let (idx_key, main_key) = kv?;
 
-            debug_assert_eq!(
-                &idx_key[..VISIBILITY_INDEX_PREFIX.len()],
-                VISIBILITY_INDEX_PREFIX
-            );
+            debug_assert_eq!(&idx_key[..VisibilityIndexKey::PREFIX.len()], VisibilityIndexKey::PREFIX);
 
             let main_value = self
                 .db
@@ -155,7 +154,12 @@ impl Storage {
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
             debug_assert!(!stored_item.get_id()?.is_empty());
-            debug_assert_eq!(stored_item.get_id()?, &main_key[AVAILABLE_PREFIX.len()..]);
+            // The value stored at the visibility index key is the available main key
+            // for the item. Ensure it matches the item's id.
+            debug_assert_eq!(
+                stored_item.get_id()?,
+                &main_key[AvailableKey::PREFIX.len()..]
+            );
 
             tracing::debug!(
                 "got stored item: {{id: {}, contents: {}}}",
@@ -172,22 +176,22 @@ impl Storage {
             polled_items.push(polled_item);
 
             // move the item to in progress
-            let new_main_key = make_main_key(stored_item.get_id()?, IN_PROGRESS_PREFIX)?;
+            let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
             in_progress_batch.delete(&main_key);
-            in_progress_batch.put(&new_main_key, &main_value);
+            in_progress_batch.put(new_main_key.as_ref(), &main_value);
 
             // remove the visibility index entry
             in_progress_batch.delete(&idx_key);
 
             // add the lease entry key
-            lease_entry_keys.set(i as _, &main_key[AVAILABLE_PREFIX.len()..]);
+            lease_entry_keys.set(i as _, stored_item.get_id()?);
             // TODO: make newtype safety stuff for these
         }
 
         // add the lease to the lease set
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
-        in_progress_batch.put(&lease_key, &lease_entry_bs);
+        in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
 
         self.db.write(in_progress_batch)?;
 
@@ -198,40 +202,7 @@ impl Storage {
 // it's a uuidv7
 type Lease = [u8; 16];
 
-// TODO: is there a way to do this without allocating / with an arena or smth? i'd like to avoid allocating in the hot path
-// returns (main key, visibility index key)
-fn make_main_key(id: &[u8], main_prefix: &'static [u8]) -> Result<Vec<u8>> {
-    let mut main_key = Vec::with_capacity(main_prefix.len() + id.len());
-    main_key.extend_from_slice(main_prefix);
-    main_key.extend_from_slice(id);
-
-    Ok(main_key)
-}
-
-fn make_visibility_index_key(id: &[u8], visibility_timeout_secs: u64) -> Result<Vec<u8>> {
-    // TODO: use a mockable clock
-    let now = std::time::SystemTime::now();
-    let visible_ts_bs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs()
-        .to_le_bytes();
-
-    let mut visibility_index_key =
-        Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + visible_ts_bs.len() + 1 + id.len());
-    visibility_index_key.extend_from_slice(VISIBILITY_INDEX_PREFIX);
-    visibility_index_key.extend_from_slice(&visible_ts_bs);
-    visibility_index_key.extend_from_slice(b"/");
-    visibility_index_key.extend_from_slice(id);
-
-    Ok(visibility_index_key)
-}
-
-fn make_lease_key(lease: &Lease) -> Vec<u8> {
-    let mut lease_key = Vec::with_capacity(LEASE_PREFIX.len() + lease.len());
-    lease_key.extend_from_slice(LEASE_PREFIX);
-    lease_key.extend_from_slice(lease);
-    lease_key
-}
+// helper key builders moved to `crate::dbkeys` newtypes
 
 #[cfg(test)]
 mod tests {
@@ -259,8 +230,11 @@ mod tests {
         assert_eq!(si.get_contents()?, b"hello");
 
         // check lease
-        let lease_key = make_lease_key(&lease);
-        let lease_value = storage.db.get(&lease_key)?.ok_or("lease not found")?;
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage
+            .db
+            .get(lease_key.as_ref())?
+            .ok_or("lease not found")?;
         let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
