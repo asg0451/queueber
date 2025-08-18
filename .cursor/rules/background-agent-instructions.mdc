@@ -4,9 +4,15 @@ alwaysApply: true
 
 # background agent instructions
 (ignore this if you arent a background agent)
-## setup
-- always install rust nightly via rustup
-- also install capnpc (`apt-get install capnproto`) and any other build deps. you CAN install packages
+## setup (DO THIS FIRST)
+- install rust nightly via rustup
+    - install rustup: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+    - install rust nightly: `rustup toolchain install nightly`
+- also install capnpc (`sudo apt-get install capnproto`). you CAN install packages
 
 ## rules
-- never, EVER submit a pr that doesnt build. `cargo check`, `cargo test`, and ci must all pass before you declare success
+- never, EVER submit a pr that doesnt build. `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings` must all pass before you declare success
+- likewise, make sure all merge conflits are resolved before declaring success. do this by running `git pull origin master` before every `git push`
+
+## guidelines
+- i can be wrong. if i say something you think is wrong, please push back on it at least once

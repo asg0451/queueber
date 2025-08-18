@@ -82,19 +82,55 @@ impl crate::protocol::queue::Server for Server {
         })
     }
 
-    fn remove(&mut self, _: RemoveParams, _: RemoveResults) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "method queue::Server::remove not implemented".to_string(),
-        ))
+    fn remove(&mut self, params: RemoveParams, mut results: RemoveResults) -> Promise<(), capnp::Error> {
+        let req = params.get()?.get_req()?;
+        let id = req.get_id()?;
+        let lease_bytes = req.get_lease()?;
+
+        if lease_bytes.len() != 16 {
+            return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
+        }
+        let mut lease: [u8; 16] = [0; 16];
+        lease.copy_from_slice(lease_bytes);
+
+        let removed = self
+            .storage
+            .remove_in_progress_item(id, &lease)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        results.get().init_resp().set_removed(removed);
+        Promise::ok(())
     }
 
-    fn poll(&mut self, _: PollParams, _: PollResults) -> Promise<(), capnp::Error> {
-        // Promise::from_future(req.send().promise.and_then(move |response| {
-        //     results.get().set_y(response.get()?.get_y());
-        //     Ok(())
-        // }))
-        Promise::err(capnp::Error::unimplemented(
-            "method queue::Server::poll not implemented".to_string(),
-        ))
+    fn poll(&mut self, _params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
+        // For now, ignore the requested lease validity and return up to 1 item.
+        // Later we can thread lease validity through the storage layer.
+        let (lease, items) = self
+            .storage
+            .get_next_available_entries(1)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut resp = results.get().init_resp();
+        resp.set_lease(&lease);
+
+        let mut items_builder = resp.init_items(items.len() as u32);
+        for (i, typed_polled_item) in items.into_iter().enumerate() {
+            let item_reader = typed_polled_item
+                .get()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let mut out_item = items_builder.reborrow().get(i as u32);
+            out_item.set_contents(
+                item_reader
+                    .get_contents()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+            );
+            out_item.set_id(
+                item_reader
+                    .get_id()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+            );
+        }
+
+        Promise::ok(())
     }
 }
