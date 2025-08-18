@@ -1,14 +1,12 @@
-use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use color_eyre::{Result, eyre::eyre};
+use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use clap::{Parser, Subcommand};
+use color_eyre::{eyre::eyre, Result};
+use futures::AsyncReadExt;
+use queueber::protocol::queue;
 use uuid::Uuid;
 
-use futures::AsyncReadExt;
-
-use queueber::protocol::queue;
-use clap::{Parser, Subcommand};
-
 #[derive(Parser, Debug)]
-#[command(name = "queueber", version, about = "Queueber client")] 
+#[command(name = "queueber", version, about = "Queueber client")]
 struct Cli {
     /// Server address (host:port)
     #[arg(short = 'a', long = "addr", default_value = "localhost:9090")]
@@ -29,6 +27,12 @@ enum Commands {
         /// Visibility timeout in seconds
         #[arg(short = 'v', long = "visibility", default_value_t = 10)]
         visibility_timeout_secs: u64,
+    },
+    /// Poll for available items
+    Poll {
+        /// How long the lease should be valid on the server (seconds)
+        #[arg(short = 'l', long = "lease", default_value_t = 30)]
+        lease_validity_secs: u64,
     },
 }
 
@@ -69,17 +73,55 @@ async fn main() -> Result<()> {
                     println!(
                         "received {:?} ids: {:?}",
                         ids.len(),
-                        ids.iter()
-                            .map(|id| id
-                                .map_err(|e| eyre!("some error idk: {:?}", e))
-                                .and_then(
-                                    |id| Uuid::from_slice(id).map_err(|e| eyre!("invalid uuid: {:?}", e))
-                                ))
+                        ids
+                            .iter()
+                            .map(|id| {
+                                id.map_err(|e| eyre!("some error idk: {:?}", e)).and_then(|id| {
+                                    Uuid::from_slice(id)
+                                        .map_err(|e| eyre!("invalid uuid: {:?}", e))
+                                })
+                            })
                             .collect::<Result<Vec<_>, _>>()?
                     );
+                    Ok(())
+                }
+                Commands::Poll { lease_validity_secs } => {
+                    let mut request = queue_client.poll_request();
+                    let mut req = request.get().init_req();
+                    req.set_lease_validity_secs(lease_validity_secs);
+
+                    let reply = request.send().promise.await?;
+                    let resp = reply.get()?.get_resp()?;
+                    let lease = resp.get_lease()?;
+                    let items = resp.get_items()?;
+
+                    println!(
+                        "lease: {}",
+                        Uuid::from_slice(lease)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| format!("{:?}", lease))
+                    );
+                    if items.len() == 0 {
+                        println!("no items available");
+                    } else {
+                        for i in 0..items.len() {
+                            let item = items.get(i);
+                            let id = item.get_id()?;
+                            let contents = item.get_contents()?;
+                            println!(
+                                "item {}: id={}, contents={}",
+                                i,
+                                Uuid::from_slice(id)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_else(|_| format!("{:?}", id)),
+                                String::from_utf8_lossy(contents)
+                            );
+                        }
+                    }
                     Ok(())
                 }
             }
         })
         .await
 }
+

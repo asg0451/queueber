@@ -52,13 +52,27 @@ impl crate::protocol::queue::Server for Server {
         ))
     }
 
-    fn poll(&mut self, _: PollParams, _: PollResults) -> Promise<(), capnp::Error> {
-        // Promise::from_future(req.send().promise.and_then(move |response| {
-        //     results.get().set_y(response.get()?.get_y());
-        //     Ok(())
-        // }))
-        Promise::err(capnp::Error::unimplemented(
-            "method queue::Server::poll not implemented".to_string(),
-        ))
+    fn poll(&mut self, _params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
+        // For now, ignore the requested lease validity and return up to 1 item.
+        // Later we can thread lease validity through the storage layer.
+        let (lease, items) = self
+            .storage
+            .get_next_available_entries(1)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut resp = results.get().init_resp();
+        resp.set_lease(&lease);
+
+        let mut items_builder = resp.init_items(items.len() as u32);
+        for (i, typed_polled_item) in items.into_iter().enumerate() {
+            let item_reader = typed_polled_item.get().map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let mut out_item = items_builder.reborrow().get(i as u32);
+            out_item
+                .set_contents(item_reader.get_contents().map_err(|e| capnp::Error::failed(e.to_string()))?);
+            out_item
+                .set_id(item_reader.get_id().map_err(|e| capnp::Error::failed(e.to_string()))?);
+        }
+
+        Promise::ok(())
     }
 }
