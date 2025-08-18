@@ -1,0 +1,169 @@
+use std::net::{SocketAddr, TcpListener};
+use std::sync::mpsc::sync_channel;
+use std::time::{Duration, Instant};
+
+use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use futures::AsyncReadExt;
+
+use queueber::protocol::queue;
+use queueber::storage::Storage;
+
+struct TestServerHandle {
+    _data_dir: tempfile::TempDir,
+    _thread: std::thread::JoinHandle<()>,
+    addr: SocketAddr,
+}
+
+fn start_test_server() -> TestServerHandle {
+    // Prepare a temporary data directory and bind to an OS-assigned port
+    let data_dir = tempfile::TempDir::new().expect("tmp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    // Signal channel to indicate readiness
+    let (ready_tx, ready_rx) = sync_channel::<()>(1);
+
+    let data_path = data_dir.path().to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            use queueber::protocol::queue::Client as QueueClient;
+            use queueber::server::Server;
+            use std::sync::Arc;
+            use tokio::sync::Notify;
+
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            let storage = Arc::new(Storage::new(&data_path).unwrap());
+            let notify = Arc::new(Notify::new());
+            let server = Server::new(storage, notify);
+            let queue_client: QueueClient = capnp_rpc::new_client(server);
+
+            // Indicate that the server is ready to accept connections
+            let _ = ready_tx.send(());
+
+            tokio::task::LocalSet::new()
+                .run_until(async move {
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        stream.set_nodelay(true).unwrap();
+                        let (reader, writer) =
+                            tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+                        let network = twoparty::VatNetwork::new(
+                            futures::io::BufReader::new(reader),
+                            futures::io::BufWriter::new(writer),
+                            rpc_twoparty_capnp::Side::Server,
+                            Default::default(),
+                        );
+                        let rpc_system =
+                            RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
+                        let _jh = tokio::task::spawn_local(rpc_system);
+                    }
+                })
+                .await;
+        });
+    });
+
+    // Wait for readiness signal
+    let _ = ready_rx.recv();
+
+    TestServerHandle { _data_dir: data_dir, _thread: thread, addr }
+}
+
+async fn with_client<F, Fut, R>(addr: SocketAddr, f: F) -> R
+where
+    F: FnOnce(queue::Client) -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+    let rpc_network = Box::new(twoparty::VatNetwork::new(
+        futures::io::BufReader::new(reader),
+        futures::io::BufWriter::new(writer),
+        rpc_twoparty_capnp::Side::Client,
+        Default::default(),
+    ));
+    let mut rpc_system = RpcSystem::new(rpc_network, None);
+    let queue_client: queue::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let _jh = tokio::task::spawn_local(rpc_system);
+            f(queue_client).await
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn poll_times_out_after_waiting_when_empty() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    let elapsed = with_client(addr, |queue_client| async move {
+        let start = Instant::now();
+        let mut request = queue_client.poll_request();
+        let mut req = request.get().init_req();
+        req.set_lease_validity_secs(30);
+        req.set_num_items(1);
+        req.set_timeout_secs(1); // 1 second timeout
+        let _reply = request.send().promise.await.unwrap();
+        start.elapsed()
+    })
+    .await;
+
+    // Expect we waited at least ~1s, and not an excessively long time
+    assert!(elapsed >= Duration::from_millis(900), "elapsed: {:?}", elapsed);
+    assert!(elapsed < Duration::from_secs(3), "elapsed: {:?}", elapsed);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn poll_indefinite_wait_wakes_on_add() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    with_client(addr, |queue_client| async move {
+        // Start a poll with timeout_secs = 0 (wait indefinitely)
+        let mut poll_req = queue_client.poll_request();
+        {
+            let mut req = poll_req.get().init_req();
+            req.set_lease_validity_secs(30);
+            req.set_num_items(1);
+            req.set_timeout_secs(0);
+        }
+
+        // Concurrently, after a short delay, add an item to wake the waiter
+        let client_for_add = queue_client.clone();
+        let add_task = tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut add = client_for_add.add_request();
+            {
+                let req = add.get().init_req();
+                let mut items = req.init_items(1);
+                let mut item = items.reborrow().get(0);
+                item.set_contents(b"hello");
+                item.set_visibility_timeout_secs(0);
+            }
+            let _ = add.send().promise.await.unwrap();
+        });
+
+        // The poll should complete shortly after the add notifies waiters
+        let reply = tokio::time::timeout(Duration::from_secs(3), async {
+            poll_req.send().promise.await.unwrap()
+        })
+        .await
+        .expect("poll should complete after add");
+
+        add_task.await.unwrap();
+
+        // Verify that we received at least one item
+        let resp = reply.get().unwrap().get_resp().unwrap();
+        let items = resp.get_items().unwrap();
+        assert!(!items.is_empty());
+    })
+    .await;
+}
+
