@@ -11,5 +11,6 @@
 - [ ] (feat) implement lease expiry
 - [X] (feat) implement poll in server
 - [ ] (minor) add polling timeout and num_items options
+- [ ] (major) fix race condition: concurrent polls can hand out the same messages
 - [ ] (feat) implement remove
 - [ ] (feat) implement extend
