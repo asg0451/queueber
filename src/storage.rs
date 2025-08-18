@@ -43,50 +43,24 @@ impl Storage {
         &self,
         (id, item): (&'i [u8], protocol::item::Reader<'i>),
     ) -> Result<()> {
-        let main_key = AvailableKey::from_id(id);
-
-        // compute visible-at timestamp and build index key
-        let now = std::time::SystemTime::now();
-        let visible_ts_secs = (now
-            + std::time::Duration::from_secs(item.get_visibility_timeout_secs()))
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-
-        let visibility_index_key =
-            VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
-
-        // make stored item to insert
-        let mut simsg = message::Builder::new_default();
-        let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
-        stored_item.set_contents(item.get_contents()?);
-        stored_item.set_id(id);
-        stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
-        let mut contents = Vec::with_capacity(simsg.size_in_words() * 8); // TODO: reuse
-        serialize_packed::write_message(&mut contents, &simsg)?;
-
-        let mut batch = WriteBatchWithTransaction::<false>::default();
-        batch.put(main_key.as_ref(), &contents);
-        batch.put(visibility_index_key.as_ref(), main_key.as_ref());
-        self.db.write(batch)?;
-
-        tracing::debug!(
-            "inserted item: ({}: {}), ({}: {})",
-            String::from_utf8_lossy(main_key.as_ref()),
-            String::from_utf8_lossy(&contents),
-            String::from_utf8_lossy(visibility_index_key.as_ref()),
-            String::from_utf8_lossy(main_key.as_ref())
-        );
-
-        Ok(())
+        self.add_available_item_from_parts(
+            id,
+            item.get_contents()?,
+            item.get_visibility_timeout_secs(),
+        )
     }
 
     pub fn add_available_items<'i>(
         &self,
         items: impl Iterator<Item = (&'i [u8], protocol::item::Reader<'i>)>,
     ) -> Result<()> {
-        // TODO: more intelligently
-        for entry in items {
-            self.add_available_item(entry)?;
+        // Delegate to the single-item owned-part API to avoid code duplication.
+        for (id, item) in items {
+            self.add_available_item_from_parts(
+                id,
+                item.get_contents()?,
+                item.get_visibility_timeout_secs(),
+            )?;
         }
         Ok(())
     }

@@ -25,19 +25,9 @@ impl Server {
 
 impl crate::protocol::queue::Server for Server {
     fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), capnp::Error> {
-        let req = match params.get() {
-            Ok(r) => r,
-            Err(e) => return Promise::err(e),
-        };
-        let req = match req.get_req() {
-            Ok(r) => r,
-            Err(e) => return Promise::err(e),
-        };
-
-        let items = match req.get_items() {
-            Ok(it) => it,
-            Err(e) => return Promise::err(e),
-        };
+        let req = match params.get() { Ok(r) => r, Err(e) => return Promise::err(e) };
+        let req = match req.get_req() { Ok(r) => r, Err(e) => return Promise::err(e) };
+        let items = match req.get_items() { Ok(it) => it, Err(e) => return Promise::err(e) };
 
         // Generate ids upfront and copy request data into owned memory so we can move
         // it into a blocking task (capnp readers are not Send).
@@ -65,17 +55,15 @@ impl crate::protocol::queue::Server for Server {
         Promise::from_future(async move {
             // Offload RocksDB work to the blocking thread pool.
             tokio::task::spawn_blocking(move || {
-                // Zip ids with item parts, pass as slices to avoid extra allocations.
                 let iter = ids
                     .iter()
                     .map(|id| id.as_slice())
                     .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
-                storage
-                    .add_available_items_from_parts(iter)
+                storage.add_available_items_from_parts(iter)
             })
             .await
-            .map_err(|e| capnp::Error::failed(format!("join error: {}", e)))?
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            .map_err(|e| crate::errors::Error::from(e))? // Join error -> our Error
+            .map_err(|e| capnp::Error::from(e))?;        // our Error -> capnp
 
             // Notify any waiters that new items may be available
             notify.notify_waiters();

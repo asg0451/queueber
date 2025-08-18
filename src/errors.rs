@@ -1,5 +1,6 @@
 use std::backtrace::Backtrace;
 use thiserror::Error;
+use tokio::task::JoinError;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -28,6 +29,12 @@ pub enum Error {
     Rocksdb {
         #[from]
         source: rocksdb::Error,
+        backtrace: Backtrace,
+    },
+    #[error("join error: {source}")]
+    Join {
+        #[from]
+        source: JoinError,
         backtrace: Backtrace,
     },
     #[error("system time error: {source}")]
