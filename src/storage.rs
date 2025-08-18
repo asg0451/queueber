@@ -116,6 +116,23 @@ impl Storage {
         Ok(())
     }
 
+    /// Return the next visibility timestamp (secs since epoch) among items in the
+    /// visibility index, if any. This is determined by reading the first key in
+    /// the `visibility_index/` namespace which is ordered by big-endian timestamp.
+    pub fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
+        let mut iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
+        if let Some(kv) = iter.next() {
+            let (idx_key, _val) = kv?;
+            debug_assert_eq!(
+                &idx_key[..VisibilityIndexKey::PREFIX.len()],
+                VisibilityIndexKey::PREFIX
+            );
+            Ok(VisibilityIndexKey::parse_visible_ts_secs(&idx_key))
+        } else {
+            Ok(None)
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn get_next_available_entries(
         &self,

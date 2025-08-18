@@ -55,6 +55,47 @@ impl Server {
             }
         });
 
+        // Background task to wake pollers when any invisible message becomes visible.
+        let vis_storage = Arc::clone(&storage);
+        let vis_notify = Arc::clone(&notify);
+        tokio::spawn(async move {
+            loop {
+                // Peek earliest visibility timestamp from RocksDB (blocking)
+                let next_vis_opt = tokio::task::spawn_blocking({
+                    let st = Arc::clone(&vis_storage);
+                    move || st.peek_next_visibility_ts_secs()
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten();
+
+                match next_vis_opt {
+                    Some(ts_secs) => {
+                        // Compute duration until visibility; if already visible, notify now.
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(ts_secs);
+                        if ts_secs <= now_secs {
+                            vis_notify.notify_waiters();
+                            // Avoid busy loop; small sleep before checking again.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        } else {
+                            let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
+                            tokio::time::sleep(sleep_dur).await;
+                            // After sleeping until next visibility, notify waiters
+                            vis_notify.notify_waiters();
+                        }
+                    }
+                    None => {
+                        // No items; back off
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        });
+
         Self {
             storage,
             notify,
