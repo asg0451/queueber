@@ -57,6 +57,10 @@ Connects to server at `localhost:9090` and demonstrates adding an item
 - Leases track which items are currently being processed
 - All database operations use atomic batches for consistency
 
+### Code Style Notes
+
+- Prefer iterator combinators (`iter`, `map`, `filter`, `filter_map`, `collect`) over index-based loops when collecting or transforming data.
+
 ### Schema Generation
 
 The Cap'n Proto schema (`queueber.capnp`) is compiled during build via `build.rs`. Uses Rust nightly toolchain as specified in `rust-toolchain.toml`.

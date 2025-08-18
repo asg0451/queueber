@@ -224,17 +224,19 @@ impl Storage {
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let keys = lease_entry_reader.get_keys()?;
 
-        // Build filtered keys excluding the provided id
-        let mut kept_keys: Vec<&[u8]> = Vec::with_capacity(keys.len().saturating_sub(1) as usize);
+        // Build filtered keys excluding the provided id using iterator combinators
         let mut found = false;
-        for i in 0..keys.len() {
-            let k = keys.get(i)?;
-            if k == id {
-                found = true;
-            } else {
-                kept_keys.push(k);
-            }
-        }
+        let kept_keys: Vec<&[u8]> = keys
+            .iter()
+            .filter_map(|res| match res {
+                Ok(k) if k == id => {
+                    found = true;
+                    None
+                }
+                Ok(k) => Some(k),
+                Err(_) => None,
+            })
+            .collect();
 
         if !found {
             return Ok(false);
