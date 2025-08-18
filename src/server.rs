@@ -62,8 +62,10 @@ impl crate::protocol::queue::Server for Server {
         let ids_for_resp = ids.clone();
 
         Promise::from_future(async move {
+            // Prefer using `?` for error propagation instead of manual map_err chains.
+            // This keeps the flow concise and leverages From conversions.
             // Offload RocksDB work to the blocking thread pool.
-            tokio::task::spawn_blocking(move || {
+            let inner_result = tokio::task::spawn_blocking(move || {
                 let iter = ids
                     .iter()
                     .map(|id| id.as_slice())
@@ -71,8 +73,9 @@ impl crate::protocol::queue::Server for Server {
                 storage.add_available_items_from_parts(iter)
             })
             .await
-            .map_err(|e| crate::errors::Error::from(e))? // Join error -> our Error
-            .map_err(|e| capnp::Error::from(e))?; // our Error -> capnp
+            .map_err(crate::errors::Error::from)?; // JoinError -> our Error
+
+            inner_result?; // our Error -> capnp::Error via From<Error>
 
             // Notify any waiters that new items may be available
             notify.notify_waiters();
