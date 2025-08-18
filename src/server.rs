@@ -3,6 +3,7 @@ use capnp::message::{Builder, HeapAllocator, TypedReader};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::Duration;
+use tokio::sync::watch;
 
 use crate::errors::{Error, Result};
 use crate::{
@@ -17,13 +18,17 @@ use crate::{
 pub struct Server {
 	storage: Arc<Storage>,
 	notify: Arc<Notify>,
+	shutdown_tx: watch::Sender<bool>,
 }
 
 impl Server {
-	pub fn new(storage: Arc<Storage>) -> Self {
+	pub fn new(storage: Arc<Storage>) -> (Self, watch::Receiver<bool>) {
 		let notify = Arc::new(Notify::new());
+		let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
 		let bg_storage = Arc::clone(&storage);
 		let bg_notify = Arc::clone(&notify);
+		let bg_shutdown_tx = shutdown_tx.clone();
 
 		// Background task to expire leases periodically
 		tokio::spawn(async move {
@@ -35,18 +40,23 @@ impl Server {
 							bg_notify.notify_waiters();
 						}
 					}
-					Ok(Err(e)) => {
-						panic!("lease expiry sweep error: {e}");
+					Ok(Err(_e)) => {
+						let _ = bg_shutdown_tx.send(true);
+						break;
 					}
-					Err(join_err) => {
-						panic!("lease expiry task join error: {join_err}");
+					Err(_join_err) => {
+						let _ = bg_shutdown_tx.send(true);
+						break;
 					}
 				}
 				tokio::time::sleep(Duration::from_millis(500)).await;
 			}
 		});
 
-		Self { storage, notify }
+		(
+			Self { storage, notify, shutdown_tx },
+			shutdown_rx,
+		)
 	}
 }
 

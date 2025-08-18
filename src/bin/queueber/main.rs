@@ -5,6 +5,7 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
+use tokio::sync::watch;
 use std::sync::Arc;
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
@@ -28,30 +29,41 @@ async fn main() -> Result<()> {
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
     let storage = Arc::new(Storage::new(&args.data_dir)?);
-    let server = Server::new(Arc::clone(&storage));
+    let (server, mut shutdown_rx) = Server::new(Arc::clone(&storage));
 
     tokio::task::LocalSet::new()
         .run_until(async move {
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
 
-            loop {
-                let (stream, _) = listener.accept().await?;
-                stream.set_nodelay(true)?;
-                let (reader, writer) =
-                    tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
-                let network = twoparty::VatNetwork::new(
-                    futures::io::BufReader::new(reader),
-                    futures::io::BufWriter::new(writer),
-                    rpc_twoparty_capnp::Side::Server,
-                    Default::default(),
-                );
+            let res: color_eyre::Result<()> = async move {
+                loop {
+                    tokio::select! {
+                        _ = async { if *shutdown_rx.borrow() { () } else { let _ = shutdown_rx.changed().await; } } => {
+                            break;
+                        }
+                        accept = listener.accept() => {
+                            let (stream, _) = accept?;
+                            stream.set_nodelay(true)?;
+                            let (reader, writer) =
+                                tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+                            let network = twoparty::VatNetwork::new(
+                                futures::io::BufReader::new(reader),
+                                futures::io::BufWriter::new(writer),
+                                rpc_twoparty_capnp::Side::Server,
+                                Default::default(),
+                            );
 
-                let rpc_system =
-                    RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
+                            let rpc_system =
+                                RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
 
-                tokio::task::spawn_local(rpc_system);
-            }
+                            tokio::task::spawn_local(rpc_system);
+                        }
+                    }
+                }
+                Ok(())
+            }.await;
+            res
         })
         .await
 }
