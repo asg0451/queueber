@@ -94,9 +94,7 @@ async fn main() -> Result<()> {
                     stream.set_nodelay(true)?;
                     let idx = next % senders.len();
                     next = next.wrapping_add(1);
-                    if let Err(e) = senders[idx].send(stream).await {
-                        break 'accept Err(color_eyre::eyre::eyre!("failed to send stream to worker: {e}"));
-                    }
+                    senders[idx].send(stream).await?;
                 }
             }
         }
