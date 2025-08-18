@@ -111,6 +111,12 @@ impl Storage {
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
         // TODO: can we do better?
+        
+        // TODO: RACE CONDITION - concurrent polls can hand out the same messages!
+        // The current implementation reads items with a prefix iterator and then moves them to in_progress,
+        // but there's no locking between the read and write operations. Multiple concurrent polls could
+        // read the same items before any of them complete their write batch, leading to duplicate message
+        // delivery. Need to implement proper locking or use atomic operations to prevent this.
 
         // TODO: use a mockable clock
         let lease = Uuid::now_v7().into_bytes();
