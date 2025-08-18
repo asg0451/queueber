@@ -207,9 +207,10 @@ fn ensure_server_started() -> &'static ServerHandle {
     })
 }
 
-fn with_client<F, R>(addr: SocketAddr, f: F) -> R
+fn with_client<F, Fut, R>(addr: SocketAddr, f: F) -> R
 where
-    F: FnOnce(queue::Client) -> R,
+    F: FnOnce(queue::Client) -> Fut,
+    Fut: std::future::Future<Output = R>,
 {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -232,7 +233,7 @@ where
         tokio::task::LocalSet::new()
             .run_until(async move {
                 let _jh = tokio::task::spawn_local(rpc_system);
-                f(queue_client)
+                f(queue_client).await
             })
             .await
     })
@@ -247,7 +248,7 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
     // Add batch
     group.bench_function(format!("rpc_add_batch_{}", num_items), |b| {
         b.iter(|| {
-            with_client(addr, |queue_client| {
+            with_client(addr, |queue_client| async move {
                 let mut request = queue_client.add_request();
                 let req = request.get().init_req();
                 let mut items = req.init_items(num_items);
@@ -256,12 +257,8 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                     item.set_contents(b"hello");
                     item.set_visibility_timeout_secs(0);
                 }
-                // Block until reply
-                let _ = futures::executor::block_on(async move {
-                    let reply = request.send().promise.await.unwrap();
-                    let _ids = reply.get().unwrap().get_resp().unwrap().get_ids().unwrap();
-                    Ok::<(), ()>(())
-                });
+                let reply = request.send().promise.await.unwrap();
+                let _ids = reply.get().unwrap().get_resp().unwrap().get_ids().unwrap();
             })
         });
     });
@@ -271,7 +268,7 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
         b.iter_batched(
             || {
                 // preload N items
-                with_client(addr, |queue_client| {
+                with_client(addr, |queue_client| async move {
                     let mut request = queue_client.add_request();
                     let req = request.get().init_req();
                     let mut items = req.init_items(num_items);
@@ -280,23 +277,18 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         item.set_contents(b"hello");
                         item.set_visibility_timeout_secs(0);
                     }
-                    futures::executor::block_on(async move {
-                        let _ = request.send().promise.await.unwrap();
-                    });
+                    let _ = request.send().promise.await.unwrap();
                 });
             },
             |_| {
-                with_client(addr, |queue_client| {
+                with_client(addr, |queue_client| async move {
                     let mut request = queue_client.poll_request();
                     let mut req = request.get().init_req();
                     req.set_lease_validity_secs(30);
                     req.set_num_items(num_items);
                     req.set_timeout_secs(0);
-                    let _ = futures::executor::block_on(async move {
-                        let reply = request.send().promise.await.unwrap();
-                        let _resp = reply.get().unwrap().get_resp().unwrap();
-                        Ok::<(), ()>(())
-                    });
+                    let reply = request.send().promise.await.unwrap();
+                    let _resp = reply.get().unwrap().get_resp().unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -308,7 +300,7 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
         b.iter_batched(
             || {
                 // Preload and poll to get lease and ids
-                with_client(addr, |queue_client| {
+                with_client(addr, |queue_client| async move {
                     let mut add = queue_client.add_request();
                     let req = add.get().init_req();
                     let mut items = req.init_items(num_items);
@@ -317,40 +309,33 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         item.set_contents(b"hello");
                         item.set_visibility_timeout_secs(0);
                     }
-                    let (lease, ids) = {
-                        let client_for_poll = queue_client.clone();
-                        futures::executor::block_on(async move {
-                            let _ = add.send().promise.await.unwrap();
-                            let mut poll = client_for_poll.poll_request();
-                            let mut preq = poll.get().init_req();
-                            preq.set_lease_validity_secs(30);
-                            preq.set_num_items(num_items);
-                            preq.set_timeout_secs(0);
-                            let reply = poll.send().promise.await.unwrap();
-                            let resp = reply.get().unwrap().get_resp().unwrap();
-                            let lease = resp.get_lease().unwrap().to_vec();
-                            let items = resp.get_items().unwrap();
-                            let mut ids: Vec<Vec<u8>> = Vec::with_capacity(items.len() as usize);
-                            for i in 0..items.len() {
-                                ids.push(items.get(i).get_id().unwrap().to_vec());
-                            }
-                            (lease, ids)
-                        })
-                    };
-                    (queue_client, lease, ids)
+                    let _ = add.send().promise.await.unwrap();
+                    let mut poll = queue_client.poll_request();
+                    let mut preq = poll.get().init_req();
+                    preq.set_lease_validity_secs(30);
+                    preq.set_num_items(num_items);
+                    preq.set_timeout_secs(0);
+                    let reply = poll.send().promise.await.unwrap();
+                    let resp = reply.get().unwrap().get_resp().unwrap();
+                    let lease = resp.get_lease().unwrap().to_vec();
+                    let items = resp.get_items().unwrap();
+                    let mut ids: Vec<Vec<u8>> = Vec::with_capacity(items.len() as usize);
+                    for i in 0..items.len() {
+                        ids.push(items.get(i).get_id().unwrap().to_vec());
+                    }
+                    (lease, ids)
                 })
             },
-            |(queue_client, lease, ids)| {
-                for id in ids {
-                    let mut req = queue_client.remove_request();
-                    let mut r = req.get().init_req();
-                    r.set_id(&id);
-                    r.set_lease(&lease);
-                    let _ = futures::executor::block_on(async move {
+            |(lease, ids)| {
+                with_client(addr, |queue_client| async move {
+                    for id in ids {
+                        let mut req = queue_client.remove_request();
+                        let mut r = req.get().init_req();
+                        r.set_id(&id);
+                        r.set_lease(&lease);
                         let _ = req.send().promise.await.unwrap();
-                        Ok::<(), ()>(())
-                    });
-                }
+                    }
+                });
             },
             BatchSize::SmallInput,
         );
