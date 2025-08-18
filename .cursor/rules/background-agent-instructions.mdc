@@ -11,4 +11,5 @@ alwaysApply: true
 - also install capnpc (`sudo apt-get install capnproto`). you CAN install packages
 
 ## rules
-- never, EVER submit a pr that doesnt build. `cargo check`, `cargo test`, and ci must all pass before you declare success
+- never, EVER submit a pr that doesnt build. `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings` must all pass before you declare success
+- likewise, make sure all merge conflits are resolved before declaring success. do this by running `git pull origin master` before every `git push`
