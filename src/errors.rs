@@ -39,3 +39,10 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<Error> for capnp::Error {
+    fn from(err: Error) -> Self {
+        // Convert any internal error to a failed Cap'n Proto RPC error.
+        capnp::Error::failed(err.to_string())
+    }
+}
