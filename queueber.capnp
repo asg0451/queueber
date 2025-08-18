@@ -23,6 +23,10 @@ struct RemoveResponse {
 
 struct PollRequest {
     leaseValiditySecs @0 :UInt64;
+    # maximum number of items to return. default 1 if unset/zero
+    numItems @1 :UInt32;
+    # how long to wait for items before returning (seconds). server may return sooner
+    timeoutSecs @2 :UInt64;
 }
 
 struct Item {

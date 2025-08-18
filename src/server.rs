@@ -1,4 +1,7 @@
 use capnp::capability::Promise;
+use capnp::message::{Builder, HeapAllocator, TypedReader};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use crate::{
     protocol::queue::{
@@ -12,11 +15,12 @@ use std::sync::Arc;
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs
 pub struct Server {
     storage: Arc<Storage>,
+    notify: Arc<Notify>,
 }
 
 impl Server {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self { storage, notify: Arc::new(Notify::new()) }
     }
 }
 
@@ -56,6 +60,7 @@ impl crate::protocol::queue::Server for Server {
             .collect();
 
         let storage = Arc::clone(&self.storage);
+        let notify = Arc::clone(&self.notify);
         let ids_for_resp = ids.clone();
 
         Promise::from_future(async move {
@@ -72,6 +77,9 @@ impl crate::protocol::queue::Server for Server {
             .await
             .map_err(|e| capnp::Error::failed(format!("join error: {}", e)))?
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            // Notify any waiters that new items may be available
+            notify.notify_waiters();
 
             // Build the response on the RPC thread.
             let mut ids_builder = results.get().init_resp().init_ids(ids_for_resp.len() as u32);
@@ -102,35 +110,56 @@ impl crate::protocol::queue::Server for Server {
         Promise::ok(())
     }
 
-    fn poll(&mut self, _params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
-        // For now, ignore the requested lease validity and return up to 1 item.
-        // Later we can thread lease validity through the storage layer.
-        let (lease, items) = self
-            .storage
-            .get_next_available_entries(1)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+    fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        let notify = Arc::clone(&self.notify);
 
-        let mut resp = results.get().init_resp();
-        resp.set_lease(&lease);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let _lease_validity_secs = req.get_lease_validity_secs();
+            let num_items = match req.get_num_items() { 0 => 1, n => n as usize };
+            let timeout_secs = req.get_timeout_secs();
 
-        let mut items_builder = resp.init_items(items.len() as u32);
-        for (i, typed_polled_item) in items.into_iter().enumerate() {
-            let item_reader = typed_polled_item
-                .get()
+            // Fast path: try immediately
+            if let Ok((lease, items)) = storage.get_next_available_entries(num_items) {
+                write_poll_response(&lease, items, &mut results)?;
+                return Ok(());
+            }
+
+            // Otherwise, wait for notification or timeout, then try again once
+            if timeout_secs > 0 {
+                let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+                tokio::select! {
+                    _ = notify.notified() => {},
+                    _ = timeout => {},
+                }
+            } else {
+                // Wait indefinitely until something is added
+                notify.notified().await;
+            }
+
+            let (lease, items) = storage
+                .get_next_available_entries(num_items)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            let mut out_item = items_builder.reborrow().get(i as u32);
-            out_item.set_contents(
-                item_reader
-                    .get_contents()
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
-            );
-            out_item.set_id(
-                item_reader
-                    .get_id()
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
-            );
-        }
-
-        Promise::ok(())
+            write_poll_response(&lease, items, &mut results)
+        })
     }
+}
+
+fn write_poll_response(
+    lease: &[u8; 16],
+    items: Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>, 
+    results: &mut crate::protocol::queue::PollResults,
+) -> Result<(), capnp::Error> {
+    let mut resp = results.get().init_resp();
+    resp.set_lease(lease);
+
+    let mut items_builder = resp.init_items(items.len() as u32);
+    for (i, typed_polled_item) in items.into_iter().enumerate() {
+        let item_reader = typed_polled_item.get()?;
+        let mut out_item = items_builder.reborrow().get(i as u32);
+        out_item.set_contents(item_reader.get_contents()?);
+        out_item.set_id(item_reader.get_id()?);
+    }
+    Ok(())
 }
