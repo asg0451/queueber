@@ -4,9 +4,9 @@ alwaysApply: true
 
 # background agent instructions
 (ignore this if you arent a background agent)
-## setup
-- always install rust nightly via rustup
-- also install capnpc (`apt-get install capnproto`) and any other build deps. you CAN install packages
+## setup (DO THIS FIRST)
+- install rust nightly via rustup
+- also install capnpc (`sudo apt-get install capnproto`) and any other build deps. you CAN install packages
 
 ## rules
 - never, EVER submit a pr that doesnt build. `cargo check`, `cargo test`, and ci must all pass before you declare success
