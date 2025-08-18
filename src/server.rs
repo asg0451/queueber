@@ -19,11 +19,8 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(storage: Arc<Storage>) -> Self {
-        Self {
-            storage,
-            notify: Arc::new(Notify::new()),
-        }
+    pub fn new(storage: Arc<Storage>, notify: Arc<Notify>) -> Self {
+        Self { storage, notify }
     }
 }
 

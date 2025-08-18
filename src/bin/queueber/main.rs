@@ -6,6 +6,9 @@ use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
 use std::sync::Arc;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
 // for how to send stuff across threads; so we can parallelize the work..?
@@ -28,30 +31,85 @@ async fn main() -> Result<()> {
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
     let storage = Arc::new(Storage::new(&args.data_dir)?);
-    let server = Server::new(Arc::clone(&storage));
+    let notify = Arc::new(Notify::new());
 
-    tokio::task::LocalSet::new()
-        .run_until(async move {
-            let listener = tokio::net::TcpListener::bind(&addr).await?;
-            let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-            loop {
-                let (stream, _) = listener.accept().await?;
-                stream.set_nodelay(true)?;
-                let (reader, writer) =
-                    tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
-                let network = twoparty::VatNetwork::new(
-                    futures::io::BufReader::new(reader),
-                    futures::io::BufWriter::new(writer),
-                    rpc_twoparty_capnp::Side::Server,
-                    Default::default(),
-                );
+    // Build a small pool of RPC workers. Each worker runs a single-threaded
+    // runtime with a LocalSet to host !Send capnp RPC tasks.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
 
-                let rpc_system =
-                    RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
+    let mut senders = Vec::with_capacity(worker_count);
+    let mut worker_handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let (tx, mut rx) = mpsc::channel::<tokio::net::TcpStream>(1024);
+        senders.push(tx);
 
-                tokio::task::spawn_local(rpc_system);
+        let storage_cloned = Arc::clone(&storage);
+        let notify_cloned = Arc::clone(&notify);
+
+        let handle = std::thread::spawn(move || {
+            let rt = RuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build worker runtime");
+
+            rt.block_on(async move {
+                let server = Server::new(storage_cloned, notify_cloned);
+                let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
+
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async move {
+                        while let Some(stream) = rx.recv().await {
+                            let client = queue_client.clone();
+                            let _jh = tokio::task::spawn_local(async move {
+                                let (reader, writer) =
+                                    tokio_util::compat::TokioAsyncReadCompatExt::compat(stream)
+                                        .split();
+                                let network = twoparty::VatNetwork::new(
+                                    futures::io::BufReader::new(reader),
+                                    futures::io::BufWriter::new(writer),
+                                    rpc_twoparty_capnp::Side::Server,
+                                    Default::default(),
+                                );
+                                let rpc_system =
+                                    RpcSystem::new(Box::new(network), Some(client.client));
+                                let _jh2 = tokio::task::spawn_local(rpc_system);
+                            });
+                        }
+                    })
+                    .await;
+            });
+        });
+        worker_handles.push(handle);
+    }
+
+    let accept_outcome: Result<()> = 'accept: {
+        let mut next = 0usize;
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    stream.set_nodelay(true)?;
+                    let idx = next % senders.len();
+                    next = next.wrapping_add(1);
+                    if let Err(e) = senders[idx].send(stream).await {
+                        break 'accept Err(color_eyre::eyre::eyre!(e));
+                    }
+                }
+                Err(e) => break 'accept Err(color_eyre::eyre::eyre!(e)),
             }
-        })
-        .await
+        }
+    };
+
+    // Close all worker channels to signal shutdown
+    drop(senders);
+    // Join worker threads to ensure clean shutdown
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
+
+    accept_outcome
 }
