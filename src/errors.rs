@@ -53,3 +53,4 @@ impl From<Error> for capnp::Error {
         capnp::Error::failed(err.to_string())
     }
 }
+

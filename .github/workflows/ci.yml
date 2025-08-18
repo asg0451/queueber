@@ -39,3 +39,7 @@ jobs:
 
     - name: Run Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: "`map_err` is forbidden!"
+      run: |
+        ! git grep -E '\.map_err\(' src/**/*.rs | grep -v 'Into::'

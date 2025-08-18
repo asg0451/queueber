@@ -3,6 +3,7 @@ use capnp::message::{Builder, HeapAllocator, TypedReader};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+use crate::errors::{Error, Result};
 use crate::{
     protocol::queue::{
         AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
@@ -28,18 +29,9 @@ impl Server {
 
 impl crate::protocol::queue::Server for Server {
     fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), capnp::Error> {
-        let req = match params.get() {
-            Ok(r) => r,
-            Err(e) => return Promise::err(e),
-        };
-        let req = match req.get_req() {
-            Ok(r) => r,
-            Err(e) => return Promise::err(e),
-        };
-        let items = match req.get_items() {
-            Ok(it) => it,
-            Err(e) => return Promise::err(e),
-        };
+        let req = params.get()?;
+        let req = req.get_req()?;
+        let items = req.get_items()?;
 
         // Generate ids upfront and copy request data into owned memory so we can move
         // it into a blocking task (capnp readers are not Send).
@@ -48,24 +40,23 @@ impl crate::protocol::queue::Server for Server {
             .map(|_| uuid::Uuid::now_v7().as_bytes().to_vec())
             .collect();
 
-        let items_owned: Vec<(Vec<u8>, u64)> = items
+        let items_owned = items
             .iter()
-            .map(|item| {
-                let contents = item.get_contents().unwrap_or_default().to_vec();
+            .map(|item| -> Result<_> {
+                let contents = item.get_contents()?.to_vec();
                 let vis = item.get_visibility_timeout_secs();
-                (contents, vis)
+                Ok((contents, vis))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()
+            .map_err(Into::<capnp::Error>::into)?;
 
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
         let ids_for_resp = ids.clone();
 
         Promise::from_future(async move {
-            // Prefer using `?` for error propagation instead of manual map_err chains.
-            // This keeps the flow concise and leverages From conversions.
             // Offload RocksDB work to the blocking thread pool.
-            let inner_result = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 let iter = ids
                     .iter()
                     .map(|id| id.as_slice())
@@ -73,9 +64,7 @@ impl crate::protocol::queue::Server for Server {
                 storage.add_available_items_from_parts(iter)
             })
             .await
-            .map_err(crate::errors::Error::from)?; // JoinError -> our Error
-
-            inner_result?; // our Error -> capnp::Error via From<Error>
+            .map_err(Into::<Error>::into)??;
 
             // Notify any waiters that new items may be available
             notify.notify_waiters();
@@ -110,7 +99,7 @@ impl crate::protocol::queue::Server for Server {
         let removed = self
             .storage
             .remove_in_progress_item(id, &lease)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            .map_err(Into::into)?;
 
         results.get().init_resp().set_removed(removed);
         Promise::ok(())
@@ -148,9 +137,9 @@ impl crate::protocol::queue::Server for Server {
             }
 
             let (lease, items) = storage
-                .get_next_available_entries(num_items)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            write_poll_response(&lease, items, &mut results)
+                .get_next_available_entries(num_items)?;
+            write_poll_response(&lease, items, &mut results)?;
+            Ok(())
         })
     }
 }
@@ -159,7 +148,7 @@ fn write_poll_response(
     lease: &[u8; 16],
     items: Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>,
     results: &mut crate::protocol::queue::PollResults,
-) -> Result<(), capnp::Error> {
+) -> Result<()> {
     let mut resp = results.get().init_resp();
     resp.set_lease(lease);
 
