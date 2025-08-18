@@ -1,16 +1,16 @@
 use std::{net::ToSocketAddrs, path::PathBuf};
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
+use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
-use clap::Parser;
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
 // for how to send stuff across threads; so we can parallelize the work..?
 
 #[derive(Parser, Debug)]
-#[command(name = "queueber-server", version, about = "Queueber server")] 
+#[command(name = "queueber-server", version, about = "Queueber server")]
 struct Args {
     /// Address to listen on (host:port)
     #[arg(short = 'l', long = "listen", default_value = "127.0.0.1:9090")]

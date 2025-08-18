@@ -1,6 +1,6 @@
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use clap::{Parser, Subcommand};
-use color_eyre::{eyre::eyre, Result};
+use color_eyre::{Result, eyre::eyre};
 use futures::AsyncReadExt;
 use queueber::protocol::queue;
 use uuid::Uuid;
@@ -59,7 +59,10 @@ async fn main() -> Result<()> {
             tokio::task::spawn_local(rpc_system);
 
             match cli.command {
-                Commands::Add { contents, visibility_timeout_secs } => {
+                Commands::Add {
+                    contents,
+                    visibility_timeout_secs,
+                } => {
                     let mut request = queue_client.add_request();
                     let req = request.get().init_req();
                     let items = req.init_items(1);
@@ -73,19 +76,21 @@ async fn main() -> Result<()> {
                     println!(
                         "received {:?} ids: {:?}",
                         ids.len(),
-                        ids
-                            .iter()
+                        ids.iter()
                             .map(|id| {
-                                id.map_err(|e| eyre!("some error idk: {:?}", e)).and_then(|id| {
-                                    Uuid::from_slice(id)
-                                        .map_err(|e| eyre!("invalid uuid: {:?}", e))
-                                })
+                                id.map_err(|e| eyre!("some error idk: {:?}", e))
+                                    .and_then(|id| {
+                                        Uuid::from_slice(id)
+                                            .map_err(|e| eyre!("invalid uuid: {:?}", e))
+                                    })
                             })
                             .collect::<Result<Vec<_>, _>>()?
                     );
                     Ok(())
                 }
-                Commands::Poll { lease_validity_secs } => {
+                Commands::Poll {
+                    lease_validity_secs,
+                } => {
                     let mut request = queue_client.poll_request();
                     let mut req = request.get().init_req();
                     req.set_lease_validity_secs(lease_validity_secs);
@@ -101,7 +106,7 @@ async fn main() -> Result<()> {
                             .map(|u| u.to_string())
                             .unwrap_or_else(|_| format!("{:?}", lease))
                     );
-                    if items.len() == 0 {
+                    if items.is_empty() {
                         println!("no items available");
                     } else {
                         for i in 0..items.len() {
@@ -124,4 +129,3 @@ async fn main() -> Result<()> {
         })
         .await
 }
-

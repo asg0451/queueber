@@ -254,7 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn poll_moves_multiple_items_and_updates_indexes() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn poll_moves_multiple_items_and_updates_indexes()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
@@ -292,7 +293,10 @@ mod tests {
                 k.extend_from_slice(id);
                 k
             };
-            let value = storage.db.get(&in_progress_key)?.ok_or("in_progress value missing")?;
+            let value = storage
+                .db
+                .get(&in_progress_key)?
+                .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
             let msg = serialize_packed::read_message(

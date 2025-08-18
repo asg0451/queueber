@@ -65,12 +65,20 @@ impl crate::protocol::queue::Server for Server {
 
         let mut items_builder = resp.init_items(items.len() as u32);
         for (i, typed_polled_item) in items.into_iter().enumerate() {
-            let item_reader = typed_polled_item.get().map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let item_reader = typed_polled_item
+                .get()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
             let mut out_item = items_builder.reborrow().get(i as u32);
-            out_item
-                .set_contents(item_reader.get_contents().map_err(|e| capnp::Error::failed(e.to_string()))?);
-            out_item
-                .set_id(item_reader.get_id().map_err(|e| capnp::Error::failed(e.to_string()))?);
+            out_item.set_contents(
+                item_reader
+                    .get_contents()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+            );
+            out_item.set_id(
+                item_reader
+                    .get_id()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+            );
         }
 
         Promise::ok(())
