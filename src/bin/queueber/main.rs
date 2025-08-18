@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
         .unwrap_or(2);
 
     let mut senders = Vec::with_capacity(worker_count);
+    let mut worker_handles = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let (tx, mut rx) = mpsc::channel::<tokio::net::TcpStream>(1024);
         senders.push(tx);
@@ -49,7 +50,7 @@ async fn main() -> Result<()> {
         let storage_cloned = Arc::clone(&storage);
         let notify_cloned = Arc::clone(&notify);
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let rt = RuntimeBuilder::new_current_thread()
                 .enable_all()
                 .build()
@@ -83,18 +84,32 @@ async fn main() -> Result<()> {
                     .await;
             });
         });
+        worker_handles.push(handle);
     }
 
-    let mut next = 0usize;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
-        let idx = next % senders.len();
-        next = next.wrapping_add(1);
-        // send the stream to the selected worker
-        senders[idx]
-            .send(stream)
-            .await
-            .map_err(|e| color_eyre::eyre::eyre!(e))?;
+    let accept_outcome: Result<()> = 'accept: {
+        let mut next = 0usize;
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    stream.set_nodelay(true)?;
+                    let idx = next % senders.len();
+                    next = next.wrapping_add(1);
+                    if let Err(e) = senders[idx].send(stream).await {
+                        break 'accept Err(color_eyre::eyre::eyre!(e));
+                    }
+                }
+                Err(e) => break 'accept Err(color_eyre::eyre::eyre!(e)),
+            }
+        }
+    };
+
+    // Close all worker channels to signal shutdown
+    drop(senders);
+    // Join worker threads to ensure clean shutdown
+    for handle in worker_handles {
+        let _ = handle.join();
     }
+
+    accept_outcome
 }
