@@ -171,8 +171,10 @@ fn ensure_server_started() -> &'static ServerHandle {
                 // removed notify
                 let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
                 let storage = Arc::new(Storage::new(&data_path).unwrap());
-                let server = Server::new(storage);
-                let queue_client: QueueClient = capnp_rpc::new_client(server.0);
+                let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+                let notify = Arc::new(tokio::sync::Notify::new());
+                let server = Server::new(storage, notify, shutdown_tx);
+                let queue_client: QueueClient = capnp_rpc::new_client(server);
                 // Signal readiness once bound and client is created
                 let _ = ready_tx.send(());
 

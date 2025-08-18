@@ -23,10 +23,7 @@ pub struct Server {
 }
 
 impl Server {
-	pub fn new(storage: Arc<Storage>) -> (Self, watch::Receiver<bool>) {
-		let notify = Arc::new(Notify::new());
-		let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
+	pub fn new(storage: Arc<Storage>, notify: Arc<Notify>, shutdown_tx: watch::Sender<bool>) -> Self {
 		let bg_storage = Arc::clone(&storage);
 		let bg_notify = Arc::clone(&notify);
 		let bg_shutdown_tx = shutdown_tx.clone();
@@ -54,10 +51,7 @@ impl Server {
 			}
 		});
 
-		(
-			Self { storage, notify, shutdown_tx },
-			shutdown_rx,
-		)
+		Self { storage, notify, shutdown_tx }
 	}
 }
 
