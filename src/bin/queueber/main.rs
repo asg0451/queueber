@@ -92,8 +92,11 @@ async fn main() -> Result<()> {
         let idx = next % senders.len();
         next = next.wrapping_add(1);
         // send the stream to the selected worker
-        if let Err(_e) = senders[idx].send(stream).await {
-            // worker closed; skip (in production we might recreate)
+        if let Err(e) = senders[idx].send(stream).await {
+            return Err(color_eyre::eyre::eyre!(
+                "worker {} channel closed; shutting down server: {}",
+                idx, e
+            ));
         }
     }
 }
