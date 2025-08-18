@@ -111,17 +111,24 @@ impl Storage {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         
-        // Create a prefix that includes only timestamps <= current time
+        // Create a range iterator that efficiently scans only visible items
         // The visibility index key format is: visibility_index/ + timestamp + "/" + id
-        // We want to iterate over all keys where timestamp <= now
-        // Since timestamps are stored as little-endian bytes, we need to handle this carefully
-        let mut visible_prefix = Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + 8);
-        visible_prefix.extend_from_slice(VISIBILITY_INDEX_PREFIX);
+        // Since timestamps are stored as little-endian bytes and keys are ordered,
+        // we can create a range from the start to a key that represents the current timestamp
+        let start_key = VISIBILITY_INDEX_PREFIX.to_vec();
         
-        // For now, we'll use a simple approach: iterate over all visibility index entries
-        // and filter by timestamp. This could be optimized with a more sophisticated
-        // prefix-based approach, but this is simpler and more reliable.
-        let iter = self.db.prefix_iterator(VISIBILITY_INDEX_PREFIX);
+        // Create an end key that represents the maximum timestamp for the current time
+        // We add 1 to the current timestamp to create an exclusive upper bound
+        let end_timestamp = now + 1;
+        let end_timestamp_bytes = end_timestamp.to_le_bytes();
+        let mut end_key = Vec::with_capacity(VISIBILITY_INDEX_PREFIX.len() + end_timestamp_bytes.len());
+        end_key.extend_from_slice(VISIBILITY_INDEX_PREFIX);
+        end_key.extend_from_slice(&end_timestamp_bytes);
+        
+        // Use a range iterator that scans from start_key to end_key (exclusive)
+        // This leverages the ordered nature of the keys for efficient prefix scanning
+        // and automatically stops when we reach keys with timestamps >= end_timestamp
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
 
         // move these items to in progress and create a lease
         // NOTE: this means either scanning twice or buffering. going with the latter for now, since n is probably small.
@@ -136,8 +143,7 @@ impl Storage {
 
         let mut in_progress_batch = WriteBatchWithTransaction::<false>::default();
 
-        let mut items_processed = 0;
-        for kv in iter {
+        for (items_processed, kv) in iter.enumerate() {
             let (idx_key, main_key) = kv?;
 
             debug_assert_eq!(
@@ -145,7 +151,12 @@ impl Storage {
                 VISIBILITY_INDEX_PREFIX
             );
 
-            // Extract timestamp from visibility index key
+            // Stop if we've reached the end of our range (keys with timestamps >= end_timestamp)
+            if idx_key.as_ref() >= end_key.as_slice() {
+                break;
+            }
+
+            // Extract timestamp from visibility index key for validation
             // Key format: visibility_index/ + timestamp + "/" + id
             let timestamp_start = VISIBILITY_INDEX_PREFIX.len();
             let timestamp_end = idx_key[timestamp_start..]
@@ -164,9 +175,9 @@ impl Storage {
                 })?
             );
             
-            // Skip items that are not yet visible
+            // Double-check that the item is actually visible (defensive programming)
             if item_timestamp > now {
-                continue;
+                break;
             }
             
             // Stop if we've processed enough items
@@ -219,8 +230,6 @@ impl Storage {
             // add the lease entry key
             lease_keys.push(main_key[AVAILABLE_PREFIX.len()..].to_vec());
             // TODO: make newtype safety stuff for these
-            
-            items_processed += 1;
         }
 
         // Create the lease entry with the actual number of keys
@@ -469,6 +478,59 @@ mod tests {
         let (lease, entries) = storage.get_next_available_entries(10)?;
         assert!(!lease.iter().all(|b| *b == 0));
         assert_eq!(entries.len(), 0); // Should get no items
+
+        Ok(())
+    }
+
+    #[test]
+    fn poll_efficiently_scans_only_visible_range() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_efficient_scan";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // Add items with different visibility timeouts to test the range scanning
+        let mut message1 = Builder::new_default();
+        let item1 = make_item_with_timeout(&mut message1, 0); // Immediately visible
+        storage.add_available_item((b"visible_now", item1)).unwrap();
+
+        let mut message2 = Builder::new_default();
+        let item2 = make_item_with_timeout(&mut message2, 5); // Visible in 5 seconds
+        storage.add_available_item((b"visible_later", item2)).unwrap();
+
+        let mut message3 = Builder::new_default();
+        let item3 = make_item_with_timeout(&mut message3, 10); // Visible in 10 seconds
+        storage.add_available_item((b"visible_much_later", item3)).unwrap();
+
+        // Poll for items - should only get the immediately visible one
+        let (lease, entries) = storage.get_next_available_entries(10)?;
+        assert!(!lease.iter().all(|b| *b == 0));
+        assert_eq!(entries.len(), 1); // Should only get the visible item
+
+        let si = entries[0].get()?;
+        assert_eq!(si.get_id()?, b"visible_now");
+        assert_eq!(si.get_contents()?, b"hello");
+
+        // Verify that the other items are still in the available state
+        // (not moved to in_progress since they weren't visible)
+        let available_key1 = {
+            let mut k = Vec::new();
+            k.extend_from_slice(b"available/");
+            k.extend_from_slice(b"visible_later");
+            k
+        };
+        assert!(storage.db.get(&available_key1)?.is_some());
+
+        let available_key2 = {
+            let mut k = Vec::new();
+            k.extend_from_slice(b"available/");
+            k.extend_from_slice(b"visible_much_later");
+            k
+        };
+        assert!(storage.db.get(&available_key2)?.is_some());
 
         Ok(())
     }
