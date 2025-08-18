@@ -17,4 +17,4 @@
 - [ ] (feat) implement extend
 - [X] (bugfix) e2e benchmark hangs / improve benchmarks
 - [X] (bugfix) polling returns early if it's woken by a new message being added, *even if it isnt visible*.
-- [ ] (bugfix) poll-waiting isnt interrupted when a message becomes visible
+- [X] (bugfix) poll-waiting isnt interrupted when a message becomes visible

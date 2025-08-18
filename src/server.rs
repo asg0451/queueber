@@ -30,7 +30,8 @@ impl Server {
     ) -> Self {
         let bg_storage = Arc::clone(&storage);
         let bg_notify = Arc::clone(&notify);
-        let bg_shutdown_tx = shutdown_tx.clone();
+        let lease_expiry_shutdown = shutdown_tx.clone();
+        let visibility_wakeup_shutdown = shutdown_tx.clone();
 
         // Background task to expire leases periodically
         tokio::spawn(async move {
@@ -39,19 +40,67 @@ impl Server {
                 match tokio::task::spawn_blocking(move || st.expire_due_leases()).await {
                     Ok(Ok(n)) => {
                         if n > 0 {
-                            bg_notify.notify_waiters();
+                            bg_notify.notify_one();
                         }
                     }
                     Ok(Err(_e)) => {
-                        let _ = bg_shutdown_tx.send(true);
+                        let _ = lease_expiry_shutdown.send(true);
                         break;
                     }
                     Err(_join_err) => {
-                        let _ = bg_shutdown_tx.send(true);
+                        let _ = lease_expiry_shutdown.send(true);
                         break;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+
+        // Background task to wake pollers when any invisible message becomes visible.
+        let vis_storage = Arc::clone(&storage);
+        let vis_notify = Arc::clone(&notify);
+        tokio::spawn(async move {
+            loop {
+                // Peek earliest visibility timestamp from RocksDB (blocking)
+                let next_vis_opt = tokio::task::spawn_blocking({
+                    let st = Arc::clone(&vis_storage);
+                    move || st.peek_next_visibility_ts_secs()
+                })
+                .await;
+
+                match next_vis_opt {
+                    Ok(Ok(Some(ts_secs))) => {
+                        // Compute duration until visibility; if already visible, notify now.
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(ts_secs);
+                        if ts_secs <= now_secs {
+                            vis_notify.notify_one();
+                            // Avoid busy loop; small sleep before checking again.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        } else {
+                            let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
+                            tokio::time::sleep(sleep_dur).await;
+                            vis_notify.notify_one();
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        // No items; back off
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    // TODO: can this be prettier?
+                    Ok(Err(e)) => {
+                        tracing::error!("peek_next_visibility_ts_secs: {}", e);
+                        let _ = visibility_wakeup_shutdown.send(true);
+                        break;
+                    }
+                    Err(join_err) => {
+                        tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
+                        let _ = visibility_wakeup_shutdown.send(true);
+                        break;
+                    }
+                }
             }
         });
 
@@ -86,6 +135,8 @@ impl crate::protocol::queue::Server for Server {
             .collect::<Result<Vec<_>>>()
             .map_err(Into::<capnp::Error>::into)?;
 
+        let any_immediately_visible = items_owned.iter().any(|(_, vis)| *vis == 0);
+
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
         let ids_for_resp = ids.clone();
@@ -102,8 +153,9 @@ impl crate::protocol::queue::Server for Server {
             .await
             .map_err(Into::<Error>::into)??;
 
-            // Notify any waiters that new items may be available
-            notify.notify_waiters();
+            if any_immediately_visible {
+                notify.notify_one();
+            }
 
             // Build the response on the RPC thread.
             let mut ids_builder = results
