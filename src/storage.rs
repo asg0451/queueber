@@ -9,20 +9,20 @@ use crate::dbkeys::{
     AvailableKey, InProgressKey, LeaseExpiryIndexKey, LeaseKey, VisibilityIndexKey,
 };
 use crate::errors::Result;
-use crate::metrics::SharedMetrics;
+use crate::metrics_wrapper::MetricsWrapper;
 use crate::protocol;
 
 pub struct Storage {
     db: TransactionDB,
-    metrics: Option<SharedMetrics>,
+    metrics: MetricsWrapper,
 }
 
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
-        Self::new_with_metrics(path, None)
+        Self::new_with_metrics(path, MetricsWrapper::none())
     }
 
-    pub fn new_with_metrics(path: &Path, metrics: Option<SharedMetrics>) -> Result<Self> {
+    pub fn new_with_metrics(path: &Path, metrics: MetricsWrapper) -> Result<Self> {
         let mut opts = Options::default();
         // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
         // Extract the namespace prefix up to and including the first '/'.
@@ -74,22 +74,7 @@ impl Storage {
         Ok(())
     }
 
-    fn record_rocksdb_operation(
-        &self,
-        operation: &str,
-        start_time: std::time::Instant,
-        result: &std::result::Result<(), rocksdb::Error>,
-    ) {
-        if let Some(metrics) = &self.metrics {
-            let duration = start_time.elapsed().as_secs_f64();
-            let status = if result.is_ok() { "success" } else { "error" };
-            // Note: We can't use tokio::spawn here since this is in a sync context
-            // The metrics will be recorded synchronously
-            if let Ok(metrics_guard) = metrics.try_write() {
-                metrics_guard.record_rocksdb_operation(operation, status, duration);
-            }
-        }
-    }
+
 
     // Convenience helpers for feeding from owned parts when capnp Readers are not Send.
     #[tracing::instrument(skip(self, contents))]
@@ -99,43 +84,41 @@ impl Storage {
         contents: &[u8],
         visibility_timeout_secs: u64,
     ) -> Result<()> {
-        let start_time = std::time::Instant::now();
+        self.metrics.time_rocksdb_operation("write", || {
+            let main_key = AvailableKey::from_id(id);
+            let now = std::time::SystemTime::now();
+            let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let visibility_index_key = VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
-        let main_key = AvailableKey::from_id(id);
-        let now = std::time::SystemTime::now();
-        let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let visibility_index_key = VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
+            let mut simsg = message::Builder::new_default();
+            let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
+            stored_item.set_contents(contents);
+            stored_item.set_id(id);
+            stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
+            let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
+            serialize_packed::write_message(&mut stored_contents, &simsg)?;
 
-        let mut simsg = message::Builder::new_default();
-        let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
-        stored_item.set_contents(contents);
-        stored_item.set_id(id);
-        stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
-        let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
-        serialize_packed::write_message(&mut stored_contents, &simsg)?;
+            let mut batch = WriteBatchWithTransaction::<true>::default();
+            batch.put(main_key.as_ref(), &stored_contents);
+            batch.put(visibility_index_key.as_ref(), main_key.as_ref());
+            let result = self.db.write(batch);
 
-        let mut batch = WriteBatchWithTransaction::<true>::default();
-        batch.put(main_key.as_ref(), &stored_contents);
-        batch.put(visibility_index_key.as_ref(), main_key.as_ref());
-        let result = self.db.write(batch);
+            if let Ok(()) = result {
+                tracing::debug!(
+                    "inserted item (from parts): ({}: {}), ({}: {})",
+                    String::from_utf8_lossy(main_key.as_ref()),
+                    String::from_utf8_lossy(&stored_contents),
+                    String::from_utf8_lossy(visibility_index_key.as_ref()),
+                    String::from_utf8_lossy(main_key.as_ref())
+                );
+            }
 
-        self.record_rocksdb_operation("write", start_time, &result);
-
-        if let Ok(()) = result {
-            tracing::debug!(
-                "inserted item (from parts): ({}: {}), ({}: {})",
-                String::from_utf8_lossy(main_key.as_ref()),
-                String::from_utf8_lossy(&stored_contents),
-                String::from_utf8_lossy(visibility_index_key.as_ref()),
-                String::from_utf8_lossy(main_key.as_ref())
-            );
-        }
-
-        result.map_err(|e| crate::errors::Error::Rocksdb {
-            source: e,
-            backtrace: std::backtrace::Backtrace::capture(),
+            result.map_err(|e| crate::errors::Error::Rocksdb {
+                source: e,
+                backtrace: std::backtrace::Backtrace::capture(),
+            })
         })
     }
 
@@ -487,9 +470,7 @@ impl Storage {
 
     /// Collect and update RocksDB metrics
     pub fn update_rocksdb_metrics(&self) {
-        if let Some(metrics) = &self.metrics {
-            let start_time = std::time::Instant::now();
-
+        let _ = self.metrics.time_rocksdb_operation("metrics_collection", || {
             // Get RocksDB statistics (simplified for now)
             let memory_usage = 0; // TODO: Implement proper RocksDB property access
             let disk_usage = 0; // TODO: Implement proper RocksDB property access
@@ -498,19 +479,14 @@ impl Storage {
             let _read_amplification = 1.0; // TODO: Calculate from actual stats
             let _write_amplification = 1.0; // TODO: Calculate from actual stats
 
-            if let Ok(metrics_guard) = metrics.try_write() {
-                metrics_guard.update_rocksdb_metrics(memory_usage, disk_usage);
-            }
-
-            self.record_rocksdb_operation("metrics_collection", start_time, &Ok(()));
-        }
+            self.metrics.update_rocksdb_metrics(memory_usage, disk_usage);
+            Ok::<(), rocksdb::Error>(())
+        });
     }
 
     /// Update queue size and depth metrics
     pub fn update_queue_metrics(&self) {
-        if let Some(metrics) = &self.metrics {
-            let start_time = std::time::Instant::now();
-
+        let _ = self.metrics.time_rocksdb_operation("queue_metrics_collection", || {
             // Count available items (queue size)
             let mut size = 0;
             let iter = self.db.prefix_iterator(b"available/");
@@ -529,12 +505,9 @@ impl Storage {
                 depth += 1;
             }
 
-            if let Ok(metrics_guard) = metrics.try_write() {
-                metrics_guard.update_queue_metrics(size, depth);
-            }
-
-            self.record_rocksdb_operation("queue_metrics_collection", start_time, &Ok(()));
-        }
+            self.metrics.update_queue_metrics(size, depth);
+            Ok::<(), rocksdb::Error>(())
+        });
     }
 }
 

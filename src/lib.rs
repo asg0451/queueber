@@ -1,10 +1,12 @@
 // for thiserror with backtraces
 #![feature(error_generic_member_access)]
 
+pub mod background_tasks;
 pub mod dbkeys;
 pub mod errors;
 pub mod metrics;
 pub mod metrics_server;
+pub mod metrics_wrapper;
 pub mod protocol;
 pub mod server;
 pub mod storage;

@@ -5,7 +5,7 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{
-    metrics::create_metrics, metrics_server::MetricsServer, server::Server, storage::Storage,
+    metrics::create_metrics, metrics_server::MetricsServer, server::Server, storage::Storage, metrics_wrapper::MetricsWrapper,
 };
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
 
     let storage = Arc::new(Storage::new_with_metrics(
         &args.data_dir,
-        Some(shared_metrics.clone()),
+        MetricsWrapper::new(Some(shared_metrics.clone())),
     )?);
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -94,12 +94,12 @@ async fn main() -> Result<()> {
                 .build()
                 .expect("build worker runtime");
             rt.block_on(async move {
-                let server = Server::new_with_metrics(
-                    storage_cloned,
-                    notify_cloned,
-                    shutdown_tx_cloned,
-                    Some(shared_metrics_cloned),
-                );
+                        let server = Server::new_with_metrics(
+            storage_cloned,
+            notify_cloned,
+            shutdown_tx_cloned,
+            MetricsWrapper::new(Some(shared_metrics_cloned)),
+        );
                 let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
                 let local = tokio::task::LocalSet::new();
                 local

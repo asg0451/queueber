@@ -3,11 +3,11 @@ use capnp::message::{Builder, HeapAllocator, TypedReader};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::sync::watch;
-use tokio::time::Duration;
 
 use crate::Storage;
+use crate::background_tasks::BackgroundTasks;
 use crate::errors::{Error, Result};
-use crate::metrics::SharedMetrics;
+use crate::metrics_wrapper::MetricsWrapper;
 use crate::protocol::queue::{
     AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
@@ -19,7 +19,7 @@ pub struct Server {
     notify: Arc<Notify>,
     #[allow(dead_code)]
     shutdown_tx: watch::Sender<bool>,
-    metrics: Option<SharedMetrics>,
+    metrics: MetricsWrapper,
 }
 
 impl Server {
@@ -28,189 +28,23 @@ impl Server {
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
-        Self::new_with_metrics(storage, notify, shutdown_tx, None)
+        Self::new_with_metrics(storage, notify, shutdown_tx, MetricsWrapper::none())
     }
 
     pub fn new_with_metrics(
         storage: Arc<Storage>,
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
-        metrics: Option<SharedMetrics>,
+        metrics: MetricsWrapper,
     ) -> Self {
-        let bg_storage = Arc::clone(&storage);
-        let bg_notify = Arc::clone(&notify);
-        let lease_expiry_shutdown = shutdown_tx.clone();
-        let visibility_wakeup_shutdown = shutdown_tx.clone();
-        let bg_metrics = metrics.clone();
-
-        // Background task to expire leases periodically
-        tokio::spawn(async move {
-            loop {
-                let start_time = std::time::Instant::now();
-                let st = Arc::clone(&bg_storage);
-                let result = tokio::task::spawn_blocking(move || st.expire_due_leases()).await;
-
-                let duration = start_time.elapsed().as_secs_f64();
-                #[allow(clippy::collapsible_if)]
-                if let Some(metrics) = &bg_metrics {
-                    if let Ok(metrics_guard) = metrics.try_write() {
-                        match &result {
-                            Ok(Ok(n)) => {
-                                if *n > 0 {
-                                    bg_notify.notify_one();
-                                    metrics_guard.record_background_task(
-                                        "lease_expiry",
-                                        "success",
-                                        duration,
-                                    );
-                                } else {
-                                    metrics_guard.record_background_task(
-                                        "lease_expiry",
-                                        "no_expirations",
-                                        duration,
-                                    );
-                                }
-                            }
-                            Ok(Err(_e)) => {
-                                metrics_guard.record_background_task(
-                                    "lease_expiry",
-                                    "error",
-                                    duration,
-                                );
-                                let _ = lease_expiry_shutdown.send(true);
-                                break;
-                            }
-                            Err(_join_err) => {
-                                metrics_guard.record_background_task(
-                                    "lease_expiry",
-                                    "join_error",
-                                    duration,
-                                );
-                                let _ = lease_expiry_shutdown.send(true);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        });
-
-        // Background task to wake pollers when any invisible message becomes visible.
-        let vis_storage = Arc::clone(&storage);
-        let vis_notify = Arc::clone(&notify);
-        let vis_metrics = metrics.clone();
-        tokio::spawn(async move {
-            loop {
-                let start_time = std::time::Instant::now();
-                // Peek earliest visibility timestamp from RocksDB (blocking)
-                let next_vis_opt = tokio::task::spawn_blocking({
-                    let st = Arc::clone(&vis_storage);
-                    move || st.peek_next_visibility_ts_secs()
-                })
-                .await;
-
-                let duration = start_time.elapsed().as_secs_f64();
-                #[allow(clippy::collapsible_if)]
-                if let Some(metrics) = &vis_metrics {
-                    if let Ok(metrics_guard) = metrics.try_write() {
-                        match &next_vis_opt {
-                            Ok(Ok(Some(_ts_secs))) => {
-                                metrics_guard.record_background_task(
-                                    "visibility_check",
-                                    "found",
-                                    duration,
-                                );
-                            }
-                            Ok(Ok(None)) => {
-                                metrics_guard.record_background_task(
-                                    "visibility_check",
-                                    "no_items",
-                                    duration,
-                                );
-                            }
-                            Ok(Err(_e)) => {
-                                metrics_guard.record_background_task(
-                                    "visibility_check",
-                                    "error",
-                                    duration,
-                                );
-                                let _ = visibility_wakeup_shutdown.send(true);
-                                break;
-                            }
-                            Err(_join_err) => {
-                                metrics_guard.record_background_task(
-                                    "visibility_check",
-                                    "join_error",
-                                    duration,
-                                );
-                                let _ = visibility_wakeup_shutdown.send(true);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                match next_vis_opt {
-                    Ok(Ok(Some(ts_secs))) => {
-                        // Compute duration until visibility; if already visible, notify now.
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(ts_secs);
-                        if ts_secs <= now_secs {
-                            vis_notify.notify_one();
-                            // Avoid busy loop; small sleep before checking again.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        } else {
-                            let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
-                            tokio::time::sleep(sleep_dur).await;
-                            vis_notify.notify_one();
-                        }
-                    }
-                    Ok(Ok(None)) => {
-                        // No items; back off
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    // TODO: can this be prettier?
-                    Ok(Err(e)) => {
-                        tracing::error!("peek_next_visibility_ts_secs: {}", e);
-                        let _ = visibility_wakeup_shutdown.send(true);
-                        break;
-                    }
-                    Err(join_err) => {
-                        tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
-                        let _ = visibility_wakeup_shutdown.send(true);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Background task to update metrics periodically
-        if let Some(metrics) = &metrics {
-            let metrics_storage = Arc::clone(&storage);
-            let metrics_clone = metrics.clone();
-            tokio::spawn(async move {
-                loop {
-                    let start_time = std::time::Instant::now();
-
-                    // Update RocksDB metrics
-                    metrics_storage.update_rocksdb_metrics();
-
-                    // Update queue metrics
-                    metrics_storage.update_queue_metrics();
-
-                    let duration = start_time.elapsed().as_secs_f64();
-                    if let Ok(metrics_guard) = metrics_clone.try_write() {
-                        metrics_guard.record_background_task("metrics_update", "success", duration);
-                    }
-
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
-            });
-        }
+        // Spawn background tasks
+        let background_tasks = BackgroundTasks::new(
+            Arc::clone(&storage),
+            Arc::clone(&notify),
+            shutdown_tx.clone(),
+            metrics.clone(),
+        );
+        background_tasks.spawn_all();
 
         Self {
             storage,
@@ -223,9 +57,6 @@ impl Server {
 
 impl crate::protocol::queue::Server for Server {
     fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), capnp::Error> {
-        let start_time = std::time::Instant::now();
-        let metrics = self.metrics.clone();
-
         let req = params.get()?;
         let req = req.get_req()?;
         let items = req.get_items()?;
@@ -252,9 +83,10 @@ impl crate::protocol::queue::Server for Server {
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
         let ids_for_resp = ids.clone();
+        let metrics = self.metrics.clone();
 
         Promise::from_future(async move {
-            let result = async {
+            metrics.time_request("add", || async {
                 // Offload RocksDB work to the blocking thread pool.
                 tokio::task::spawn_blocking(move || {
                     let iter = ids
@@ -279,19 +111,7 @@ impl crate::protocol::queue::Server for Server {
                     ids_builder.set(i as u32, id);
                 }
                 Ok(())
-            }
-            .await;
-
-            // Record metrics
-            if let Some(metrics) = metrics {
-                let duration = start_time.elapsed().as_secs_f64();
-                let status = if result.is_ok() { "success" } else { "error" };
-                if let Ok(metrics_guard) = metrics.try_write() {
-                    metrics_guard.record_request("add", status, duration);
-                }
-            }
-
-            result
+            }).await
         })
     }
 
@@ -300,50 +120,43 @@ impl crate::protocol::queue::Server for Server {
         params: RemoveParams,
         mut results: RemoveResults,
     ) -> Promise<(), capnp::Error> {
-        let start_time = std::time::Instant::now();
-        let metrics = self.metrics.clone();
-
         let req = params.get()?.get_req()?;
-        let id = req.get_id()?;
-        let lease_bytes = req.get_lease()?;
+        let id = req.get_id()?.to_vec();
+        let lease_bytes = req.get_lease()?.to_vec();
 
         if lease_bytes.len() != 16 {
             return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
         }
         let mut lease: [u8; 16] = [0; 16];
-        lease.copy_from_slice(lease_bytes);
+        lease.copy_from_slice(&lease_bytes);
 
-        let result = self
-            .storage
-            .remove_in_progress_item(id, &lease)
-            .map_err(Into::into);
+        let storage = Arc::clone(&self.storage);
+        let metrics = self.metrics.clone();
 
-        // Record metrics
-        if let Some(metrics) = metrics {
-            let duration = start_time.elapsed().as_secs_f64();
-            let status = if result.is_ok() { "success" } else { "error" };
-            if let Ok(metrics_guard) = metrics.try_write() {
-                metrics_guard.record_request("remove", status, duration);
+        Promise::from_future(async move {
+            let result = metrics.time_request("remove", || async {
+                storage
+                    .remove_in_progress_item(&id, &lease)
+                    .map_err(Into::into)
+            }).await;
+
+            match result {
+                Ok(removed) => {
+                    results.get().init_resp().set_removed(removed);
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-        }
-
-        match result {
-            Ok(removed) => {
-                results.get().init_resp().set_removed(removed);
-                Promise::ok(())
-            }
-            Err(e) => Promise::err(e),
-        }
+        })
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
-        let start_time = std::time::Instant::now();
-        let metrics = self.metrics.clone();
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
+        let metrics = self.metrics.clone();
 
         Promise::from_future(async move {
-            let result = async {
+            metrics.time_request("poll", || async {
                 let req = params.get()?.get_req()?;
                 let lease_validity_secs = req.get_lease_validity_secs();
                 if lease_validity_secs == 0 {
@@ -388,19 +201,7 @@ impl crate::protocol::queue::Server for Server {
                         }
                     }
                 }
-            }
-            .await;
-
-            // Record metrics
-            if let Some(metrics) = metrics {
-                let duration = start_time.elapsed().as_secs_f64();
-                let status = if result.is_ok() { "success" } else { "error" };
-                if let Ok(metrics_guard) = metrics.try_write() {
-                    metrics_guard.record_request("poll", status, duration);
-                }
-            }
-
-            result
+            }).await
         })
     }
 }
