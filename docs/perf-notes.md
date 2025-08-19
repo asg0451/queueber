@@ -66,11 +66,7 @@ Recommended fixes (incremental):
 3) De-duplicate background tasks:
    - Spawn a single `lease_expiry` and a single `visibility_wakeup` task in the top-level runtime, not per worker. They can still use `spawn_blocking` for DB access and notify the shared `Notify`.
 
-4) Connection-level parallelism:
-   - If the client is single-connection, it will monopolize one worker. For benchmarks intended to measure concurrent throughput across workers, open multiple client connections.
-   - Alternatively, refactor to a `Send`-safe per-connection task and use a multi-thread Tokio runtime without `LocalSet`, allowing tasks to distribute across cores. This depends on capnp-rpc constraints.
-
-5) Validate utilization after changes:
+4) Validate utilization after changes:
    - With worker thread naming, use `top -H` or tracing to verify more workers are active under load. You should see blocking pool threads increase when many polls occur concurrently.
 
 ### Configuration knobs
