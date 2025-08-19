@@ -92,6 +92,15 @@ enum Commands {
         #[arg(short = 'l', long = "lease")]
         lease: String,
     },
+    /// Extend a lease's validity
+    Extend {
+        /// The lease id (UUID string) to extend
+        #[arg(short = 'l', long = "lease")]
+        lease: String,
+        /// How long the lease should be valid (seconds)
+        #[arg(short = 'v', long = "validity", default_value_t = 30)]
+        lease_validity_secs: u64,
+    },
     /// Stress test the server
     Stress {
         /// The number of concurrent polling clients to spawn
@@ -207,6 +216,26 @@ async fn main() -> Result<()> {
                 let reply = request.send().promise.await?;
                 let removed = reply.get()?.get_resp()?.get_removed();
                 println!("removed: {}", removed);
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
+            .await?
+            .unwrap();
+        }
+        Commands::Extend {
+            lease,
+            lease_validity_secs,
+        } => {
+            with_client(addr, |queue_client| async move {
+                let lease_bytes = uuid::Uuid::parse_str(&lease)?.into_bytes();
+
+                let mut request = queue_client.extend_request();
+                let mut req = request.get().init_req();
+                req.set_lease(&lease_bytes);
+                req.set_lease_validity_secs(lease_validity_secs);
+
+                let reply = request.send().promise.await?;
+                let extended = reply.get()?.get_resp()?.get_extended();
+                println!("extended: {}", extended);
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?

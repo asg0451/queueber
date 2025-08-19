@@ -355,6 +355,52 @@ impl Storage {
         Ok(true)
     }
 
+    /// Extend the validity of a lease by updating its expiry timestamp.
+    /// Returns true if the lease was extended, false if the lease doesn't exist.
+    #[tracing::instrument(skip(self))]
+    pub fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
+        let lease_key = LeaseKey::from_lease_bytes(lease);
+
+        // Check if lease exists
+        let lease_value_opt = self.db.get(lease_key.as_ref())?;
+        let Some(_lease_value) = lease_value_opt else {
+            return Ok(false);
+        };
+
+        // Calculate new expiry timestamp
+        let now_secs: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let new_expiry_ts_secs = now_secs + lease_validity_secs;
+
+        // Find and remove the old expiry index entry
+        let iter = self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
+        let mut old_expiry_idx_key = None;
+        for kv in iter {
+            let (idx_key, lease_key_bytes_val) = kv?;
+            if lease_key_bytes_val.as_ref() == lease {
+                old_expiry_idx_key = Some(idx_key);
+                break;
+            }
+        }
+
+        // Prepare batch: update expiry index
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+
+        // Remove old expiry index entry if found
+        if let Some(old_idx_key) = old_expiry_idx_key {
+            batch.delete(&old_idx_key);
+        }
+
+        // Add new expiry index entry
+        let new_expiry_idx_key =
+            LeaseExpiryIndexKey::from_expiry_ts_and_lease(new_expiry_ts_secs, lease);
+        batch.put(new_expiry_idx_key.as_ref(), lease_key.as_ref());
+
+        self.db.write(batch)?;
+        Ok(true)
+    }
+
     /// Sweep expired leases: for each expired lease, move any remaining
     /// in-progress items back to available and delete the lease and its index.
     /// Returns the number of expired leases processed.
@@ -841,5 +887,52 @@ mod tests {
             Ok(_) => panic!("expected AssertionFailed, got Ok(..)"),
             Err(e) => panic!("expected AssertionFailed, got {}", e),
         }
+    }
+
+    #[test]
+    fn extend_lease_basic_functionality() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Add an item and poll it to get a lease
+        storage.add_available_item_from_parts(b"test1", b"payload", 0)?;
+        let (lease, _items) = storage.get_next_available_entries_with_lease(1, 10)?;
+        assert_eq!(_items.len(), 1);
+
+        // Check that the lease exists
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_exists = storage.db.get(lease_key.as_ref())?.is_some();
+        assert!(lease_exists, "Lease should exist");
+
+        // Extend the lease
+        let extended = storage.extend_lease(&lease, 20)?;
+        assert!(extended);
+
+        // Verify the lease still exists
+        let lease_exists_after = storage.db.get(lease_key.as_ref())?.is_some();
+        assert!(lease_exists_after, "Lease should still exist after extend");
+
+        Ok(())
+    }
+
+    #[test]
+    fn extend_nonexistent_lease_returns_false() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Try to extend a non-existent lease
+        let fake_lease = [1u8; 16];
+        let extended = storage.extend_lease(&fake_lease, 10)?;
+        assert!(!extended);
+
+        Ok(())
     }
 }

@@ -21,6 +21,15 @@ struct RemoveResponse {
     removed @0 :Bool;
 }
 
+struct ExtendRequest {
+    lease @0 :Data;
+    leaseValiditySecs @1 :UInt64;
+}
+
+struct ExtendResponse {
+    extended @0 :Bool;
+}
+
 struct PollRequest {
     leaseValiditySecs @0 :UInt64;
     # maximum number of items to return. default 1 if unset/zero
@@ -49,6 +58,7 @@ interface Queue {
     add @00 (req :AddRequest) -> (resp :AddResponse);
     remove @01 (req :RemoveRequest) -> (resp :RemoveResponse);
     poll @02 (req :PollRequest) -> (resp :PollResponse);
+    extend @03 (req :ExtendRequest) -> (resp :ExtendResponse);
 }
 
 
