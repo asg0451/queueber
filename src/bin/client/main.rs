@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::{runtime::Handle, time::Instant};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -73,15 +73,15 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::var_os("TOKIO_CONSOLE").is_some() {
-        console_subscriber::init();
-    } else {
-        let env_filter = std::env::var("RUST_LOG")
-            .ok()
-            .and_then(|v| EnvFilter::try_new(v).ok())
-            .unwrap_or_else(|| EnvFilter::new("info,queueber=info"));
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    }
+    let env_filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| EnvFilter::new("info,queueber=info"));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(console_subscriber::spawn())
+        .init();
 
     let cli = Cli::parse();
     let addr = &cli.addr;
