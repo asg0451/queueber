@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::dbkeys::{
     AvailableKey, InProgressKey, LeaseExpiryIndexKey, LeaseKey, VisibilityIndexKey,
 };
-use crate::errors::{Error, Result};
+use crate::errors::Result;
 use crate::protocol;
 
 pub struct Storage {
@@ -208,16 +208,19 @@ impl Storage {
                 break;
             }
 
-            let main_value = self
-                .db
-                .get(&main_key)?
-                .ok_or_else(|| Error::AssertionFailed {
-                    msg: format!(
-                        "database integrity violated: main key not found: {:?}",
-                        &main_key
-                    ),
-                    backtrace: std::backtrace::Backtrace::capture(),
-                })?;
+            // Best-effort healing: if the main key referenced by the visibility index
+            // is missing, treat it as a stale index entry (likely due to a race with
+            // another concurrent poll) and delete the index entry, then continue.
+            let Some(main_value) = self.db.get(&main_key)? else {
+                tracing::warn!(
+                    "stale visibility index entry: missing main key {:?}; cleaning up",
+                    &main_key
+                );
+                let mut cleanup_batch = WriteBatchWithTransaction::<false>::default();
+                cleanup_batch.delete(&idx_key);
+                self.db.write(cleanup_batch)?;
+                continue;
+            };
 
             let stored_item_message = serialize_packed::read_message(
                 BufReader::new(&main_value[..]), // TODO: avoid allocation
@@ -808,6 +811,38 @@ mod tests {
 
         let (_lease2, items2) = storage.get_next_available_entries(1)?;
         assert_eq!(items2.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_visibility_index_entry_is_cleaned_up() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Create a visibility index entry pointing at a non-existent main key
+        let ghost_id = b"ghost";
+        let idx_key = VisibilityIndexKey::from_visible_ts_and_id(0, ghost_id);
+        let main_key = AvailableKey::from_id(ghost_id);
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        batch.put(idx_key.as_ref(), main_key.as_ref());
+        storage.db.write(batch)?;
+
+        // Poll should not panic and should return no items
+        let (_lease, items) = storage.get_next_available_entries(1)?;
+        assert_eq!(items.len(), 0);
+
+        // The stale index entry should have been deleted
+        assert!(storage.db.get(idx_key.as_ref())?.is_none());
+
+        // No available or in-progress entry should have been created
+        assert!(storage.db.get(main_key.as_ref())?.is_none());
+        let in_prog = InProgressKey::from_id(ghost_id);
+        assert!(storage.db.get(in_prog.as_ref())?.is_none());
+
         Ok(())
     }
 }

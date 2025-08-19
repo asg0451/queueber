@@ -1,6 +1,6 @@
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use clap::{Parser, Subcommand};
-use color_eyre::{Result, eyre::Error};
+use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::protocol::queue;
 use std::{
@@ -74,7 +74,7 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let addr = &cli.addr;
-    let addr = SocketAddr::from_str(&addr)?;
+    let addr = SocketAddr::from_str(addr)?;
 
     match cli.command {
         Commands::Add {
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
         Commands::Stress {
             polling_clients,
             adding_clients,
-            rate, // TODO: use this
+            rate: _,
         } => {
             // TODO: clean this shit up jesus fucking christ
 
@@ -252,8 +252,8 @@ async fn main() -> Result<()> {
                                             let promises = items.iter().map(|i| {
                                                 let mut request = queue_client.remove_request();
                                                 let mut req = request.get().init_req();
-                                                req.set_id(&i.get_id().unwrap());
-                                                req.set_lease(&lease);
+                                                req.set_id(i.get_id().unwrap());
+                                                req.set_lease(lease);
                                                 request.send().promise
                                             });
                                             let _ = futures::future::join_all(promises).await;
