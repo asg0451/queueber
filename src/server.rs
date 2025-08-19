@@ -88,15 +88,17 @@ impl crate::protocol::queue::Server for Server {
         Promise::from_future(async move {
             metrics.time_request("add", || async {
                 // Offload RocksDB work to the blocking thread pool.
-                tokio::task::spawn_blocking(move || {
-                    let iter = ids
-                        .iter()
-                        .map(|id| id.as_slice())
-                        .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
-                    storage.add_available_items_from_parts(iter)
-                })
-                .await
-                .map_err(Into::<Error>::into)??;
+                tokio::task::Builder::new()
+                    .name("add_available_items_from_parts")
+                    .spawn_blocking(move || {
+                        let iter = ids
+                            .iter()
+                            .map(|id| id.as_slice())
+                            .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+                        storage.add_available_items_from_parts(iter)
+                    })?
+                    .await
+                    .map_err(Into::<Error>::into)??;
 
                 if any_immediately_visible {
                     notify.notify_one();
