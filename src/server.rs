@@ -32,75 +32,89 @@ impl Server {
         let visibility_wakeup_shutdown = shutdown_tx.clone();
 
         // Background task to expire leases periodically
-        tokio::spawn(async move {
-            loop {
-                let st = Arc::clone(&bg_storage);
-                match tokio::task::spawn_blocking(move || st.expire_due_leases()).await {
-                    Ok(Ok(n)) => {
-                        if n > 0 {
-                            bg_notify.notify_one();
+        tokio::task::Builder::new()
+            .name("lease_expiry")
+            .spawn(async move {
+                loop {
+                    let st = Arc::clone(&bg_storage);
+                    match tokio::task::Builder::new()
+                        .name("expire_due_leases")
+                        .spawn_blocking(move || st.expire_due_leases())
+                        .unwrap()
+                        .await
+                    {
+                        Ok(Ok(n)) => {
+                            if n > 0 {
+                                bg_notify.notify_one();
+                            }
+                        }
+                        Ok(Err(_e)) => {
+                            let _ = lease_expiry_shutdown.send(true);
+                            break;
+                        }
+                        Err(_join_err) => {
+                            let _ = lease_expiry_shutdown.send(true);
+                            break;
                         }
                     }
-                    Ok(Err(_e)) => {
-                        let _ = lease_expiry_shutdown.send(true);
-                        break;
-                    }
-                    Err(_join_err) => {
-                        let _ = lease_expiry_shutdown.send(true);
-                        break;
-                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        });
+            })
+            .unwrap();
 
         // Background task to wake pollers when any invisible message becomes visible.
         let vis_storage = Arc::clone(&storage);
         let vis_notify = Arc::clone(&notify);
-        tokio::spawn(async move {
-            loop {
-                // Peek earliest visibility timestamp from RocksDB (blocking)
-                let next_vis_opt = tokio::task::spawn_blocking({
-                    let st = Arc::clone(&vis_storage);
-                    move || st.peek_next_visibility_ts_secs()
-                })
-                .await;
+        tokio::task::Builder::new()
+            .name("visibility_wakeup")
+            .spawn(async move {
+                loop {
+                    // Peek earliest visibility timestamp from RocksDB (blocking)
+                    let next_vis_opt = tokio::task::Builder::new()
+                        .name("peek_next_visibility_ts_secs")
+                        .spawn_blocking({
+                            let st = Arc::clone(&vis_storage);
+                            move || st.peek_next_visibility_ts_secs()
+                        })
+                        .unwrap()
+                        .await;
 
-                match next_vis_opt {
-                    Ok(Ok(Some(ts_secs))) => {
-                        // Compute duration until visibility; if already visible, notify now.
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(ts_secs);
-                        if ts_secs <= now_secs {
-                            vis_notify.notify_one();
-                            // Avoid busy loop; small sleep before checking again.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        } else {
-                            let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
-                            tokio::time::sleep(sleep_dur).await;
-                            vis_notify.notify_one();
+                    match next_vis_opt {
+                        Ok(Ok(Some(ts_secs))) => {
+                            // Compute duration until visibility; if already visible, notify now.
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(ts_secs);
+                            if ts_secs <= now_secs {
+                                vis_notify.notify_one();
+                                // Avoid busy loop; small sleep before checking again.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            } else {
+                                let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
+                                tokio::time::sleep(sleep_dur).await;
+                                vis_notify.notify_one();
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            // No items; back off
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                        // TODO: can this be prettier?
+                        Ok(Err(e)) => {
+                            tracing::error!("peek_next_visibility_ts_secs: {}", e);
+                            let _ = visibility_wakeup_shutdown.send(true);
+                            break;
+                        }
+                        Err(join_err) => {
+                            tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
+                            let _ = visibility_wakeup_shutdown.send(true);
+                            break;
                         }
                     }
-                    Ok(Ok(None)) => {
-                        // No items; back off
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    // TODO: can this be prettier?
-                    Ok(Err(e)) => {
-                        tracing::error!("peek_next_visibility_ts_secs: {}", e);
-                        let _ = visibility_wakeup_shutdown.send(true);
-                        break;
-                    }
-                    Err(join_err) => {
-                        tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
-                        let _ = visibility_wakeup_shutdown.send(true);
-                        break;
-                    }
                 }
-            }
-        });
+            })
+            .unwrap();
 
         Self {
             storage,
@@ -141,15 +155,17 @@ impl crate::protocol::queue::Server for Server {
 
         Promise::from_future(async move {
             // Offload RocksDB work to the blocking thread pool.
-            tokio::task::spawn_blocking(move || {
-                let iter = ids
-                    .iter()
-                    .map(|id| id.as_slice())
-                    .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
-                storage.add_available_items_from_parts(iter)
-            })
-            .await
-            .map_err(Into::<Error>::into)??;
+            tokio::task::Builder::new()
+                .name("add_available_items_from_parts")
+                .spawn_blocking(move || {
+                    let iter = ids
+                        .iter()
+                        .map(|id| id.as_slice())
+                        .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+                    storage.add_available_items_from_parts(iter)
+                })?
+                .await
+                .map_err(Into::<Error>::into)??;
 
             if any_immediately_visible {
                 notify.notify_one();
