@@ -9,8 +9,43 @@ use std::{
     sync::{Arc, atomic},
     time::Duration,
 };
-use tokio::{runtime::Handle, time::Instant};
+use tokio::{
+    runtime::Handle,
+    time::{Instant, MissedTickBehavior},
+};
 use uuid::Uuid;
+
+fn compute_batch_interval(rate_per_client: u32, batch_size: u32) -> Option<Duration> {
+    if rate_per_client == 0 {
+        return None;
+    }
+    let secs_per_batch = (batch_size as f64) / (rate_per_client as f64);
+    let duration = Duration::from_secs_f64(secs_per_batch);
+    Some(duration.max(Duration::from_millis(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_batch_interval;
+    use std::time::Duration;
+
+    #[test]
+    fn interval_none_when_rate_zero() {
+        assert_eq!(compute_batch_interval(0, 10), None);
+    }
+
+    #[test]
+    fn interval_scales_with_batch_and_rate() {
+        let i1 = compute_batch_interval(10, 10).unwrap();
+        assert!(i1 > Duration::from_millis(0));
+
+        let i2 = compute_batch_interval(100, 10).unwrap();
+        assert!(i2 < i1);
+
+        let i3 = compute_batch_interval(1000, 10).unwrap();
+        assert!(i3 < i2);
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "queueber", version, about = "Queueber client")]
@@ -73,8 +108,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let addr = &cli.addr;
-    let addr = SocketAddr::from_str(addr)?;
+    let addr = SocketAddr::from_str(&cli.addr)?;
 
     match cli.command {
         Commands::Add {
@@ -135,13 +169,13 @@ async fn main() -> Result<()> {
                         let id = item.get_id()?;
                         let contents = item.get_contents()?;
                         println!(
-                            "item {}: id={}, contents={}",
+                            "item {}: id={}, contents=",
                             i,
                             Uuid::from_slice(id)
                                 .map(|u| u.to_string())
                                 .unwrap_or_else(|_| format!("{:?}", id)),
-                            String::from_utf8_lossy(contents)
                         );
+                        println!("{}", String::from_utf8_lossy(contents));
                     }
                 }
                 Ok::<(), Box<dyn std::error::Error>>(())
@@ -170,47 +204,42 @@ async fn main() -> Result<()> {
         Commands::Stress {
             polling_clients,
             adding_clients,
-            rate: _,
+            rate,
         } => {
-            // TODO: clean this shit up jesus fucking christ
+            let add_count = Arc::new(atomic::AtomicU64::new(0));
+            let poll_count = Arc::new(atomic::AtomicU64::new(0));
+            let remove_count = Arc::new(atomic::AtomicU64::new(0));
+
+            // periodic metrics reporter
+            tokio::spawn({
+                let add_count = Arc::clone(&add_count);
+                let poll_count = Arc::clone(&poll_count);
+                let remove_count = Arc::clone(&remove_count);
+                async move {
+                    let mut last_time = Instant::now();
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let now = Instant::now();
+                        let adds = add_count.swap(0, atomic::Ordering::Relaxed);
+                        let polls = poll_count.swap(0, atomic::Ordering::Relaxed);
+                        let removes = remove_count.swap(0, atomic::Ordering::Relaxed);
+                        let duration = now.duration_since(last_time);
+                        last_time = now;
+                        let secs = duration.as_secs_f64().max(1.0);
+                        println!(
+                            "add: {} ({:.1}/s), poll: {} ({:.1}/s), remove: {} ({:.1}/s)",
+                            adds,
+                            adds as f64 / secs,
+                            polls,
+                            polls as f64 / secs,
+                            removes,
+                            removes as f64 / secs
+                        );
+                    }
+                }
+            });
 
             std::thread::scope(|s| {
-                // bookkeeping
-                let add_count = Arc::new(atomic::AtomicU64::new(0));
-                let poll_count = Arc::new(atomic::AtomicU64::new(0));
-                let remove_count = Arc::new(atomic::AtomicU64::new(0));
-
-                tokio::spawn({
-                    let add_count = Arc::clone(&add_count);
-                    let poll_count = Arc::clone(&poll_count);
-                    let remove_count = Arc::clone(&remove_count);
-                    async move {
-                        let mut last_time = Instant::now();
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            let now = Instant::now();
-                            let adds = add_count.load(atomic::Ordering::Relaxed);
-                            let polls = poll_count.load(atomic::Ordering::Relaxed);
-                            let removes = remove_count.load(atomic::Ordering::Relaxed);
-                            let duration = now.duration_since(last_time);
-                            last_time = now;
-                            println!(
-                                "add: {} ({}/s), poll: {} ({}/s), remove: {} ({}/s)",
-                                adds / duration.as_secs(),
-                                adds,
-                                polls / duration.as_secs(),
-                                polls,
-                                removes / duration.as_secs(),
-                                removes
-                            );
-
-                            add_count.store(0, atomic::Ordering::Relaxed);
-                            poll_count.store(0, atomic::Ordering::Relaxed);
-                            remove_count.store(0, atomic::Ordering::Relaxed);
-                        }
-                    }
-                });
-
                 // spawn polling clients
                 for _ in 0..polling_clients {
                     let poll_count = Arc::clone(&poll_count);
@@ -220,7 +249,7 @@ async fn main() -> Result<()> {
                         handle.block_on(async move {
                             tokio::task::LocalSet::new()
                                 .run_until(async move {
-                                    with_client(addr, |queue_client| async move {
+                                    let _ = with_client(addr, |queue_client| async move {
                                         loop {
                                             let mut request = queue_client.poll_request();
                                             let mut req = request.get().init_req();
@@ -228,27 +257,15 @@ async fn main() -> Result<()> {
                                             req.set_num_items(10);
                                             req.set_timeout_secs(5);
                                             let reply = request.send().promise.await.unwrap();
-                                            let items = reply
-                                                .get()
-                                                .unwrap()
-                                                .get_resp()
-                                                .unwrap()
-                                                .get_items()
-                                                .unwrap();
+                                            let resp = reply.get().unwrap().get_resp().unwrap();
+                                            let items = resp.get_items().unwrap();
                                             poll_count.fetch_add(
                                                 items.len() as u64,
                                                 atomic::Ordering::Relaxed,
                                             );
 
-                                            let lease = reply
-                                                .get()
-                                                .unwrap()
-                                                .get_resp()
-                                                .unwrap()
-                                                .get_lease()
-                                                .unwrap();
+                                            let lease = resp.get_lease().unwrap();
 
-                                            // then remove the items
                                             let promises = items.iter().map(|i| {
                                                 let mut request = queue_client.remove_request();
                                                 let mut req = request.get().init_req();
@@ -263,35 +280,50 @@ async fn main() -> Result<()> {
                                             );
                                         }
                                     })
-                                    .await
-                                    .unwrap();
+                                    .await;
                                 })
                                 .await;
                         });
                     });
                 }
 
+                // spawn adding clients
                 for _ in 0..adding_clients {
                     let add_count = Arc::clone(&add_count);
                     let handle = Handle::current();
                     s.spawn(move || {
                         handle.block_on(async move {
-                            with_client(addr, |queue_client| async move {
-                                loop {
-                                    let mut request = queue_client.add_request();
-                                    let req = request.get().init_req();
-                                    let mut items = req.init_items(10);
-                                    for i in 0..10 {
-                                        let mut item = items.reborrow().get(i);
-                                        item.set_contents(format!("test {}", i).as_bytes());
-                                        item.set_visibility_timeout_secs(3);
-                                    }
-                                    let _ = request.send().promise.await.unwrap();
-                                    add_count.fetch_add(10, atomic::Ordering::Relaxed);
-                                }
-                            })
-                            .await
-                            .unwrap();
+                            tokio::task::LocalSet::new()
+                                .run_until(async move {
+                                    let _ = with_client(addr, |queue_client| async move {
+                                        let batch_size: u32 = 10;
+                                        let mut ticker = compute_batch_interval(rate, batch_size)
+                                            .map(tokio::time::interval);
+                                        if let Some(ref mut t) = ticker {
+                                            t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                                        }
+                                        loop {
+                                            if let Some(t) = &mut ticker {
+                                                t.tick().await;
+                                            }
+                                            let mut request = queue_client.add_request();
+                                            let req = request.get().init_req();
+                                            let mut items = req.init_items(batch_size);
+                                            for i in 0..batch_size as usize {
+                                                let mut item = items.reborrow().get(i as u32);
+                                                item.set_contents(format!("test {}", i).as_bytes());
+                                                item.set_visibility_timeout_secs(3);
+                                            }
+                                            let _ = request.send().promise.await.unwrap();
+                                            add_count.fetch_add(
+                                                batch_size as u64,
+                                                atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                    })
+                                    .await;
+                                })
+                                .await;
                         });
                     });
                 }
