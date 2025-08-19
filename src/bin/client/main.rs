@@ -13,6 +13,7 @@ use tokio::{
     runtime::Handle,
     time::{Instant, MissedTickBehavior},
 };
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 fn compute_batch_interval(rate_per_client: u32, batch_size: u32) -> Option<Duration> {
@@ -107,6 +108,16 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let env_filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| EnvFilter::new("info,queueber=info"));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(console_subscriber::spawn())
+        .init();
+
     let cli = Cli::parse();
     let addr = SocketAddr::from_str(&cli.addr)?;
 
