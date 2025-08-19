@@ -9,20 +9,20 @@ use crate::dbkeys::{
     AvailableKey, InProgressKey, LeaseExpiryIndexKey, LeaseKey, VisibilityIndexKey,
 };
 use crate::errors::Result;
-use crate::metrics_wrapper::MetricsWrapper;
+use crate::metrics_wrapper_atomic::AtomicMetricsWrapper;
 use crate::protocol;
 
 pub struct Storage {
     db: TransactionDB,
-    metrics: MetricsWrapper,
+    metrics: AtomicMetricsWrapper,
 }
 
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
-        Self::new_with_metrics(path, MetricsWrapper::none())
+        Self::new_with_metrics(path, AtomicMetricsWrapper::none())
     }
 
-    pub fn new_with_metrics(path: &Path, metrics: MetricsWrapper) -> Result<Self> {
+    pub fn new_with_metrics(path: &Path, metrics: AtomicMetricsWrapper) -> Result<Self> {
         let mut opts = Options::default();
         // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
         // Extract the namespace prefix up to and including the first '/'.
@@ -463,6 +463,9 @@ impl Storage {
 
             self.db.write(batch)?;
             processed += 1;
+            
+            // Record lease expiration for metrics
+            self.metrics.record_lease_expiration();
         }
 
         Ok(processed)
@@ -471,13 +474,25 @@ impl Storage {
     /// Collect and update RocksDB metrics
     pub fn update_rocksdb_metrics(&self) {
         let _ = self.metrics.time_rocksdb_operation("metrics_collection", || {
-            // Get RocksDB statistics (simplified for now)
-            let memory_usage = 0; // TODO: Implement proper RocksDB property access
-            let disk_usage = 0; // TODO: Implement proper RocksDB property access
+            // Get RocksDB memory usage (simplified - using approximate size)
+            let memory_usage = 0i64; // TODO: Implement proper memory usage collection
 
-            // Calculate amplification factors (simplified)
-            let _read_amplification = 1.0; // TODO: Calculate from actual stats
-            let _write_amplification = 1.0; // TODO: Calculate from actual stats
+            // Get RocksDB disk usage by estimating from database size
+            let mut disk_usage = 0i64;
+            if let Ok(_metadata) = std::fs::metadata(self.db.path())
+                && let Ok(entries) = std::fs::read_dir(self.db.path()) {
+                for entry in entries.flatten() {
+                    if let Ok(metadata) = entry.metadata() {
+                        disk_usage += metadata.len() as i64;
+                    }
+                }
+            }
+
+            // Log metrics for debugging
+            tracing::debug!(
+                "RocksDB metrics - Memory: {} bytes, Disk: {} bytes",
+                memory_usage, disk_usage
+            );
 
             self.metrics.update_rocksdb_metrics(memory_usage, disk_usage);
             Ok::<(), rocksdb::Error>(())

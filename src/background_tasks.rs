@@ -2,13 +2,13 @@ use std::sync::Arc;
 use tokio::sync::{Notify, watch};
 use tokio::time::Duration;
 use crate::Storage;
-use crate::metrics_wrapper::MetricsWrapper;
+use crate::metrics_wrapper_atomic::AtomicMetricsWrapper;
 
 pub struct BackgroundTasks {
     storage: Arc<Storage>,
     notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
-    metrics: MetricsWrapper,
+    metrics: AtomicMetricsWrapper,
 }
 
 impl BackgroundTasks {
@@ -16,7 +16,7 @@ impl BackgroundTasks {
         storage: Arc<Storage>,
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
-        metrics: MetricsWrapper,
+        metrics: AtomicMetricsWrapper,
     ) -> Self {
         Self {
             storage,

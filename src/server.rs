@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use crate::Storage;
 use crate::background_tasks::BackgroundTasks;
 use crate::errors::{Error, Result};
-use crate::metrics_wrapper::MetricsWrapper;
+use crate::metrics_wrapper_atomic::AtomicMetricsWrapper;
 use crate::protocol::queue::{
     AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
@@ -19,7 +19,7 @@ pub struct Server {
     notify: Arc<Notify>,
     #[allow(dead_code)]
     shutdown_tx: watch::Sender<bool>,
-    metrics: MetricsWrapper,
+    metrics: AtomicMetricsWrapper,
 }
 
 impl Server {
@@ -28,14 +28,14 @@ impl Server {
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
-        Self::new_with_metrics(storage, notify, shutdown_tx, MetricsWrapper::none())
+        Self::new_with_metrics(storage, notify, shutdown_tx, AtomicMetricsWrapper::none())
     }
 
     pub fn new_with_metrics(
         storage: Arc<Storage>,
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
-        metrics: MetricsWrapper,
+        metrics: AtomicMetricsWrapper,
     ) -> Self {
         // Spawn background tasks
         let background_tasks = BackgroundTasks::new(

@@ -4,16 +4,17 @@ use std::sync::Arc;
 
 use tower_http::cors::CorsLayer;
 
-use crate::metrics::{SharedMetrics, encode_metrics};
+use crate::metrics_atomic::{AtomicMetrics, encode_atomic_metrics};
 
 pub struct MetricsServer {
+    #[allow(dead_code)]
     registry: Registry,
     #[allow(dead_code)]
-    metrics: SharedMetrics,
+    metrics: AtomicMetrics,
 }
 
 impl MetricsServer {
-    pub fn new(registry: Registry, metrics: SharedMetrics) -> Self {
+    pub fn new(registry: Registry, metrics: AtomicMetrics) -> Self {
         Self { registry, metrics }
     }
 
@@ -33,7 +34,8 @@ impl MetricsServer {
 }
 
 async fn metrics_handler(State(state): State<Arc<MetricsServer>>) -> impl IntoResponse {
-    match encode_metrics(&state.registry).await {
+    let snapshot = state.metrics.snapshot();
+    match encode_atomic_metrics(&snapshot) {
         Ok(metrics) => (StatusCode::OK, metrics).into_response(),
         Err(e) => {
             tracing::error!("Failed to encode metrics: {}", e);
