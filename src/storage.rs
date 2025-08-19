@@ -41,7 +41,6 @@ impl Storage {
     }
 
     // id+item -> store stored_item and visibility index entry
-    #[tracing::instrument(skip(self))]
     pub fn add_available_item<'i>(
         &self,
         (id, item): (&'i [u8], protocol::item::Reader<'i>),
@@ -69,7 +68,6 @@ impl Storage {
     }
 
     // Convenience helpers for feeding from owned parts when capnp Readers are not Send.
-    #[tracing::instrument(skip(self, contents))]
     pub fn add_available_item_from_parts(
         &self,
         id: &[u8],
@@ -297,7 +295,6 @@ impl Storage {
 
     /// Remove an in-progress item if the provided lease currently owns it.
     /// Returns true if an item was removed, false if not found or lease mismatch.
-    #[tracing::instrument(skip(self))]
     pub fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
         // Build keys
         let in_progress_key = InProgressKey::from_id(id);
