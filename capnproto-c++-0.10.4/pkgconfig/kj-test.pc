@@ -1,0 +1,11 @@
+prefix=/workspace/.local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: KJ Test Framework
+Description: Basic utility library called KJ (test part)
+Version: 0.10.4
+Libs: -L${libdir} -lkj-test   
+Requires: kj = 0.10.4
+Cflags: -I${includedir}   

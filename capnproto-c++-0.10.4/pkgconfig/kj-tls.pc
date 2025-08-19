@@ -1,0 +1,11 @@
+prefix=/workspace/.local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: KJ TLS Adapters
+Description: Basic utility library called KJ (TLS part)
+Version: 0.10.4
+Libs: -L${libdir} -lkj-tls   
+Requires: kj-async = 0.10.4
+Cflags: -I${includedir}   

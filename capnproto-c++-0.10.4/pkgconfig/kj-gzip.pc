@@ -1,0 +1,11 @@
+prefix=/workspace/.local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: KJ Gzip Adapters
+Description: Basic utility library called KJ (gzip part)
+Version: 0.10.4
+Libs: -L${libdir} -lkj-gzip   
+Requires: kj-async = 0.10.4
+Cflags: -I${includedir}   

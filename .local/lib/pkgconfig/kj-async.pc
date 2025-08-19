@@ -1,0 +1,11 @@
+prefix=/workspace/.local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: KJ Async Framework Library
+Description: Basic utility library called KJ (async part)
+Version: 0.10.4
+Libs: -L${libdir} -lkj-async    
+Requires: kj = 0.10.4
+Cflags: -I${includedir}    

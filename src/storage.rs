@@ -211,25 +211,37 @@ impl Storage {
             let _ = txn.get_for_update(&idx_key, true)?;
             let main_value_opt = txn.get_for_update(&main_key, true)?;
             let Some(main_value) = main_value_opt else {
-                // Check if this is a database integrity issue or just normal concurrency
-                // If the visibility index entry exists but the main key doesn't, that's a database integrity issue
-                // If the main key exists but is in in-progress state, that's normal concurrency
+                // Distinguish true corruption from legitimate concurrent moves.
+                // Re-read index and in-progress state under the same transaction.
                 let id_suffix = AvailableKey::id_suffix_from_key_bytes(&main_key);
                 let in_progress_key = InProgressKey::from_id(id_suffix);
-                if txn.get(&in_progress_key)?.is_some() {
-                    // Item was already claimed by another poll, skip it
+
+                // If the index entry no longer exists, another poller already claimed it.
+                if txn.get(&idx_key)?.is_none() {
                     continue;
-                } else {
-                    // Invariant: visibility index should point to an available item. If it's gone,
-                    // fail fast rather than silently healing; this indicates a concurrency bug.
-                    return Err(crate::errors::Error::AssertionFailed {
-                        msg: format!(
-                            "database integrity violated: main key not found for visibility entry: {:?}",
-                            &main_key
-                        ),
-                        backtrace: std::backtrace::Backtrace::capture(),
-                    });
                 }
+
+                // If the item is already in progress, another poller claimed it.
+                if txn.get(&in_progress_key)?.is_some() {
+                    continue;
+                }
+
+                // If the index still exists and still points to this same main key but the
+                // main value is gone, this is a true integrity violation.
+                if let Some(idx_val) = txn.get(&idx_key)? {
+                    if idx_val.as_slice() == main_key.as_ref() {
+                        return Err(crate::errors::Error::AssertionFailed {
+                            msg: format!(
+                                "database integrity violated: main key not found for visibility entry: {:?}",
+                                &main_key
+                            ),
+                            backtrace: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                }
+
+                // Otherwise the index changed concurrently; skip this entry.
+                continue;
             };
 
             let stored_item_message = serialize_packed::read_message(
