@@ -12,7 +12,7 @@
 - [X] (feat) implement lease expiry via a background thread
 - [X] (feat) implement poll in server
 - [X] (minor) add polling timeout and num_items options
-- [ ] (major) fix race condition: concurrent polls can hand out the same messages
+- [X] (major) fix race condition: concurrent polls can hand out the same messages
 - [X] (feat) implement remove
 - [X] (feat) implement extend
 - [X] (bugfix) e2e benchmark hangs / improve benchmarks
