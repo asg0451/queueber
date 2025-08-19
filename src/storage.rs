@@ -379,6 +379,11 @@ impl Storage {
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let old_expiry_idx_key = lease_entry_reader.get_expiry_index_key()?;
 
+        // TODO: There may be a race between the background lease expirer
+        // (which deletes the expiry index and possibly the lease entry) and
+        // this extender that updates the expiry index. Investigate ensuring
+        // atomicity or retry semantics to avoid lost updates.
+
         // Calculate new expiry timestamp
         let now_secs: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -965,29 +970,45 @@ mod tests {
 
         // Verify the lease entry contains the expiry index key
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        let lease_value = storage.db.get(lease_key.as_ref())?.expect("lease should exist");
+        let lease_value = storage
+            .db
+            .get(lease_key.as_ref())?
+            .expect("lease should exist");
         let lease_msg = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let expiry_index_key = lease_entry_reader.get_expiry_index_key()?;
-        assert!(!expiry_index_key.is_empty(), "expiry index key should be stored");
+        assert!(
+            !expiry_index_key.is_empty(),
+            "expiry index key should be stored"
+        );
 
         // Extend the lease
         let extended = storage.extend_lease(&lease, 20)?;
         assert!(extended);
 
         // Verify the lease entry was updated with a new expiry index key
-        let updated_lease_value = storage.db.get(lease_key.as_ref())?.expect("lease should still exist");
+        let updated_lease_value = storage
+            .db
+            .get(lease_key.as_ref())?
+            .expect("lease should still exist");
         let updated_lease_msg = serialize_packed::read_message(
             BufReader::new(&updated_lease_value[..]),
             message::ReaderOptions::new(),
         )?;
-        let updated_lease_entry_reader = updated_lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+        let updated_lease_entry_reader =
+            updated_lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let updated_expiry_index_key = updated_lease_entry_reader.get_expiry_index_key()?;
-        assert!(!updated_expiry_index_key.is_empty(), "updated expiry index key should be stored");
-        assert_ne!(expiry_index_key, updated_expiry_index_key, "expiry index key should have changed");
+        assert!(
+            !updated_expiry_index_key.is_empty(),
+            "updated expiry index key should be stored"
+        );
+        assert_ne!(
+            expiry_index_key, updated_expiry_index_key,
+            "expiry index key should have changed"
+        );
 
         Ok(())
     }

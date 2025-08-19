@@ -178,7 +178,13 @@ impl crate::protocol::queue::Server for Server {
         let lease_bytes = req.get_lease()?;
 
         if lease_bytes.len() != 16 {
-            return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
+            return Promise::err(
+                Error::AssertionFailed {
+                    msg: "invalid lease length".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into(),
+            );
         }
         let mut lease: [u8; 16] = [0; 16];
         lease.copy_from_slice(lease_bytes);
@@ -202,12 +208,22 @@ impl crate::protocol::queue::Server for Server {
         let lease_validity_secs = req.get_lease_validity_secs();
 
         if lease_bytes.len() != 16 {
-            return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
+            return Promise::err(
+                Error::AssertionFailed {
+                    msg: "invalid lease length".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into(),
+            );
         }
         if lease_validity_secs == 0 {
-            return Promise::err(capnp::Error::failed(
-                "invariant: leaseValiditySecs must be > 0".to_string(),
-            ));
+            return Promise::err(
+                Error::AssertionFailed {
+                    msg: "invariant: leaseValiditySecs must be > 0".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into(),
+            );
         }
 
         let mut lease: [u8; 16] = [0; 16];
@@ -230,9 +246,11 @@ impl crate::protocol::queue::Server for Server {
             let req = params.get()?.get_req()?;
             let lease_validity_secs = req.get_lease_validity_secs();
             if lease_validity_secs == 0 {
-                return Err(capnp::Error::failed(
-                    "invariant: leaseValiditySecs must be > 0".to_string(),
-                ));
+                return Err(Error::AssertionFailed {
+                    msg: "invariant: leaseValiditySecs must be > 0".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into());
             }
             let num_items = match req.get_num_items() {
                 0 => 1,
