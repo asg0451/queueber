@@ -43,6 +43,36 @@ top -H -p $(pidof queueber)
 
 You should see 1 acceptor thread group (with ~available_parallelism workers), plus your N `rpc-worker-*` threads after naming them.
 
+### Why most worker threads look idle in practice
+
+Observed pattern: one thread busy with Cap'n Proto RPC, one thread doing storage polls, one RocksDB background thread, others idle.
+
+Root causes:
+
+- Single-connection affinity: a single client connection funnels all its RPCs through the worker that owns that connection. With one busy client connection, only that worker is active while other workers sit idle. To utilize many workers, you need multiple concurrent connections or a different scheduling model.
+- Blocking DB work on the worker thread: `poll()` and `remove()` call into `Storage` synchronously. RocksDB is a blocking API, so this ties up the worker thread during each call. Only `add()` currently offloads via `spawn_blocking`.
+- Narrow wakeups: `notify.notify_one()` wakes a single waiter. With many waiting pollers, only one wakes on visibility/add events; others keep sleeping until the next notify.
+- Duplicated background tasks per worker: `Server::new` (constructed per worker) spawns `lease_expiry` and `visibility_wakeup` tasks for each worker. This leads to redundant polling of RocksDB and potential contention while not increasing throughput.
+
+Recommended fixes (incremental):
+
+1) Offload all RocksDB work:
+   - Wrap `storage.get_next_available_entries_with_lease` and `storage.remove_in_progress_item` in `tokio::task::spawn_blocking` inside `poll()` and `remove()` so the worker thread is not blocked.
+   - Consider a dedicated `rayon`/custom thread pool for storage ops if you want stronger isolation from Tokio's blocking pool.
+
+2) Improve wakeups:
+   - Switch `notify.notify_one()` to `notify.notify_waiters()` when items become visible or are added. This wakes all waiters; you may add simple backoff if stampedes become an issue.
+
+3) De-duplicate background tasks:
+   - Spawn a single `lease_expiry` and a single `visibility_wakeup` task in the top-level runtime, not per worker. They can still use `spawn_blocking` for DB access and notify the shared `Notify`.
+
+4) Connection-level parallelism:
+   - If the client is single-connection, it will monopolize one worker. For benchmarks intended to measure concurrent throughput across workers, open multiple client connections.
+   - Alternatively, refactor to a `Send`-safe per-connection task and use a multi-thread Tokio runtime without `LocalSet`, allowing tasks to distribute across cores. This depends on capnp-rpc constraints.
+
+5) Validate utilization after changes:
+   - With worker thread naming, use `top -H` or tracing to verify more workers are active under load. You should see blocking pool threads increase when many polls occur concurrently.
+
 ### Configuration knobs
 
 - Expose `--workers <N>` on the server binary to override the default `available_parallelism()` for the RPC worker pool. Default can remain `available_parallelism()`.
