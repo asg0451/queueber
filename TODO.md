@@ -18,3 +18,6 @@
 - [X] (bugfix) e2e benchmark hangs / improve benchmarks
 - [X] (bugfix) polling returns early if it's woken by a new message being added, *even if it isnt visible*.
 - [X] (bugfix) poll-waiting isnt interrupted when a message becomes visible
+- [ ] (minor) clean up cursed client stress mode
+- [ ] (minor) perf analysis on queueber while being stressed
+- [ ] (minor) integrate tokio console into queueber
