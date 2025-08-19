@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # TODO: for some reason it's not noticing this in .cargo/config.toml, so we have to set it here
+  # rustflags = ["--cfg", "tokio_unstable"] # for tokio console
+  RUSTFLAGS: --cfg tokio_unstable
 
 jobs:
   test:
@@ -29,7 +32,7 @@ jobs:
         toolchain: nightly
         components: clippy
         cache: true
-        cache-key: queueber-2
+        cache-key: queueber-3
 
     - name: Build
       run: cargo build --verbose
