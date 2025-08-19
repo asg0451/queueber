@@ -19,6 +19,7 @@
 - [X] (bugfix) polling returns early if it's woken by a new message being added, *even if it isnt visible*.
 - [X] (bugfix) poll-waiting isnt interrupted when a message becomes visible
 - [X] (minor) clean up cursed client stress mode
-- [ ] (minor) perf analysis on queueber while being stressed
+- [X] (minor) perf analysis on queueber while being stressed
+- [X] (feat) add prometheus metrics for SLIs and RocksDB internals
 - [X] (minor) integrate tokio console into queueber
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.

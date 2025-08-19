@@ -4,7 +4,9 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
-use queueber::{server::Server, storage::Storage};
+use queueber::{
+    metrics::create_metrics, metrics_server::MetricsServer, server::Server, storage::Storage,
+};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -18,6 +20,10 @@ struct Args {
     /// Address to listen on (host:port)
     #[arg(short = 'l', long = "listen", default_value = "127.0.0.1:9090")]
     listen: String,
+
+    /// Metrics server address (host:port)
+    #[arg(short = 'm', long = "metrics", default_value = "127.0.0.1:9091")]
+    metrics: String,
 
     /// Data directory for RocksDB
     #[arg(short = 'd', long = "data-dir", default_value = "/tmp/queueber/data")]
@@ -48,9 +54,24 @@ async fn main() -> Result<()> {
         std::fs::remove_dir_all(&args.data_dir)?;
     }
 
-    let storage = Arc::new(Storage::new(&args.data_dir)?);
+    // Create metrics
+    let (registry, shared_metrics) = create_metrics();
+
+    let storage = Arc::new(Storage::new_with_metrics(
+        &args.data_dir,
+        Some(shared_metrics.clone()),
+    )?);
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Start metrics server
+    let metrics_server = MetricsServer::new(registry, shared_metrics.clone());
+    let metrics_addr = args.metrics.clone();
+    tokio::spawn(async move {
+        if let Err(e) = metrics_server.start(&metrics_addr).await {
+            tracing::error!("Metrics server failed: {}", e);
+        }
+    });
 
     // Build a small pool of RPC workers. Each worker runs a single-threaded runtime with a LocalSet
     let worker_count = std::thread::available_parallelism()
@@ -65,6 +86,7 @@ async fn main() -> Result<()> {
         let storage_cloned = Arc::clone(&storage);
         let notify_cloned = Arc::clone(&notify);
         let shutdown_tx_cloned = shutdown_tx.clone();
+        let shared_metrics_cloned = shared_metrics.clone();
 
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -72,7 +94,12 @@ async fn main() -> Result<()> {
                 .build()
                 .expect("build worker runtime");
             rt.block_on(async move {
-                let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
+                let server = Server::new_with_metrics(
+                    storage_cloned,
+                    notify_cloned,
+                    shutdown_tx_cloned,
+                    Some(shared_metrics_cloned),
+                );
                 let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
                 let local = tokio::task::LocalSet::new();
                 local
