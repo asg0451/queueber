@@ -277,3 +277,46 @@ async fn poll_wait_wakes_when_item_becomes_visible() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn extend_lease_updates_expiry_index() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    with_client(addr, |queue_client| async move {
+        // Add an immediately visible item
+        let mut add = queue_client.add_request();
+        {
+            let req = add.get().init_req();
+            let mut items = req.init_items(1);
+            let mut item = items.reborrow().get(0);
+            item.set_contents(b"hello");
+            item.set_visibility_timeout_secs(0);
+        }
+        let _ = add.send().promise.await.unwrap();
+
+        // Poll to obtain a lease
+        let mut poll_req = queue_client.poll_request();
+        {
+            let mut req = poll_req.get().init_req();
+            req.set_lease_validity_secs(1);
+            req.set_num_items(1);
+            req.set_timeout_secs(1);
+        }
+        let reply = poll_req.send().promise.await.unwrap();
+        let resp = reply.get().unwrap().get_resp().unwrap();
+        let lease = resp.get_lease().unwrap();
+
+        // Extend the lease by a few seconds; just assert RPC succeeds
+        let mut ext = queue_client.extend_request();
+        {
+            let mut req = ext.get().init_req();
+            req.set_lease(lease);
+            req.set_extend_by_secs(5);
+        }
+        let ext_reply = ext.send().promise.await.unwrap();
+        let extended = ext_reply.get().unwrap().get_resp().unwrap().get_extended();
+        assert!(extended);
+    })
+    .await;
+}

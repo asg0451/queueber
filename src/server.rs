@@ -258,6 +258,38 @@ impl crate::protocol::queue::Server for Server {
             }
         })
     }
+
+    fn extend(
+        &mut self,
+        params: crate::protocol::queue::ExtendParams,
+        mut results: crate::protocol::queue::ExtendResults,
+    ) -> Promise<(), capnp::Error> {
+        let req = match params.get() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let req = match req.get_req() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let lease_bytes = match req.get_lease() {
+            Ok(b) => b,
+            Err(e) => return Promise::err(e),
+        };
+        if lease_bytes.len() != 16 {
+            return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
+        }
+        let mut lease: [u8; 16] = [0; 16];
+        lease.copy_from_slice(lease_bytes);
+        let extend_by_secs = req.get_extend_by_secs();
+
+        let extended = match self.storage.extend_lease(&lease, extend_by_secs) {
+            Ok(b) => b,
+            Err(e) => return Promise::err(e.into()),
+        };
+        results.get().init_resp().set_extended(extended);
+        Promise::ok(())
+    }
 }
 
 fn write_poll_response(

@@ -1,3 +1,4 @@
+ 
 @0xbab6e22de0402699;
 
 using Rust = import "rust.capnp";
@@ -40,6 +41,15 @@ struct PollResponse {
     lease @1 :Data;
 }
 
+struct ExtendRequest {
+    lease @0 :Data;
+    extendBySecs @1 :UInt64;
+}
+
+struct ExtendResponse {
+    extended @0 :Bool;
+}
+
 struct PolledItem {
     contents @0 :Data;
     id @1 :Data;
@@ -49,6 +59,7 @@ interface Queue {
     add @00 (req :AddRequest) -> (resp :AddResponse);
     remove @01 (req :RemoveRequest) -> (resp :RemoveResponse);
     poll @02 (req :PollRequest) -> (resp :PollResponse);
+    extend @03 (req :ExtendRequest) -> (resp :ExtendResponse);
 }
 
 
