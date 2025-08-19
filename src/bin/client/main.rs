@@ -120,11 +120,10 @@ async fn main() -> Result<()> {
     let env_filter = std::env::var("RUST_LOG")
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| EnvFilter::new("info,queueber=info"));
+        .unwrap_or_else(|| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
-        .with(console_subscriber::spawn())
         .init();
 
     let cli = Cli::parse();
@@ -251,33 +250,36 @@ async fn main() -> Result<()> {
             let remove_count = Arc::new(atomic::AtomicU64::new(0));
 
             // periodic metrics reporter
-            tokio::spawn({
-                let add_count = Arc::clone(&add_count);
-                let poll_count = Arc::clone(&poll_count);
-                let remove_count = Arc::clone(&remove_count);
-                async move {
-                    let mut last_time = Instant::now();
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        let now = Instant::now();
-                        let adds = add_count.swap(0, atomic::Ordering::Relaxed);
-                        let polls = poll_count.swap(0, atomic::Ordering::Relaxed);
-                        let removes = remove_count.swap(0, atomic::Ordering::Relaxed);
-                        let duration = now.duration_since(last_time);
-                        last_time = now;
-                        let secs = duration.as_secs_f64().max(1.0);
-                        println!(
-                            "add: {} ({:.1}/s), poll: {} ({:.1}/s), remove: {} ({:.1}/s)",
-                            adds,
-                            adds as f64 / secs,
-                            polls,
-                            polls as f64 / secs,
-                            removes,
-                            removes as f64 / secs
-                        );
+            tokio::task::Builder::new()
+                .name("metrics_reporter")
+                .spawn({
+                    let add_count = Arc::clone(&add_count);
+                    let poll_count = Arc::clone(&poll_count);
+                    let remove_count = Arc::clone(&remove_count);
+                    async move {
+                        let mut last_time = Instant::now();
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            let now = Instant::now();
+                            let adds = add_count.swap(0, atomic::Ordering::Relaxed);
+                            let polls = poll_count.swap(0, atomic::Ordering::Relaxed);
+                            let removes = remove_count.swap(0, atomic::Ordering::Relaxed);
+                            let duration = now.duration_since(last_time);
+                            last_time = now;
+                            let secs = duration.as_secs_f64().max(1.0);
+                            println!(
+                                "add: {} ({:.1}/s), poll: {} ({:.1}/s), remove: {} ({:.1}/s)",
+                                adds,
+                                adds as f64 / secs,
+                                polls,
+                                polls as f64 / secs,
+                                removes,
+                                removes as f64 / secs
+                            );
+                        }
                     }
-                }
-            });
+                })
+                .unwrap();
 
             std::thread::scope(|s| {
                 // spawn polling clients
@@ -391,7 +393,9 @@ where
     let queue_client: queue::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
     Ok(tokio::task::LocalSet::new()
         .run_until(async move {
-            let _jh = tokio::task::spawn_local(rpc_system);
+            let _jh = tokio::task::Builder::new()
+                .name("rpc_system")
+                .spawn_local(rpc_system);
             f(queue_client).await
         })
         .await)

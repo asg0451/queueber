@@ -62,7 +62,10 @@ fn start_test_server() -> TestServerHandle {
                         );
                         let rpc_system =
                             RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
-                        let _jh = tokio::task::spawn_local(rpc_system);
+                        let _jh = tokio::task::Builder::new()
+                            .name("rpc_system")
+                            .spawn_local(rpc_system)
+                            .unwrap();
                     }
                 })
                 .await;
@@ -97,7 +100,10 @@ where
     let queue_client: queue::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
     tokio::task::LocalSet::new()
         .run_until(async move {
-            let _jh = tokio::task::spawn_local(rpc_system);
+            let _jh = tokio::task::Builder::new()
+                .name("rpc_system")
+                .spawn_local(rpc_system)
+                .unwrap();
             f(queue_client).await
         })
         .await

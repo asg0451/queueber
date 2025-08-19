@@ -72,6 +72,7 @@ The Cap'n Proto schema (`queueber.capnp`) is compiled during build via `build.rs
 - Avoid `map_err` whenever possible; use `?` and convert errors at boundaries.
 - When sharing `Arc<T>`, prefer `Arc::clone(&arc_value)` over calling `.clone()` directly on the variable for clarity and to avoid accidental inner clones.
 - **Error Handling**: Prefer using `crate::errors::Error::somevariant` then using `into()` to make it a capnp error. This way we get the backtrace.
+- Never use a bare `tokio::spawn*` - always use `tokio::task::Builder::new().name("some name").spawn*(..).unwrap()/?`
 
 ## Invariants and Failure Policy
 
