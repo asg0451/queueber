@@ -29,6 +29,7 @@ capnpc = "0.21.2"
 [dev-dependencies]
 scopeguard = "1.2.0"
 criterion = { version = "0.5" }
+proptest = "1.5"
 
 [[bench]]
 name = "storage_bench"
