@@ -5,12 +5,10 @@ use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Duration;
 
+use crate::Storage;
 use crate::errors::{Error, Result};
-use crate::{
-    protocol::queue::{
-        AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
-    },
-    storage::Storage,
+use crate::protocol::queue::{
+    AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
 
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc

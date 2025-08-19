@@ -72,6 +72,10 @@ The Cap'n Proto schema (`queueber.capnp`) is compiled during build via `build.rs
 - Avoid `map_err` whenever possible; use `?` and convert errors at boundaries.
 - When sharing `Arc<T>`, prefer `Arc::clone(&arc_value)` over calling `.clone()` directly on the variable for clarity and to avoid accidental inner clones.
 
+## Invariants and Failure Policy
+
+- Prefer fail-fast for broken invariants. If internal consistency checks (e.g., an index referencing a missing main record) fail, return an error rather than attempting automatic healing. Such conditions indicate a logic or concurrency bug and should surface in tests and logs immediately.
+
 ## Current State
 
 This is an early-stage implementation. Key unimplemented features noted in TODO.md:

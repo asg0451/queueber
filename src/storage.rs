@@ -1,6 +1,6 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize_packed;
-use rocksdb::{DB, Options, SliceTransform, WriteBatchWithTransaction};
+use rocksdb::{Options, SliceTransform, TransactionDB, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
@@ -8,11 +8,11 @@ use uuid::Uuid;
 use crate::dbkeys::{
     AvailableKey, InProgressKey, LeaseExpiryIndexKey, LeaseKey, VisibilityIndexKey,
 };
-use crate::errors::{Error, Result};
+use crate::errors::Result;
 use crate::protocol;
 
 pub struct Storage {
-    db: DB,
+    db: TransactionDB,
 }
 
 impl Storage {
@@ -35,7 +35,8 @@ impl Storage {
         );
         opts.set_prefix_extractor(ns_prefix);
         opts.create_if_missing(true);
-        let db = DB::open(&opts, path)?;
+        let txn_opts = rocksdb::TransactionDBOptions::default();
+        let db = TransactionDB::open(&opts, &txn_opts, path)?;
         Ok(Self { db })
     }
 
@@ -90,7 +91,7 @@ impl Storage {
         let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
         serialize_packed::write_message(&mut stored_contents, &simsg)?;
 
-        let mut batch = WriteBatchWithTransaction::<false>::default();
+        let mut batch = WriteBatchWithTransaction::<true>::default();
         batch.put(main_key.as_ref(), &stored_contents);
         batch.put(visibility_index_key.as_ref(), main_key.as_ref());
         self.db.write(batch)?;
@@ -185,7 +186,7 @@ impl Storage {
 
         let mut polled_items = Vec::with_capacity(n);
 
-        let mut in_progress_batch = WriteBatchWithTransaction::<false>::default();
+        let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
 
         for kv in iter {
             if polled_items.len() >= n {
@@ -208,16 +209,22 @@ impl Storage {
                 break;
             }
 
-            let main_value = self
-                .db
-                .get(&main_key)?
-                .ok_or_else(|| Error::AssertionFailed {
+            // Atomically claim the item using a transaction to prevent races
+            let txn = self.db.transaction();
+            // Lock both the index entry and the main key to avoid concurrent polls claiming it
+            let _ = txn.get_for_update(&idx_key, true)?;
+            let main_value_opt = txn.get_for_update(&main_key, true)?;
+            let Some(main_value) = main_value_opt else {
+                // Invariant: visibility index should point to an available item. If it's gone,
+                // fail fast rather than silently healing; this indicates a concurrency bug.
+                return Err(crate::errors::Error::AssertionFailed {
                     msg: format!(
-                        "database integrity violated: main key not found: {:?}",
+                        "database integrity violated: main key not found for visibility entry: {:?}",
                         &main_key
                     ),
                     backtrace: std::backtrace::Backtrace::capture(),
-                })?;
+                });
+            };
 
             let stored_item_message = serialize_packed::read_message(
                 BufReader::new(&main_value[..]), // TODO: avoid allocation
@@ -249,11 +256,11 @@ impl Storage {
 
             // move the item to in progress
             let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
-            in_progress_batch.delete(&main_key);
-            in_progress_batch.put(new_main_key.as_ref(), &main_value);
-
-            // remove the visibility index entry
-            in_progress_batch.delete(&idx_key);
+            // Apply moves inside the transaction to guarantee exclusivity
+            txn.delete(&main_key)?;
+            txn.put(new_main_key.as_ref(), &main_value)?;
+            txn.delete(&idx_key)?;
+            txn.commit()?;
         }
 
         // Build the lease entry by re-reading the IDs from the polled_items
@@ -325,7 +332,7 @@ impl Storage {
         }
 
         // Prepare batch: delete in_progress item; update or delete lease entry
-        let mut batch = WriteBatchWithTransaction::<false>::default();
+        let mut batch = WriteBatchWithTransaction::<true>::default();
         batch.delete(in_progress_key.as_ref());
 
         if kept_keys.is_empty() {
@@ -382,7 +389,7 @@ impl Storage {
             // Load the lease entry; if missing, just delete the expiry index
             let lease_value_opt = self.db.get(lease_key.as_ref())?;
             if lease_value_opt.is_none() {
-                let mut batch = WriteBatchWithTransaction::<false>::default();
+                let mut batch = WriteBatchWithTransaction::<true>::default();
                 batch.delete(&idx_key);
                 self.db.write(batch)?;
                 processed += 1;
@@ -398,7 +405,7 @@ impl Storage {
             let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
             let keys = lease_entry_reader.get_keys()?;
 
-            let mut batch = WriteBatchWithTransaction::<false>::default();
+            let mut batch = WriteBatchWithTransaction::<true>::default();
 
             // For each id, if it's still in in_progress, move back to available and
             // restore the visibility index entry with visibility at now
@@ -809,5 +816,30 @@ mod tests {
         let (_lease2, items2) = storage.get_next_available_entries(1)?;
         assert_eq!(items2.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn stale_visibility_index_entry_fails_fast() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Create a visibility index entry pointing at a non-existent main key
+        let ghost_id = b"ghost";
+        let idx_key = VisibilityIndexKey::from_visible_ts_and_id(0, ghost_id);
+        let main_key = AvailableKey::from_id(ghost_id);
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+        batch.put(idx_key.as_ref(), main_key.as_ref());
+        storage.db.write(batch)?;
+
+        // Poll should fail fast with an assertion failure due to broken invariant
+        match storage.get_next_available_entries(1) {
+            Err(crate::errors::Error::AssertionFailed { .. }) => Ok(()),
+            Ok(_) => panic!("expected AssertionFailed, got Ok(..)"),
+            Err(e) => panic!("expected AssertionFailed, got {}", e),
+        }
     }
 }
