@@ -18,7 +18,7 @@
 - [X] (bugfix) e2e benchmark hangs / improve benchmarks
 - [X] (bugfix) polling returns early if it's woken by a new message being added, *even if it isnt visible*.
 - [X] (bugfix) poll-waiting isnt interrupted when a message becomes visible
-- [ ] (minor) clean up cursed client stress mode
+- [X] (minor) clean up cursed client stress mode
 - [ ] (minor) perf analysis on queueber while being stressed
 - [X] (minor) integrate tokio console into queueber
 - [ ] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
