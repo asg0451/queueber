@@ -8,7 +8,8 @@ use tokio::time::Duration;
 use crate::Storage;
 use crate::errors::{Error, Result};
 use crate::protocol::queue::{
-    AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
+    AddParams, AddResults, ExtendParams, ExtendResults, PollParams, PollResults, RemoveParams,
+    RemoveResults,
 };
 
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc
@@ -193,7 +194,13 @@ impl crate::protocol::queue::Server for Server {
         let lease_bytes = req.get_lease()?;
 
         if lease_bytes.len() != 16 {
-            return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
+            return Promise::err(
+                Error::AssertionFailed {
+                    msg: "invalid lease length".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into(),
+            );
         }
         let mut lease: [u8; 16] = [0; 16];
         lease.copy_from_slice(lease_bytes);
@@ -207,6 +214,46 @@ impl crate::protocol::queue::Server for Server {
         Promise::ok(())
     }
 
+    fn extend(
+        &mut self,
+        params: ExtendParams,
+        mut results: ExtendResults,
+    ) -> Promise<(), capnp::Error> {
+        let req = params.get()?.get_req()?;
+        let lease_bytes = req.get_lease()?;
+        let lease_validity_secs = req.get_lease_validity_secs();
+
+        if lease_bytes.len() != 16 {
+            return Promise::err(
+                Error::AssertionFailed {
+                    msg: "invalid lease length".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into(),
+            );
+        }
+        if lease_validity_secs == 0 {
+            return Promise::err(
+                Error::AssertionFailed {
+                    msg: "invariant: leaseValiditySecs must be > 0".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into(),
+            );
+        }
+
+        let mut lease: [u8; 16] = [0; 16];
+        lease.copy_from_slice(lease_bytes);
+
+        let extended = self
+            .storage
+            .extend_lease(&lease, lease_validity_secs)
+            .map_err(Into::into)?;
+
+        results.get().init_resp().set_extended(extended);
+        Promise::ok(())
+    }
+
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
@@ -215,9 +262,11 @@ impl crate::protocol::queue::Server for Server {
             let req = params.get()?.get_req()?;
             let lease_validity_secs = req.get_lease_validity_secs();
             if lease_validity_secs == 0 {
-                return Err(capnp::Error::failed(
-                    "invariant: leaseValiditySecs must be > 0".to_string(),
-                ));
+                return Err(Error::AssertionFailed {
+                    msg: "invariant: leaseValiditySecs must be > 0".to_string(),
+                    backtrace: std::backtrace::Backtrace::capture(),
+                }
+                .into());
             }
             let num_items = match req.get_num_items() {
                 0 => 1,
