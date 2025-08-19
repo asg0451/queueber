@@ -71,4 +71,5 @@ struct StoredItem {
 
 struct LeaseEntry {
     keys @0 :List(Data);
+    expiryIndexKey @1 :Data;
 }
