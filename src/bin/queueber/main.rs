@@ -28,13 +28,15 @@ struct Args {
     wipe: bool,
 }
 
+// NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing with both console and fmt subscribers
     let env_filter = std::env::var("RUST_LOG")
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| EnvFilter::new("info,queueber=info"));
+        .unwrap_or_else(|| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
@@ -74,25 +76,32 @@ async fn main() -> Result<()> {
             rt.block_on(async move {
                 let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
                 let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
+                // TODO: give this one a name
                 let local = tokio::task::LocalSet::new();
                 local
                     .run_until(async move {
                         while let Some(stream) = rx.recv().await {
                             let client = queue_client.clone();
-                            let _jh = tokio::task::spawn_local(async move {
-                                let (reader, writer) =
-                                    tokio_util::compat::TokioAsyncReadCompatExt::compat(stream)
-                                        .split();
-                                let network = twoparty::VatNetwork::new(
-                                    futures::io::BufReader::new(reader),
-                                    futures::io::BufWriter::new(writer),
-                                    rpc_twoparty_capnp::Side::Server,
-                                    Default::default(),
-                                );
-                                let rpc_system =
-                                    RpcSystem::new(Box::new(network), Some(client.client));
-                                let _jh2 = tokio::task::spawn_local(rpc_system);
-                            });
+                            let _jh = tokio::task::Builder::new()
+                                .name("rpc_server")
+                                .spawn_local(async move {
+                                    let (reader, writer) =
+                                        tokio_util::compat::TokioAsyncReadCompatExt::compat(stream)
+                                            .split();
+                                    let network = twoparty::VatNetwork::new(
+                                        futures::io::BufReader::new(reader),
+                                        futures::io::BufWriter::new(writer),
+                                        rpc_twoparty_capnp::Side::Server,
+                                        Default::default(),
+                                    );
+                                    let rpc_system =
+                                        RpcSystem::new(Box::new(network), Some(client.client));
+                                    let _jh2 = tokio::task::Builder::new()
+                                        .name("rpc_system")
+                                        .spawn_local(rpc_system)
+                                        .unwrap();
+                                })
+                                .unwrap();
                         }
                     })
                     .await;

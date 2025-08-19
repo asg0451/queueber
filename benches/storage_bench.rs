@@ -191,7 +191,9 @@ fn ensure_server_started() -> &'static ServerHandle {
                                 Box::new(network),
                                 Some(queue_client.clone().client),
                             );
-                            let _jh = tokio::task::spawn_local(rpc_system);
+                            let _jh = tokio::task::Builder::new()
+                                .name("rpc_system")
+                                .spawn_local(rpc_system);
                         }
                     })
                     .await;
@@ -232,7 +234,9 @@ where
         let queue_client: queue::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
         tokio::task::LocalSet::new()
             .run_until(async move {
-                let _jh = tokio::task::spawn_local(rpc_system);
+                let _jh = tokio::task::Builder::new()
+                    .name("rpc_system")
+                    .spawn_local(rpc_system);
                 f(queue_client).await
             })
             .await
