@@ -47,6 +47,15 @@ impl AvailableKey {
     pub fn id_suffix(&self) -> &[u8] {
         &self.0[Self::PREFIX.len()..]
     }
+
+    /// Returns the item id suffix from a raw `available/` key without allocating.
+    ///
+    /// Panics in debug builds if the provided slice does not start with the
+    /// expected `available/` prefix.
+    pub fn id_suffix_from_key_bytes(main_key_bytes: &[u8]) -> &[u8] {
+        debug_assert!(main_key_bytes.starts_with(Self::PREFIX));
+        &main_key_bytes[Self::PREFIX.len()..]
+    }
 }
 
 impl AsRef<[u8]> for AvailableKey {

@@ -216,8 +216,8 @@ impl Storage {
                 // Check if this is a database integrity issue or just normal concurrency
                 // If the visibility index entry exists but the main key doesn't, that's a database integrity issue
                 // If the main key exists but is in in-progress state, that's normal concurrency
-                let in_progress_key =
-                    InProgressKey::from_id(&main_key[AvailableKey::PREFIX.len()..]);
+                let id_suffix = AvailableKey::id_suffix_from_key_bytes(&main_key);
+                let in_progress_key = InProgressKey::from_id(id_suffix);
                 if txn.get(&in_progress_key)?.is_some() {
                     // Item was already claimed by another poll, skip it
                     continue;
@@ -245,7 +245,7 @@ impl Storage {
             // for the item. Ensure it matches the item's id.
             debug_assert_eq!(
                 stored_item.get_id()?,
-                &main_key[AvailableKey::PREFIX.len()..]
+                AvailableKey::id_suffix_from_key_bytes(&main_key)
             );
 
             tracing::debug!(
