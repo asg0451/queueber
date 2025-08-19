@@ -4,7 +4,7 @@
 - [X] (minor) set the rocksdb setting that helps with prefix scans
 - [X] (minor) proper command setup (cli args, etc)
 - [X] (minor) ci
-- [ ] (minor) rocksdb settings tuning
+- [X] (minor) rocksdb settings tuning
 - [X] (major) server concurrency (either normally or via partitioning)
 - [X] (major) server parallelism
 - [ ] (major) server/storage sharding

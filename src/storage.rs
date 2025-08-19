@@ -18,6 +18,7 @@ pub struct Storage {
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
         let mut opts = Options::default();
+
         // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
         // Extract the namespace prefix up to and including the first '/'.
         // Examples:
@@ -35,6 +36,49 @@ impl Storage {
         );
         opts.set_prefix_extractor(ns_prefix);
         opts.create_if_missing(true);
+
+        // Performance tuning for queue workload
+        // Write buffer size - larger buffers reduce write amplification but use more memory
+        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
+        opts.set_max_write_buffer_number(3);
+        opts.set_min_write_buffer_number_to_merge(2);
+
+        // Compaction settings - optimize for read-heavy workload with frequent small writes
+        opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_level_zero_slowdown_writes_trigger(8);
+        opts.set_level_zero_stop_writes_trigger(12);
+        opts.set_max_bytes_for_level_base(256 * 1024 * 1024); // 256MB
+        opts.set_max_bytes_for_level_multiplier(10.0);
+
+        // Bloom filter settings - improve read performance for point lookups
+        opts.set_bloom_locality(1);
+        opts.set_optimize_filters_for_hits(true);
+
+        // Block cache and table settings
+        // Note: Block cache is configured via BlockBasedTableOptions in newer RocksDB versions
+        // These settings are applied at the table level, not the database level
+
+        // Compression settings - balance between space and CPU
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+
+        // Memory management
+        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB write buffer
+        opts.set_max_background_jobs(4); // Parallel background jobs
+
+        // Transaction-specific optimizations
+        opts.set_use_fsync(false); // Use fdatasync for better performance
+        opts.set_bytes_per_sync(1024 * 1024); // 1MB per sync
+        opts.set_wal_bytes_per_sync(64 * 1024); // 64KB WAL sync
+
+        // Optimize for queue-specific access patterns
+        opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
+        opts.set_compaction_readahead_size(2 * 1024 * 1024); // 2MB readahead
+
+        // Disable features not needed for queue workload
+        opts.set_manual_wal_flush(false);
+        opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
+
         let txn_opts = rocksdb::TransactionDBOptions::default();
         let db = TransactionDB::open(&opts, &txn_opts, path)?;
         Ok(Self { db })
