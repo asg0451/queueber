@@ -165,11 +165,6 @@ impl Storage {
             >,
         >,
     )> {
-        // Iterate over visibility index entries in lexicographic order; since
-        // timestamps are encoded big-endian in the key, this corresponds to
-        // ascending time order.
-        let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
-
         // Determine current time (secs since epoch) to filter visible items.
         let now = std::time::SystemTime::now();
         let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -184,9 +179,12 @@ impl Storage {
         let lease_expiry_index_key =
             LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, &lease);
 
-        let mut polled_items = Vec::with_capacity(n);
+        // Iterate over visibility index entries in lexicographic order; since
+        // timestamps are encoded big-endian in the key, this corresponds to
+        // ascending time order.
+        let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
 
-        let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
+        let mut polled_items = Vec::with_capacity(n);
 
         for kv in iter {
             if polled_items.len() >= n {
@@ -209,21 +207,31 @@ impl Storage {
                 break;
             }
 
-            // Atomically claim the item using a transaction to prevent races
+            // Try to claim this item atomically using a transaction
             let txn = self.db.transaction();
             // Lock both the index entry and the main key to avoid concurrent polls claiming it
             let _ = txn.get_for_update(&idx_key, true)?;
             let main_value_opt = txn.get_for_update(&main_key, true)?;
             let Some(main_value) = main_value_opt else {
-                // Invariant: visibility index should point to an available item. If it's gone,
-                // fail fast rather than silently healing; this indicates a concurrency bug.
-                return Err(crate::errors::Error::AssertionFailed {
-                    msg: format!(
-                        "database integrity violated: main key not found for visibility entry: {:?}",
-                        &main_key
-                    ),
-                    backtrace: std::backtrace::Backtrace::capture(),
-                });
+                // Check if this is a database integrity issue or just normal concurrency
+                // If the visibility index entry exists but the main key doesn't, that's a database integrity issue
+                // If the main key exists but is in in-progress state, that's normal concurrency
+                let in_progress_key =
+                    InProgressKey::from_id(&main_key[AvailableKey::PREFIX.len()..]);
+                if txn.get(&in_progress_key)?.is_some() {
+                    // Item was already claimed by another poll, skip it
+                    continue;
+                } else {
+                    // Invariant: visibility index should point to an available item. If it's gone,
+                    // fail fast rather than silently healing; this indicates a concurrency bug.
+                    return Err(crate::errors::Error::AssertionFailed {
+                        msg: format!(
+                            "database integrity violated: main key not found for visibility entry: {:?}",
+                            &main_key
+                        ),
+                        backtrace: std::backtrace::Backtrace::capture(),
+                    });
+                }
             };
 
             let stored_item_message = serialize_packed::read_message(
@@ -276,6 +284,8 @@ impl Storage {
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
 
+        // Write the lease entry
+        let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
         in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
         // index the lease by expiry time for the background sweeper
         in_progress_batch.put(lease_expiry_index_key.as_ref(), lease_key.as_ref());
@@ -841,5 +851,84 @@ mod tests {
             Ok(_) => panic!("expected AssertionFailed, got Ok(..)"),
             Err(e) => panic!("expected AssertionFailed, got {}", e),
         }
+    }
+
+    #[test]
+    fn concurrent_polls_do_not_get_overlapping_messages() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::new(tmp.path()).expect("storage"));
+
+        // Add 10 items that are immediately visible
+        for i in 0..10 {
+            let id = format!("item-{}", i);
+            storage.add_available_item_from_parts(id.as_bytes(), b"payload", 0)?;
+        }
+
+        // Spawn 3 concurrent polls, each trying to get 4 items
+        let mut handles = Vec::new();
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for poller_id in 0..3 {
+            let st = Arc::clone(&storage);
+            let results = Arc::clone(&results);
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                let (_lease, items) = st.get_next_available_entries(4)?;
+                let mut item_ids = Vec::new();
+                for item in items {
+                    let item_reader = item.get()?;
+                    item_ids.push(item_reader.get_id()?.to_vec());
+                }
+
+                let mut results = results.lock().unwrap();
+                results.push((poller_id, item_ids));
+                Ok(())
+            }));
+        }
+
+        // Wait for all polls to complete
+        for h in handles {
+            h.join().expect("thread join").expect("poller result");
+        }
+
+        // Check that no item appears in multiple polls
+        let results = results.lock().unwrap();
+        let mut all_item_ids = Vec::new();
+        for (poller_id, item_ids) in results.iter() {
+            println!(
+                "Poller {} got items: {:?}",
+                poller_id,
+                item_ids
+                    .iter()
+                    .map(|id| String::from_utf8_lossy(id))
+                    .collect::<Vec<_>>()
+            );
+            all_item_ids.extend(item_ids.clone());
+        }
+
+        // Check for duplicates
+        let mut sorted_ids = all_item_ids.clone();
+        sorted_ids.sort();
+        sorted_ids.dedup();
+
+        if sorted_ids.len() != all_item_ids.len() {
+            panic!(
+                "Found duplicate items across concurrent polls! Total items: {}, Unique items: {}",
+                all_item_ids.len(),
+                sorted_ids.len()
+            );
+        }
+
+        // Verify we got exactly 10 items total (some polls might get fewer than 4 if others got them first)
+        assert_eq!(
+            all_item_ids.len(),
+            10,
+            "Expected exactly 10 items total across all polls"
+        );
+
+        Ok(())
     }
 }
