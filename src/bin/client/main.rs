@@ -1,6 +1,6 @@
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use clap::{Parser, Subcommand};
-use color_eyre::{Result, eyre::Error};
+use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::protocol::queue;
 use std::{
@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::{runtime::Handle, time::Instant};
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -72,9 +73,19 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::var_os("TOKIO_CONSOLE").is_some() {
+        console_subscriber::init();
+    } else {
+        let env_filter = std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|v| EnvFilter::try_new(v).ok())
+            .unwrap_or_else(|| EnvFilter::new("info,queueber=info"));
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
     let cli = Cli::parse();
     let addr = &cli.addr;
-    let addr = SocketAddr::from_str(&addr)?;
+    let addr = SocketAddr::from_str(addr)?;
 
     match cli.command {
         Commands::Add {
@@ -170,7 +181,7 @@ async fn main() -> Result<()> {
         Commands::Stress {
             polling_clients,
             adding_clients,
-            rate, // TODO: use this
+            rate: _, // TODO: use this
         } => {
             // TODO: clean this shit up jesus fucking christ
 
@@ -252,8 +263,8 @@ async fn main() -> Result<()> {
                                             let promises = items.iter().map(|i| {
                                                 let mut request = queue_client.remove_request();
                                                 let mut req = request.get().init_req();
-                                                req.set_id(&i.get_id().unwrap());
-                                                req.set_lease(&lease);
+                                                req.set_id(i.get_id().unwrap());
+                                                req.set_lease(lease);
                                                 request.send().promise
                                             });
                                             let _ = futures::future::join_all(promises).await;
