@@ -6,7 +6,7 @@
 - [X] (minor) ci
 - [ ] (minor) rocksdb settings tuning
 - [X] (major) server concurrency (either normally or via partitioning)
-- [ ] (major) server parallelism
+- [X] (major) server parallelism
 - [ ] (major) server/storage sharding
 - [X] (major) move storage to an io thread pool
 - [X] (feat) implement lease expiry via a background thread
@@ -22,3 +22,4 @@
 - [ ] (minor) perf analysis on queueber while being stressed
 - [X] (minor) integrate tokio console into queueber
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
+- [ ] (perf) improve performance and cpu utilization. see docs/perf-notes.md

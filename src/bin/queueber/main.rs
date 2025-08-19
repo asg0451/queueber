@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
+    tracing::info!("using {} worker threads", worker_count);
     let mut senders = Vec::with_capacity(worker_count);
     let mut worker_handles = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
