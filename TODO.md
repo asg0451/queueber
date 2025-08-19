@@ -21,3 +21,4 @@
 - [ ] (minor) clean up cursed client stress mode
 - [ ] (minor) perf analysis on queueber while being stressed
 - [ ] (minor) integrate tokio console into queueber
+- [ ] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
