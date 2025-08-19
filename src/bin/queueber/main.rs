@@ -7,6 +7,7 @@ use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
 // for how to send stuff across threads; so we can parallelize the work..?
@@ -29,6 +30,17 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing with both console and fmt subscribers
+    let env_filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| EnvFilter::new("info,queueber=info"));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(console_subscriber::spawn())
+        .init();
+
     let args = Args::parse();
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
