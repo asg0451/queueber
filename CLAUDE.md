@@ -61,6 +61,7 @@ Connects to server at `localhost:9090` and demonstrates adding an item
 
 - Prefer iterator combinators (`iter`, `map`, `filter`, `filter_map`, `collect`) over index-based loops when collecting or transforming data.
 - Avoid `map_err` whenever possible!!!
+- In functions that return `Promise<(), capnp::Error>`, you DON'T need to match and return `promise::err`. you can and must just use `?`.
 
 ### Schema Generation
 
