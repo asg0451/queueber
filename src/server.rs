@@ -1,6 +1,6 @@
 use capnp::capability::Promise;
 use capnp::message::{Builder, HeapAllocator, TypedReader};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Duration;
@@ -26,95 +26,102 @@ impl Server {
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
-        let bg_storage = Arc::clone(&storage);
-        let bg_notify = Arc::clone(&notify);
-        let lease_expiry_shutdown = shutdown_tx.clone();
-        let visibility_wakeup_shutdown = shutdown_tx.clone();
+        // Spawn background tasks once per process (de-duplicated across workers)
+        static BG_SPAWNED: AtomicBool = AtomicBool::new(false);
+        if BG_SPAWNED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let bg_storage = Arc::clone(&storage);
+            let bg_notify = Arc::clone(&notify);
+            let lease_expiry_shutdown = shutdown_tx.clone();
 
-        // Background task to expire leases periodically
-        tokio::task::Builder::new()
-            .name("lease_expiry")
-            .spawn(async move {
-                loop {
-                    let st = Arc::clone(&bg_storage);
-                    match tokio::task::Builder::new()
-                        .name("expire_due_leases")
-                        .spawn_blocking(move || st.expire_due_leases())
-                        .unwrap()
-                        .await
-                    {
-                        Ok(Ok(n)) => {
-                            if n > 0 {
-                                bg_notify.notify_one();
+            // Background task to expire leases periodically
+            tokio::task::Builder::new()
+                .name("lease_expiry")
+                .spawn(async move {
+                    loop {
+                        let st = Arc::clone(&bg_storage);
+                        match tokio::task::Builder::new()
+                            .name("expire_due_leases")
+                            .spawn_blocking(move || st.expire_due_leases())
+                            .unwrap()
+                            .await
+                        {
+                            Ok(Ok(n)) => {
+                                if n > 0 {
+                                    bg_notify.notify_waiters();
+                                }
+                            }
+                            Ok(Err(_e)) => {
+                                let _ = lease_expiry_shutdown.send(true);
+                                break;
+                            }
+                            Err(_join_err) => {
+                                let _ = lease_expiry_shutdown.send(true);
+                                break;
                             }
                         }
-                        Ok(Err(_e)) => {
-                            let _ = lease_expiry_shutdown.send(true);
-                            break;
-                        }
-                        Err(_join_err) => {
-                            let _ = lease_expiry_shutdown.send(true);
-                            break;
-                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            })
-            .unwrap();
+                })
+                .unwrap();
 
-        // Background task to wake pollers when any invisible message becomes visible.
-        let vis_storage = Arc::clone(&storage);
-        let vis_notify = Arc::clone(&notify);
-        tokio::task::Builder::new()
-            .name("visibility_wakeup")
-            .spawn(async move {
-                loop {
-                    // Peek earliest visibility timestamp from RocksDB (blocking)
-                    let next_vis_opt = tokio::task::Builder::new()
-                        .name("peek_next_visibility_ts_secs")
-                        .spawn_blocking({
-                            let st = Arc::clone(&vis_storage);
-                            move || st.peek_next_visibility_ts_secs()
-                        })
-                        .unwrap()
-                        .await;
+            // Background task to wake pollers when any invisible message becomes visible.
+            let vis_storage = Arc::clone(&storage);
+            let vis_notify = Arc::clone(&notify);
+            let visibility_wakeup_shutdown = shutdown_tx.clone();
+            tokio::task::Builder::new()
+                .name("visibility_wakeup")
+                .spawn(async move {
+                    loop {
+                        // Peek earliest visibility timestamp from RocksDB (blocking)
+                        let next_vis_opt = tokio::task::Builder::new()
+                            .name("peek_next_visibility_ts_secs")
+                            .spawn_blocking({
+                                let st = Arc::clone(&vis_storage);
+                                move || st.peek_next_visibility_ts_secs()
+                            })
+                            .unwrap()
+                            .await;
 
-                    match next_vis_opt {
-                        Ok(Ok(Some(ts_secs))) => {
-                            // Compute duration until visibility; if already visible, notify now.
-                            let now_secs = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(ts_secs);
-                            if ts_secs <= now_secs {
-                                vis_notify.notify_one();
-                                // Avoid busy loop; small sleep before checking again.
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            } else {
-                                let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
-                                tokio::time::sleep(sleep_dur).await;
-                                vis_notify.notify_one();
+                        match next_vis_opt {
+                            Ok(Ok(Some(ts_secs))) => {
+                                // Compute duration until visibility; if already visible, notify now.
+                                let now_secs = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(ts_secs);
+                                if ts_secs <= now_secs {
+                                    vis_notify.notify_waiters();
+                                    // Avoid busy loop; small sleep before checking again.
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                } else {
+                                    let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
+                                    tokio::time::sleep(sleep_dur).await;
+                                    vis_notify.notify_waiters();
+                                }
+                            }
+                            Ok(Ok(None)) => {
+                                // No items; back off
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                            // TODO: can this be prettier?
+                            Ok(Err(e)) => {
+                                tracing::error!("peek_next_visibility_ts_secs: {}", e);
+                                let _ = visibility_wakeup_shutdown.send(true);
+                                break;
+                            }
+                            Err(join_err) => {
+                                tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
+                                let _ = visibility_wakeup_shutdown.send(true);
+                                break;
                             }
                         }
-                        Ok(Ok(None)) => {
-                            // No items; back off
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
-                        // TODO: can this be prettier?
-                        Ok(Err(e)) => {
-                            tracing::error!("peek_next_visibility_ts_secs: {}", e);
-                            let _ = visibility_wakeup_shutdown.send(true);
-                            break;
-                        }
-                        Err(join_err) => {
-                            tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
-                            let _ = visibility_wakeup_shutdown.send(true);
-                            break;
-                        }
                     }
-                }
-            })
-            .unwrap();
+                })
+                .unwrap();
+        }
 
         Self {
             storage,
@@ -168,7 +175,7 @@ impl crate::protocol::queue::Server for Server {
                 .map_err(Into::<Error>::into)??;
 
             if any_immediately_visible {
-                notify.notify_one();
+                notify.notify_waiters();
             }
 
             // Build the response on the RPC thread.
@@ -188,9 +195,10 @@ impl crate::protocol::queue::Server for Server {
         params: RemoveParams,
         mut results: RemoveResults,
     ) -> Promise<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        let id = req.get_id()?;
-        let lease_bytes = req.get_lease()?;
+        let req = match params.get() { Ok(p) => p, Err(e) => return Promise::err(e) };
+        let req = match req.get_req() { Ok(r) => r, Err(e) => return Promise::err(e) };
+        let id = match req.get_id() { Ok(i) => i, Err(e) => return Promise::err(e) };
+        let lease_bytes = match req.get_lease() { Ok(l) => l, Err(e) => return Promise::err(e) };
 
         if lease_bytes.len() != 16 {
             return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
@@ -198,13 +206,19 @@ impl crate::protocol::queue::Server for Server {
         let mut lease: [u8; 16] = [0; 16];
         lease.copy_from_slice(lease_bytes);
 
-        let removed = self
-            .storage
-            .remove_in_progress_item(id, &lease)
-            .map_err(Into::into)?;
+        let storage = Arc::clone(&self.storage);
+        let id_vec = id.to_vec();
+        let lease_copy = lease;
 
-        results.get().init_resp().set_removed(removed);
-        Promise::ok(())
+        Promise::from_future(async move {
+            let removed = tokio::task::Builder::new()
+                .name("remove_in_progress_item")
+                .spawn_blocking(move || storage.remove_in_progress_item(&id_vec, &lease_copy))?
+                .await
+                .map_err(Into::<Error>::into)??;
+            results.get().init_resp().set_removed(removed);
+            Ok(())
+        })
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
@@ -232,8 +246,20 @@ impl crate::protocol::queue::Server for Server {
             };
 
             loop {
-                let (lease, items) = storage
-                    .get_next_available_entries_with_lease(num_items, lease_validity_secs)?;
+                let (lease, items) = tokio::task::Builder::new()
+                    .name("get_next_available_entries_with_lease")
+                    .spawn_blocking({
+                        let storage = Arc::clone(&storage);
+                        move || {
+                            storage.get_next_available_entries_with_lease(
+                                num_items,
+                                lease_validity_secs,
+                            )
+                        }
+                    })
+                    .map_err(|e| capnp::Error::failed(format!("spawn_blocking failed: {}", e)))?
+                    .await
+                    .map_err(Into::<Error>::into)??;
                 if !items.is_empty() {
                     write_poll_response(&lease, items, &mut results)?;
                     return Ok(());

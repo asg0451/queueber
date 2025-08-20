@@ -1,5 +1,8 @@
 use capnp::message::{self, TypedReader};
-use capnp::serialize_packed;
+#[cfg(feature = "unpacked_capnp")]
+use capnp::serialize as serialize_mode;
+#[cfg(not(feature = "unpacked_capnp"))]
+use capnp::serialize_packed as serialize_mode;
 use rocksdb::{Options, SliceTransform, TransactionDB, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
@@ -34,6 +37,23 @@ impl Storage {
             Some(|_key: &[u8]| true),
         );
         opts.set_prefix_extractor(ns_prefix);
+        // RocksDB tuning for better latency and concurrency
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(2);
+        opts.increase_parallelism(parallelism);
+        opts.set_max_background_jobs((2 * parallelism).max(2));
+
+        // Block-based table with Bloom filter for prefix workloads
+        let mut table_opts = rocksdb::BlockBasedOptions::default();
+        table_opts.set_bloom_filter(10.0, false);
+        table_opts.set_format_version(5);
+        opts.set_block_based_table_factory(&table_opts);
+
+        // Smooth I/O
+        opts.set_bytes_per_sync(1 << 20);
+        opts.set_wal_bytes_per_sync(1 << 20);
+
         opts.create_if_missing(true);
         let txn_opts = rocksdb::TransactionDBOptions::default();
         let db = TransactionDB::open(&opts, &txn_opts, path)?;
@@ -87,7 +107,7 @@ impl Storage {
         stored_item.set_id(id);
         stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
         let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
-        serialize_packed::write_message(&mut stored_contents, &simsg)?;
+        serialize_mode::write_message(&mut stored_contents, &simsg)?;
 
         let mut batch = WriteBatchWithTransaction::<true>::default();
         batch.put(main_key.as_ref(), &stored_contents);
@@ -232,7 +252,7 @@ impl Storage {
                 }
             };
 
-            let stored_item_message = serialize_packed::read_message(
+            let stored_item_message = serialize_mode::read_message(
                 BufReader::new(&main_value[..]), // TODO: avoid allocation
                 message::ReaderOptions::new(),
             )?;
@@ -280,7 +300,7 @@ impl Storage {
             lease_entry_keys.set(i as u32, item_reader.get_id()?);
         }
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
-        serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
+        serialize_mode::write_message(&mut lease_entry_bs, &lease_entry)?;
 
         // Write the lease entry
         let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
@@ -313,7 +333,7 @@ impl Storage {
         };
 
         // Parse lease entry and verify it contains the id
-        let lease_msg = serialize_packed::read_message(
+        let lease_msg = serialize_mode::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -354,7 +374,7 @@ impl Storage {
                 out_keys.set(i as u32, k);
             }
             let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
-            serialize_packed::write_message(&mut buf, &msg)?;
+            serialize_mode::write_message(&mut buf, &msg)?;
             batch.put(lease_key.as_ref(), &buf);
         }
 
@@ -405,7 +425,7 @@ impl Storage {
             let lease_value = lease_value_opt.unwrap();
 
             // Parse lease entry keys
-            let lease_msg = serialize_packed::read_message(
+            let lease_msg = serialize_mode::read_message(
                 BufReader::new(&lease_value[..]),
                 message::ReaderOptions::new(),
             )?;
@@ -421,7 +441,7 @@ impl Storage {
                 let in_progress_key = InProgressKey::from_id(id);
                 if let Some(value) = self.db.get(in_progress_key.as_ref())? {
                     // Parse stored item to get id and contents
-                    let msg = serialize_packed::read_message(
+                    let msg = serialize_mode::read_message(
                         BufReader::new(&value[..]),
                         message::ReaderOptions::new(),
                     )?;
@@ -440,7 +460,7 @@ impl Storage {
                     out_item.set_id(stored_item.get_id()?);
                     out_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
                     let mut out_buf = Vec::with_capacity(out_msg.size_in_words() * 8);
-                    serialize_packed::write_message(&mut out_buf, &out_msg)?;
+                    serialize_mode::write_message(&mut out_buf, &out_msg)?;
 
                     let avail_key = AvailableKey::from_id(id);
                     batch.put(avail_key.as_ref(), &out_buf);
@@ -500,7 +520,7 @@ mod tests {
             .db
             .get(lease_key.as_ref())?
             .ok_or("lease not found")?;
-        let lease_entry = serialize_packed::read_message(
+        let lease_entry = serialize_mode::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -553,7 +573,7 @@ mod tests {
                 .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
-            let msg = serialize_packed::read_message(
+            let msg = serialize_mode::read_message(
                 BufReader::new(&value[..]),
                 message::ReaderOptions::new(),
             )?;
@@ -574,7 +594,7 @@ mod tests {
             .db
             .get(lease_key.as_ref())?
             .ok_or("lease not found")?;
-        let lease_entry = serialize_packed::read_message(
+        let lease_entry = serialize_mode::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -622,7 +642,7 @@ mod tests {
         // lease entry should contain only id2
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
-        let lease_entry = serialize_packed::read_message(
+        let lease_entry = serialize_mode::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -674,7 +694,7 @@ mod tests {
 
         let db_path = "/tmp/queueber_test_db_remove_wrong_lease";
         let storage = Storage::new(Path::new(db_path)).unwrap();
-        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+        scopeguard::defer!({ std::fs::remove_dir_all(db_path).ok(); });
 
         // add one item and poll
         let mut msg = Builder::new_default();
@@ -696,7 +716,7 @@ mod tests {
         // original lease entry still exists and contains the id
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
-        let lease_entry = serialize_packed::read_message(
+        let lease_entry = serialize_mode::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -730,7 +750,7 @@ mod tests {
 
         let db_path = "/tmp/queueber_test_db_future_visibility";
         let storage = Storage::new(Path::new(db_path)).unwrap();
-        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+        scopeguard::defer!({ std::fs::remove_dir_all(db_path).ok(); });
 
         // add one item with future visibility (e.g., 60 seconds)
         let mut msg = Builder::new_default();
@@ -754,7 +774,7 @@ mod tests {
             .db
             .get(avail_key.as_ref())?
             .ok_or("missing available value")?;
-        let msg = serialize_packed::read_message(
+        let msg = serialize_mode::read_message(
             std::io::BufReader::new(&value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -929,3 +949,5 @@ mod tests {
         Ok(())
     }
 }
+
+

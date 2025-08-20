@@ -23,3 +23,16 @@
 - [X] (minor) integrate tokio console into queueber
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
 - [ ] (perf) improve performance and cpu utilization. see docs/perf-notes.md
+  - [X] (perf) add `--workers` CLI flag and name RPC worker threads
+  - [X] (perf) log top-level Tokio runtime metrics at startup (requires `--cfg tokio_unstable`)
+  - [X] (perf) offload blocking RocksDB work from RPC thread:
+    - [X] `add()` already uses `spawn_blocking`
+    - [X] `poll()` wraps `get_next_available_entries_with_lease` in `spawn_blocking`
+    - [X] `remove()` wraps `remove_in_progress_item` in `spawn_blocking`
+  - [X] (perf) improve wakeups: switch `notify_one()` to `notify_waiters()` for visibility/add events
+  - [X] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
+  - [ ] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
+  - [X] (perf) RocksDB tuning: increase parallelism/background jobs and add bloom filters
+  - [X] (perf) feature flag to toggle packed vs. unpacked Cap’n Proto serialization (`unpacked_capnp`)
+  - [ ] (perf) per-worker accept via `SO_REUSEPORT`
+  - [ ] (perf) buffer/message reuse to reduce allocations on hot paths

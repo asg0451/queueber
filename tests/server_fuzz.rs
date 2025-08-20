@@ -60,7 +60,7 @@ proptest! {
                 for op in seq {
                     match op {
                         Op::Add { id, contents, vis_secs } => {
-                            let _ = st.add_available_item_from_parts(&id, &contents, vis_secs)?;
+                            st.add_available_item_from_parts(&id, &contents, vis_secs)?;
                         }
                         Op::Poll { n, lease_secs } => {
                             let (_lease, _items) = st.get_next_available_entries_with_lease(n, lease_secs)?;
