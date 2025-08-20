@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
                     {
                         Ok(Ok(n)) => {
                             if n > 0 {
-                                notify_for_expiry.notify_waiters();
+                                notify_for_expiry.notify_one();
                             }
                         }
                         Ok(Err(_e)) => {
@@ -121,12 +121,12 @@ async fn main() -> Result<()> {
                                 .map(|d| d.as_secs())
                                 .unwrap_or(ts_secs);
                             if ts_secs <= now_secs {
-                                notify_for_vis.notify_waiters();
+                                notify_for_vis.notify_one();
                                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             } else {
                                 let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
                                 tokio::time::sleep(sleep_dur).await;
-                                notify_for_vis.notify_waiters();
+                                notify_for_vis.notify_one();
                             }
                         }
                         Ok(Ok(None)) => {

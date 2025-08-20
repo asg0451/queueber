@@ -1,6 +1,9 @@
 use capnp::capability::Promise;
 use capnp::message::{Builder, HeapAllocator, TypedReader};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Duration;
@@ -50,7 +53,7 @@ impl Server {
                         {
                             Ok(Ok(n)) => {
                                 if n > 0 {
-                                    bg_notify.notify_waiters();
+                                    bg_notify.notify_one();
                                 }
                             }
                             Ok(Err(_e)) => {
@@ -93,13 +96,14 @@ impl Server {
                                     .map(|d| d.as_secs())
                                     .unwrap_or(ts_secs);
                                 if ts_secs <= now_secs {
-                                    vis_notify.notify_waiters();
+                                    vis_notify.notify_one();
                                     // Avoid busy loop; small sleep before checking again.
                                     tokio::time::sleep(Duration::from_millis(50)).await;
                                 } else {
-                                    let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
+                                    let sleep_dur =
+                                        std::time::Duration::from_secs(ts_secs - now_secs);
                                     tokio::time::sleep(sleep_dur).await;
-                                    vis_notify.notify_waiters();
+                                    vis_notify.notify_one();
                                 }
                             }
                             Ok(Ok(None)) => {
@@ -175,7 +179,7 @@ impl crate::protocol::queue::Server for Server {
                 .map_err(Into::<Error>::into)??;
 
             if any_immediately_visible {
-                notify.notify_waiters();
+                notify.notify_one();
             }
 
             // Build the response on the RPC thread.
@@ -195,10 +199,22 @@ impl crate::protocol::queue::Server for Server {
         params: RemoveParams,
         mut results: RemoveResults,
     ) -> Promise<(), capnp::Error> {
-        let req = match params.get() { Ok(p) => p, Err(e) => return Promise::err(e) };
-        let req = match req.get_req() { Ok(r) => r, Err(e) => return Promise::err(e) };
-        let id = match req.get_id() { Ok(i) => i, Err(e) => return Promise::err(e) };
-        let lease_bytes = match req.get_lease() { Ok(l) => l, Err(e) => return Promise::err(e) };
+        let req = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let req = match req.get_req() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let id = match req.get_id() {
+            Ok(i) => i,
+            Err(e) => return Promise::err(e),
+        };
+        let lease_bytes = match req.get_lease() {
+            Ok(l) => l,
+            Err(e) => return Promise::err(e),
+        };
 
         if lease_bytes.len() != 16 {
             return Promise::err(capnp::Error::failed("invalid lease length".to_string()));

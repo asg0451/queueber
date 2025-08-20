@@ -61,7 +61,7 @@ Recommended fixes (incremental):
    - Consider a dedicated `rayon`/custom thread pool for storage ops if you want stronger isolation from Tokio's blocking pool.
 
 2) Improve wakeups:
-   - Switch `notify.notify_one()` to `notify.notify_waiters()` when items become visible or are added. This wakes all waiters; you may add simple backoff if stampedes become an issue.
+   - Replace the `Notify` primitive with a versioned `watch<u64>` epoch channel. Maintain an `AtomicU64` epoch; on add/visibility/expiry, increment and `tx.send(epoch)`. In the poll loop, check DB first; if empty, capture `*rx.borrow()` and wait on `rx.changed()` (or `select!` with timeout). This avoids lost notifications, naturally coalesces multiple events, and scales to many waiters without stampedes.
 
 3) De-duplicate background tasks:
    - Spawn a single `lease_expiry` and a single `visibility_wakeup` task in the top-level runtime, not per worker. They can still use `spawn_blocking` for DB access and notify the shared `Notify`.

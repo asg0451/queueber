@@ -29,7 +29,7 @@
     - [X] `add()` already uses `spawn_blocking`
     - [X] `poll()` wraps `get_next_available_entries_with_lease` in `spawn_blocking`
     - [X] `remove()` wraps `remove_in_progress_item` in `spawn_blocking`
-  - [X] (perf) improve wakeups: switch `notify_one()` to `notify_waiters()` for visibility/add events
+  - [ ] (perf) improve wakeups: replace `Notify` with a versioned `watch<u64>` epoch channel to avoid lost wakeups and stampedes
   - [X] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
   - [ ] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
   - [X] (perf) RocksDB tuning: increase parallelism/background jobs and add bloom filters

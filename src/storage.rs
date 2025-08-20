@@ -694,7 +694,9 @@ mod tests {
 
         let db_path = "/tmp/queueber_test_db_remove_wrong_lease";
         let storage = Storage::new(Path::new(db_path)).unwrap();
-        scopeguard::defer!({ std::fs::remove_dir_all(db_path).ok(); });
+        scopeguard::defer!({
+            std::fs::remove_dir_all(db_path).ok();
+        });
 
         // add one item and poll
         let mut msg = Builder::new_default();
@@ -750,7 +752,9 @@ mod tests {
 
         let db_path = "/tmp/queueber_test_db_future_visibility";
         let storage = Storage::new(Path::new(db_path)).unwrap();
-        scopeguard::defer!({ std::fs::remove_dir_all(db_path).ok(); });
+        scopeguard::defer!({
+            std::fs::remove_dir_all(db_path).ok();
+        });
 
         // add one item with future visibility (e.g., 60 seconds)
         let mut msg = Builder::new_default();
@@ -949,5 +953,3 @@ mod tests {
         Ok(())
     }
 }
-
-

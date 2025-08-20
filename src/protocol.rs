@@ -2,14 +2,14 @@ capnp::generated_code!(pub mod queueber_capnp);
 pub use queueber_capnp::*;
 
 use crate::errors::Result;
-use capnp::{
-    message::{ReaderOptions, TypedReader},
-    serialize::OwnedSegments,
-};
 #[cfg(feature = "unpacked_capnp")]
 use capnp::serialize as serialize_mode;
 #[cfg(not(feature = "unpacked_capnp"))]
 use capnp::serialize_packed as serialize_mode;
+use capnp::{
+    message::{ReaderOptions, TypedReader},
+    serialize::OwnedSegments,
+};
 
 pub fn demo() -> Result<()> {
     // create & write
