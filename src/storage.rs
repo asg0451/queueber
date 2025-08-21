@@ -1,8 +1,5 @@
 use capnp::message::{self, TypedReader};
-#[cfg(feature = "unpacked_capnp")]
 use capnp::serialize as serialize_mode;
-#[cfg(not(feature = "unpacked_capnp"))]
-use capnp::serialize_packed as serialize_mode;
 use rocksdb::{Options, SliceTransform, TransactionDB, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;

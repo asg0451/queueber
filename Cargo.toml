@@ -23,9 +23,7 @@ tracing-subscriber = { version = "0.3.19", features = [
 console-subscriber = "0.4"
 uuid = { version = "1.18.0", features = ["std", "v4", "v7", "zerocopy"] }
 
-[features]
-default = []
-unpacked_capnp = []
+ 
 
 [build-dependencies]
 capnpc = "0.21.2"
