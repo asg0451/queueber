@@ -6,13 +6,13 @@
 - [X] (minor) ci
 - [ ] (minor) rocksdb settings tuning
 - [X] (major) server concurrency (either normally or via partitioning)
-- [ ] (major) server parallelism
+- [X] (major) server parallelism
 - [ ] (major) server/storage sharding
 - [X] (major) move storage to an io thread pool
 - [X] (feat) implement lease expiry via a background thread
 - [X] (feat) implement poll in server
 - [X] (minor) add polling timeout and num_items options
-- [ ] (major) fix race condition: concurrent polls can hand out the same messages
+- [X] (major) fix race condition: concurrent polls can hand out the same messages
 - [X] (feat) implement remove
 - [ ] (feat) implement extend
 - [X] (bugfix) e2e benchmark hangs / improve benchmarks
@@ -23,3 +23,4 @@
 - [X] (feat) add prometheus metrics for SLIs and RocksDB internals
 - [X] (minor) integrate tokio console into queueber
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
+- [ ] (perf) improve performance and cpu utilization. see docs/perf-notes.md
