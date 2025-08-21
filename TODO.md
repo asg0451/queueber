@@ -33,6 +33,6 @@
   - [X] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
   - [ ] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
   - [X] (perf) RocksDB tuning: increase parallelism/background jobs and add bloom filters
-  - [X] (perf) feature flag to toggle packed vs. unpacked Cap’n Proto serialization (`unpacked_capnp`)
+  - [X] (perf) switch to unpacked Cap’n Proto serialization (`capnp::serialize`) everywhere
   - [ ] (perf) per-worker accept via `SO_REUSEPORT`
   - [ ] (perf) buffer/message reuse to reduce allocations on hot paths

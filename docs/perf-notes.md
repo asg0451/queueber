@@ -77,7 +77,7 @@ Recommended fixes (incremental):
 ### Low-overhead wins
 
 - Serialization:
-  - `serialize_packed` trades bandwidth for CPU. Add a feature flag to switch hot paths to `capnp::serialize` (unpacked) for lower CPU during benchmarks.
+  - Use `capnp::serialize` (unpacked) everywhere to reduce CPU. Revisit packed only if bandwidth is a bottleneck.
   - Reuse buffers for message building to reduce alloc pressure on hot paths.
 
 - DB write batching:
@@ -106,7 +106,7 @@ If you can make per-connection work `Send` (or isolate the non-`Send` parts), yo
 ### What to implement first
 
 1) Name worker threads and add a `--workers` CLI flag; log both `worker_count` and top-level runtime metrics at startup so it’s unambiguous how many threads are active.
-2) Add a feature-flag to toggle packed vs. unpacked Cap’n Proto serialization for storage.
+2) Use unpacked Cap’n Proto serialization (`capnp::serialize`) across the board. No feature flag.
 3) Batch claims and include lease writes in the same RocksDB transaction.
 4) Add a tuned `BlockBasedOptions` with bloom filters and increase `max_background_jobs`.
 5) Consider switching to `SO_REUSEPORT` per-worker accept.
