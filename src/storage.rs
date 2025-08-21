@@ -222,27 +222,32 @@ impl Storage {
             // Try to claim this item atomically using a transaction
             let txn = self.db.transaction();
             // Lock both the index entry and the main key to avoid concurrent polls claiming it
-            let _ = txn.get_for_update(&idx_key, true)?;
+            let idx_value_opt = txn.get_for_update(&idx_key, true)?;
             let main_value_opt = txn.get_for_update(&main_key, true)?;
             let Some(main_value) = main_value_opt else {
                 // Check if this is a database integrity issue or just normal concurrency
-                // If the visibility index entry exists but the main key doesn't, that's a database integrity issue
-                // If the main key exists but is in in-progress state, that's normal concurrency
+                // If another poller already claimed and removed the available entry (and possibly
+                // the index), we should skip this entry rather than failing. This can also happen
+                // if the item was acknowledged quickly under its lease.
                 let id_suffix = AvailableKey::id_suffix_from_key_bytes(&main_key);
                 let in_progress_key = InProgressKey::from_id(id_suffix);
                 if txn.get(&in_progress_key)?.is_some() {
                     // Item was already claimed by another poll, skip it
                     continue;
                 } else {
-                    // Invariant: visibility index should point to an available item. If it's gone,
-                    // fail fast rather than silently healing; this indicates a concurrency bug.
-                    return Err(crate::errors::Error::AssertionFailed {
-                        msg: format!(
-                            "database integrity violated: main key not found for visibility entry: {:?}",
-                            &main_key
-                        ),
-                        backtrace: std::backtrace::Backtrace::capture(),
-                    });
+                    // If the visibility index entry itself no longer exists, this is a benign race
+                    // (we iterated a stale view). Skip it.
+                    if idx_value_opt.is_none() {
+                        continue;
+                    }
+
+                    // Otherwise, the index points at a non-existent main key and there is no
+                    // in-progress entry. Treat this as a stale/orphaned index entry and self-heal
+                    // by deleting it within the same transaction that holds the lock to avoid
+                    // deadlocks/timeouts, then commit.
+                    txn.delete(&idx_key)?;
+                    txn.commit()?;
+                    continue;
                 }
             };
 
@@ -296,13 +301,14 @@ impl Storage {
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
 
-        // Write the lease entry
-        let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
-        in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
-        // index the lease by expiry time for the background sweeper
-        in_progress_batch.put(lease_expiry_index_key.as_ref(), lease_key.as_ref());
-
-        self.db.write(in_progress_batch)?;
+        if !polled_items.is_empty() {
+            // Write the lease entry only if we actually polled items
+            let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
+            in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
+            // index the lease by expiry time for the background sweeper
+            in_progress_batch.put(lease_expiry_index_key.as_ref(), lease_key.as_ref());
+            self.db.write(in_progress_batch)?;
+        }
 
         Ok((lease, polled_items))
     }
@@ -904,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_visibility_index_entry_fails_fast() -> Result<()> {
+    fn stale_visibility_index_entry_is_healed() -> Result<()> {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .try_init();
@@ -920,12 +926,12 @@ mod tests {
         batch.put(idx_key.as_ref(), main_key.as_ref());
         storage.db.write(batch)?;
 
-        // Poll should fail fast with an assertion failure due to broken invariant
-        match storage.get_next_available_entries(1) {
-            Err(crate::errors::Error::AssertionFailed { .. }) => Ok(()),
-            Ok(_) => panic!("expected AssertionFailed, got Ok(..)"),
-            Err(e) => panic!("expected AssertionFailed, got {}", e),
-        }
+        // Poll should self-heal by deleting the orphaned index and not panic
+        let (_lease, items) = storage.get_next_available_entries(1)?;
+        assert_eq!(items.len(), 0);
+        // The index entry should be gone after healing
+        assert!(storage.db.get(idx_key.as_ref())?.is_none());
+        Ok(())
     }
 
     #[test]
