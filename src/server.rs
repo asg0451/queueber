@@ -86,34 +86,36 @@ impl crate::protocol::queue::Server for Server {
         let metrics = self.metrics.clone();
 
         Promise::from_future(async move {
-            metrics.time_request("add", || async {
-                // Offload RocksDB work to the blocking thread pool.
-                tokio::task::Builder::new()
-                    .name("add_available_items_from_parts")
-                    .spawn_blocking(move || {
-                        let iter = ids
-                            .iter()
-                            .map(|id| id.as_slice())
-                            .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
-                        storage.add_available_items_from_parts(iter)
-                    })?
-                    .await
-                    .map_err(Into::<Error>::into)??;
+            metrics
+                .time_request("add", || async {
+                    // Offload RocksDB work to the blocking thread pool.
+                    tokio::task::Builder::new()
+                        .name("add_available_items_from_parts")
+                        .spawn_blocking(move || {
+                            let iter = ids
+                                .iter()
+                                .map(|id| id.as_slice())
+                                .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+                            storage.add_available_items_from_parts(iter)
+                        })?
+                        .await
+                        .map_err(Into::<Error>::into)??;
 
-                if any_immediately_visible {
-                    notify.notify_one();
-                }
+                    if any_immediately_visible {
+                        notify.notify_one();
+                    }
 
-                // Build the response on the RPC thread.
-                let mut ids_builder = results
-                    .get()
-                    .init_resp()
-                    .init_ids(ids_for_resp.len() as u32);
-                for (i, id) in ids_for_resp.iter().enumerate() {
-                    ids_builder.set(i as u32, id);
-                }
-                Ok(())
-            }).await
+                    // Build the response on the RPC thread.
+                    let mut ids_builder = results
+                        .get()
+                        .init_resp()
+                        .init_ids(ids_for_resp.len() as u32);
+                    for (i, id) in ids_for_resp.iter().enumerate() {
+                        ids_builder.set(i as u32, id);
+                    }
+                    Ok(())
+                })
+                .await
         })
     }
 
@@ -136,11 +138,13 @@ impl crate::protocol::queue::Server for Server {
         let metrics = self.metrics.clone();
 
         Promise::from_future(async move {
-            let result = metrics.time_request("remove", || async {
-                storage
-                    .remove_in_progress_item(&id, &lease)
-                    .map_err(Into::into)
-            }).await;
+            let result = metrics
+                .time_request("remove", || async {
+                    storage
+                        .remove_in_progress_item(&id, &lease)
+                        .map_err(Into::into)
+                })
+                .await;
 
             match result {
                 Ok(removed) => {
@@ -158,52 +162,59 @@ impl crate::protocol::queue::Server for Server {
         let metrics = self.metrics.clone();
 
         Promise::from_future(async move {
-            metrics.time_request("poll", || async {
-                let req = params.get()?.get_req()?;
-                let lease_validity_secs = req.get_lease_validity_secs();
-                if lease_validity_secs == 0 {
-                    return Err(capnp::Error::failed(
-                        "invariant: leaseValiditySecs must be > 0".to_string(),
-                    ));
-                }
-                let num_items = match req.get_num_items() {
-                    0 => 1,
-                    n => n as usize,
-                };
-                let timeout_secs = req.get_timeout_secs();
-
-                let deadline = if timeout_secs > 0 {
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
-                } else {
-                    None
-                };
-
-                loop {
-                    let (lease, items) = storage
-                        .get_next_available_entries_with_lease(num_items, lease_validity_secs)?;
-                    if !items.is_empty() {
-                        write_poll_response(&lease, items, &mut results)?;
-                        return Ok(());
+            metrics
+                .time_request("poll", || async {
+                    let req = params.get()?.get_req()?;
+                    let lease_validity_secs = req.get_lease_validity_secs();
+                    if lease_validity_secs == 0 {
+                        return Err(capnp::Error::failed(
+                            "invariant: leaseValiditySecs must be > 0".to_string(),
+                        ));
                     }
+                    let num_items = match req.get_num_items() {
+                        0 => 1,
+                        n => n as usize,
+                    };
+                    let timeout_secs = req.get_timeout_secs();
 
-                    match deadline {
-                        Some(d) => {
-                            let now = std::time::Instant::now();
-                            if now >= d {
-                                return Ok(());
+                    let deadline = if timeout_secs > 0 {
+                        Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(timeout_secs),
+                        )
+                    } else {
+                        None
+                    };
+
+                    loop {
+                        let (lease, items) = storage.get_next_available_entries_with_lease(
+                            num_items,
+                            lease_validity_secs,
+                        )?;
+                        if !items.is_empty() {
+                            write_poll_response(&lease, items, &mut results)?;
+                            return Ok(());
+                        }
+
+                        match deadline {
+                            Some(d) => {
+                                let now = std::time::Instant::now();
+                                if now >= d {
+                                    return Ok(());
+                                }
+                                let remaining = d - now;
+                                tokio::select! {
+                                    _ = notify.notified() => {},
+                                    _ = tokio::time::sleep(remaining) => { return Ok(()); },
+                                }
                             }
-                            let remaining = d - now;
-                            tokio::select! {
-                                _ = notify.notified() => {},
-                                _ = tokio::time::sleep(remaining) => { return Ok(()); },
+                            None => {
+                                notify.notified().await;
                             }
                         }
-                        None => {
-                            notify.notified().await;
-                        }
                     }
-                }
-            }).await
+                })
+                .await
         })
     }
 }

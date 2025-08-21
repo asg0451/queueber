@@ -1,8 +1,8 @@
+use crate::Storage;
+use crate::metrics_wrapper_atomic::AtomicMetricsWrapper;
 use std::sync::Arc;
 use tokio::sync::{Notify, watch};
 use tokio::time::Duration;
-use crate::Storage;
-use crate::metrics_wrapper_atomic::AtomicMetricsWrapper;
 
 pub struct BackgroundTasks {
     storage: Arc<Storage>,
@@ -144,12 +144,12 @@ impl BackgroundTasks {
             loop {
                 // Update RocksDB metrics
                 storage.update_rocksdb_metrics();
-                
+
                 // Update queue metrics
                 storage.update_queue_metrics();
-                
+
                 metrics.record_background_task("metrics_update", "success", 0.0);
-                
+
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });

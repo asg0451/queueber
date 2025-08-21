@@ -5,7 +5,8 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{
-    metrics_atomic::create_atomic_metrics, metrics_server::MetricsServer, server::Server, storage::Storage, metrics_wrapper_atomic::AtomicMetricsWrapper,
+    metrics_atomic::create_atomic_metrics, metrics_server::MetricsServer,
+    metrics_wrapper_atomic::AtomicMetricsWrapper, server::Server, storage::Storage,
 };
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
@@ -69,14 +70,21 @@ async fn main() -> Result<()> {
 
     let storage = Arc::new(Storage::new_with_metrics(
         &args.data_dir,
-        AtomicMetricsWrapper::new(if args.enable_metrics { Some(atomic_metrics.clone()) } else { None }),
+        AtomicMetricsWrapper::new(if args.enable_metrics {
+            Some(atomic_metrics.clone())
+        } else {
+            None
+        }),
     )?);
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Start metrics server (only if enabled)
     if args.enable_metrics {
-        let metrics_server = MetricsServer::new(prometheus_client::registry::Registry::default(), atomic_metrics.clone());
+        let metrics_server = MetricsServer::new(
+            prometheus_client::registry::Registry::default(),
+            atomic_metrics.clone(),
+        );
         let metrics_addr = args.metrics.clone();
         tokio::spawn(async move {
             if let Err(e) = metrics_server.start(&metrics_addr).await {
@@ -107,12 +115,16 @@ async fn main() -> Result<()> {
                 .build()
                 .expect("build worker runtime");
             rt.block_on(async move {
-                        let server = Server::new_with_metrics(
-            storage_cloned,
-            notify_cloned,
-            shutdown_tx_cloned,
-            AtomicMetricsWrapper::new(if args.enable_metrics { Some(atomic_metrics_cloned) } else { None }),
-        );
+                let server = Server::new_with_metrics(
+                    storage_cloned,
+                    notify_cloned,
+                    shutdown_tx_cloned,
+                    AtomicMetricsWrapper::new(if args.enable_metrics {
+                        Some(atomic_metrics_cloned)
+                    } else {
+                        None
+                    }),
+                );
                 let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
                 // TODO: give this one a name
                 let local = tokio::task::LocalSet::new();

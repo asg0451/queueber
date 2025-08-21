@@ -18,7 +18,8 @@ impl MetricsWrapper {
     /// Record a request with timing
     pub fn record_request(&self, operation: &str, status: &str, duration: f64) {
         if let Some(metrics) = &self.metrics
-            && let Ok(guard) = metrics.try_write() {
+            && let Ok(guard) = metrics.try_write()
+        {
             guard.record_request(operation, status, duration);
         }
     }
@@ -26,7 +27,8 @@ impl MetricsWrapper {
     /// Record a RocksDB operation with timing
     pub fn record_rocksdb_operation(&self, operation: &str, status: &str, duration: f64) {
         if let Some(metrics) = &self.metrics
-            && let Ok(guard) = metrics.try_write() {
+            && let Ok(guard) = metrics.try_write()
+        {
             guard.record_rocksdb_operation(operation, status, duration);
         }
     }
@@ -34,7 +36,8 @@ impl MetricsWrapper {
     /// Record a background task with timing
     pub fn record_background_task(&self, task: &str, status: &str, duration: f64) {
         if let Some(metrics) = &self.metrics
-            && let Ok(guard) = metrics.try_write() {
+            && let Ok(guard) = metrics.try_write()
+        {
             guard.record_background_task(task, status, duration);
         }
     }
@@ -42,7 +45,8 @@ impl MetricsWrapper {
     /// Update queue metrics
     pub fn update_queue_metrics(&self, size: i64, depth: i64) {
         if let Some(metrics) = &self.metrics
-            && let Ok(guard) = metrics.try_write() {
+            && let Ok(guard) = metrics.try_write()
+        {
             guard.update_queue_metrics(size, depth);
         }
     }
@@ -50,7 +54,8 @@ impl MetricsWrapper {
     /// Update RocksDB metrics
     pub fn update_rocksdb_metrics(&self, memory_usage: i64, disk_usage: i64) {
         if let Some(metrics) = &self.metrics
-            && let Ok(guard) = metrics.try_write() {
+            && let Ok(guard) = metrics.try_write()
+        {
             guard.update_rocksdb_metrics(memory_usage, disk_usage);
         }
     }

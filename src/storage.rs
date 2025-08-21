@@ -73,8 +73,6 @@ impl Storage {
         Ok(())
     }
 
-
-
     // Convenience helpers for feeding from owned parts when capnp Readers are not Send.
     pub fn add_available_item_from_parts(
         &self,
@@ -88,7 +86,8 @@ impl Storage {
             let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
-            let visibility_index_key = VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
+            let visibility_index_key =
+                VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
             let mut simsg = message::Builder::new_default();
             let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
@@ -470,7 +469,7 @@ impl Storage {
 
             self.db.write(batch)?;
             processed += 1;
-            
+
             // Record lease expiration for metrics
             self.metrics.record_lease_expiration();
         }
@@ -480,56 +479,63 @@ impl Storage {
 
     /// Collect and update RocksDB metrics
     pub fn update_rocksdb_metrics(&self) {
-        let _ = self.metrics.time_rocksdb_operation("metrics_collection", || {
-            // Get RocksDB memory usage (simplified - using approximate size)
-            let memory_usage = 0i64; // TODO: Implement proper memory usage collection
+        let _ = self
+            .metrics
+            .time_rocksdb_operation("metrics_collection", || {
+                // Get RocksDB memory usage (simplified - using approximate size)
+                let memory_usage = 0i64; // TODO: Implement proper memory usage collection
 
-            // Get RocksDB disk usage by estimating from database size
-            let mut disk_usage = 0i64;
-            if let Ok(_metadata) = std::fs::metadata(self.db.path())
-                && let Ok(entries) = std::fs::read_dir(self.db.path()) {
-                for entry in entries.flatten() {
-                    if let Ok(metadata) = entry.metadata() {
-                        disk_usage += metadata.len() as i64;
+                // Get RocksDB disk usage by estimating from database size
+                let mut disk_usage = 0i64;
+                if let Ok(_metadata) = std::fs::metadata(self.db.path())
+                    && let Ok(entries) = std::fs::read_dir(self.db.path())
+                {
+                    for entry in entries.flatten() {
+                        if let Ok(metadata) = entry.metadata() {
+                            disk_usage += metadata.len() as i64;
+                        }
                     }
                 }
-            }
 
-            // Log metrics for debugging
-            tracing::debug!(
-                "RocksDB metrics - Memory: {} bytes, Disk: {} bytes",
-                memory_usage, disk_usage
-            );
+                // Log metrics for debugging
+                tracing::debug!(
+                    "RocksDB metrics - Memory: {} bytes, Disk: {} bytes",
+                    memory_usage,
+                    disk_usage
+                );
 
-            self.metrics.update_rocksdb_metrics(memory_usage, disk_usage);
-            Ok::<(), rocksdb::Error>(())
-        });
+                self.metrics
+                    .update_rocksdb_metrics(memory_usage, disk_usage);
+                Ok::<(), rocksdb::Error>(())
+            });
     }
 
     /// Update queue size and depth metrics
     pub fn update_queue_metrics(&self) {
-        let _ = self.metrics.time_rocksdb_operation("queue_metrics_collection", || {
-            // Count available items (queue size)
-            let mut size = 0;
-            let iter = self.db.prefix_iterator(b"available/");
-            for _ in iter {
-                size += 1;
-            }
+        let _ = self
+            .metrics
+            .time_rocksdb_operation("queue_metrics_collection", || {
+                // Count available items (queue size)
+                let mut size = 0;
+                let iter = self.db.prefix_iterator(b"available/");
+                for _ in iter {
+                    size += 1;
+                }
 
-            // Count all items including leased (queue depth)
-            let mut depth = 0;
-            let available_iter = self.db.prefix_iterator(b"available/");
-            for _ in available_iter {
-                depth += 1;
-            }
-            let in_progress_iter = self.db.prefix_iterator(b"in_progress/");
-            for _ in in_progress_iter {
-                depth += 1;
-            }
+                // Count all items including leased (queue depth)
+                let mut depth = 0;
+                let available_iter = self.db.prefix_iterator(b"available/");
+                for _ in available_iter {
+                    depth += 1;
+                }
+                let in_progress_iter = self.db.prefix_iterator(b"in_progress/");
+                for _ in in_progress_iter {
+                    depth += 1;
+                }
 
-            self.metrics.update_queue_metrics(size, depth);
-            Ok::<(), rocksdb::Error>(())
-        });
+                self.metrics.update_queue_metrics(size, depth);
+                Ok::<(), rocksdb::Error>(())
+            });
     }
 }
 
