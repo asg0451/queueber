@@ -54,6 +54,13 @@ async fn main() -> Result<()> {
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Spawn deduplicated background tasks once
+    queueber::server::spawn_background_tasks(
+        Arc::clone(&storage),
+        Arc::clone(&notify),
+        shutdown_tx.clone(),
+    );
+
     // Build a small pool of RPC workers. Each worker runs a single-threaded runtime with a LocalSet
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get())
