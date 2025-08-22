@@ -172,12 +172,15 @@ impl Storage {
             }
 
             // Fetch the item. Lock it and its index to prevent races.
-            let _idx_value = txn
-                .get_pinned_for_update(&idx_key, true)?
-                .ok_or_else(|| Error::assertion_failed("visibility index entry not found"))?;
-            let main_value = txn
-                .get_pinned_for_update(&main_key, true)?
-                .ok_or_else(|| Error::assertion_failed("main key not found"))?;
+            let _idx_value = txn.get_pinned_for_update(&idx_key, true)?.ok_or_else(|| {
+                Error::assertion_failed(&format!("visibility index entry not found even though we scanned to get here in a txn: {:?}", VisibilityIndexKey::split_ts_and_id(&idx_key)))
+
+                // `RUST_LOG=debug cargo t concurrent_polls_do_not_get_overlapping_messages -- --nocapture`
+                // shows that the id is only 6 bytes. data corruption? TODO: why???
+            })?;
+            let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
+                Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
+            })?;
 
             // Fetch and decode.
             let stored_item_message =
