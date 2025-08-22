@@ -26,6 +26,10 @@ struct Args {
     /// Wipe the data directory before starting
     #[arg(short = 'w', long = "wipe")]
     wipe: bool,
+
+    /// Number of RPC worker threads to spawn (defaults to available_parallelism)
+    #[arg(short = 'W', long = "workers")]
+    workers: Option<usize>,
 }
 
 // NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
@@ -55,13 +59,15 @@ async fn main() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Build a small pool of RPC workers. Each worker runs a single-threaded runtime with a LocalSet
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    tracing::info!("using {} worker threads", worker_count);
+    let worker_count = args.workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+    });
+    tracing::info!(worker_count, "using worker threads");
     let mut senders = Vec::with_capacity(worker_count);
     let mut worker_handles = Vec::with_capacity(worker_count);
-    for _ in 0..worker_count {
+    for i in 0..worker_count {
         let (tx, mut rx) = mpsc::channel::<tokio::net::TcpStream>(1024);
         senders.push(tx);
 
@@ -69,45 +75,52 @@ async fn main() -> Result<()> {
         let notify_cloned = Arc::clone(&notify);
         let shutdown_tx_cloned = shutdown_tx.clone();
 
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build worker runtime");
-            rt.block_on(async move {
-                let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
-                let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
-                // TODO: give this one a name
-                let local = tokio::task::LocalSet::new();
-                local
-                    .run_until(async move {
-                        while let Some(stream) = rx.recv().await {
-                            let client = queue_client.clone();
-                            let _jh = tokio::task::Builder::new()
-                                .name("rpc_server")
-                                .spawn_local(async move {
-                                    let (reader, writer) =
-                                        tokio_util::compat::TokioAsyncReadCompatExt::compat(stream)
+        let thread_name = format!("rpc-worker-{i}");
+        let builder = std::thread::Builder::new().name(thread_name);
+        let handle = builder
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build worker runtime");
+                rt.block_on(async move {
+                    let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
+                    let queue_client: queueber::protocol::queue::Client =
+                        capnp_rpc::new_client(server);
+                    // TODO: give this one a name
+                    let local = tokio::task::LocalSet::new();
+                    local
+                        .run_until(async move {
+                            while let Some(stream) = rx.recv().await {
+                                let client = queue_client.clone();
+                                let _jh = tokio::task::Builder::new()
+                                    .name("rpc_server")
+                                    .spawn_local(async move {
+                                        let (reader, writer) =
+                                            tokio_util::compat::TokioAsyncReadCompatExt::compat(
+                                                stream,
+                                            )
                                             .split();
-                                    let network = twoparty::VatNetwork::new(
-                                        futures::io::BufReader::new(reader),
-                                        futures::io::BufWriter::new(writer),
-                                        rpc_twoparty_capnp::Side::Server,
-                                        Default::default(),
-                                    );
-                                    let rpc_system =
-                                        RpcSystem::new(Box::new(network), Some(client.client));
-                                    let _jh2 = tokio::task::Builder::new()
-                                        .name("rpc_system")
-                                        .spawn_local(rpc_system)
-                                        .unwrap();
-                                })
-                                .unwrap();
-                        }
-                    })
-                    .await;
-            });
-        });
+                                        let network = twoparty::VatNetwork::new(
+                                            futures::io::BufReader::new(reader),
+                                            futures::io::BufWriter::new(writer),
+                                            rpc_twoparty_capnp::Side::Server,
+                                            Default::default(),
+                                        );
+                                        let rpc_system =
+                                            RpcSystem::new(Box::new(network), Some(client.client));
+                                        let _jh2 = tokio::task::Builder::new()
+                                            .name("rpc_system")
+                                            .spawn_local(rpc_system)
+                                            .unwrap();
+                                    })
+                                    .unwrap();
+                            }
+                        })
+                        .await;
+                });
+            })
+            .expect("spawn worker thread");
         worker_handles.push(handle);
     }
 
