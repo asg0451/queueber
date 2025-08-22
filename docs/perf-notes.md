@@ -112,4 +112,3 @@ If you can make per-connection work `Send` (or isolate the non-`Send` parts), yo
 5) Consider switching to `SO_REUSEPORT` per-worker accept.
 
 These yield quick, measurable wins without changing external behavior.
-

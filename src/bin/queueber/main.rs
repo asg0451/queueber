@@ -24,12 +24,8 @@ struct Args {
     data_dir: PathBuf,
 
     /// Wipe the data directory before starting
-    #[arg(short = 'W', long = "wipe")]
+    #[arg(short = 'w', long = "wipe")]
     wipe: bool,
-
-    /// Number of RPC worker threads (defaults to available parallelism)
-    #[arg(short = 'j', long = "workers")]
-    workers: Option<usize>,
 }
 
 // NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
@@ -58,109 +54,14 @@ async fn main() -> Result<()> {
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Background task to expire leases periodically (single instance, top-level runtime)
-    {
-        let st = Arc::clone(&storage);
-        let notify_for_expiry = Arc::clone(&notify);
-        let shutdown_for_expiry = shutdown_tx.clone();
-        tokio::task::Builder::new()
-            .name("lease_expiry")
-            .spawn(async move {
-                loop {
-                    match tokio::task::Builder::new()
-                        .name("expire_due_leases")
-                        .spawn_blocking({
-                            let st = Arc::clone(&st);
-                            move || st.expire_due_leases()
-                        })
-                        .unwrap()
-                        .await
-                    {
-                        Ok(Ok(n)) => {
-                            if n > 0 {
-                                notify_for_expiry.notify_one();
-                            }
-                        }
-                        Ok(Err(_e)) => {
-                            let _ = shutdown_for_expiry.send(true);
-                            break;
-                        }
-                        Err(_join_err) => {
-                            let _ = shutdown_for_expiry.send(true);
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            })
-            .unwrap();
-    }
-
-    // Background task to wake pollers when any invisible message becomes visible (single instance)
-    {
-        let st = Arc::clone(&storage);
-        let notify_for_vis = Arc::clone(&notify);
-        let shutdown_for_vis = shutdown_tx.clone();
-        tokio::task::Builder::new()
-            .name("visibility_wakeup")
-            .spawn(async move {
-                loop {
-                    let next_vis_opt = tokio::task::Builder::new()
-                        .name("peek_next_visibility_ts_secs")
-                        .spawn_blocking({
-                            let st = Arc::clone(&st);
-                            move || st.peek_next_visibility_ts_secs()
-                        })
-                        .unwrap()
-                        .await;
-
-                    match next_vis_opt {
-                        Ok(Ok(Some(ts_secs))) => {
-                            let now_secs = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(ts_secs);
-                            if ts_secs <= now_secs {
-                                notify_for_vis.notify_one();
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            } else {
-                                let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
-                                tokio::time::sleep(sleep_dur).await;
-                                notify_for_vis.notify_one();
-                            }
-                        }
-                        Ok(Ok(None)) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!("peek_next_visibility_ts_secs: {}", e);
-                            let _ = shutdown_for_vis.send(true);
-                            break;
-                        }
-                        Err(join_err) => {
-                            tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
-                            let _ = shutdown_for_vis.send(true);
-                            break;
-                        }
-                    }
-                }
-            })
-            .unwrap();
-    }
-
     // Build a small pool of RPC workers. Each worker runs a single-threaded runtime with a LocalSet
-    let worker_count = args.workers.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2)
-    });
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
     tracing::info!("using {} worker threads", worker_count);
-
-    // Log top-level runtime metrics if available (tokio_unstable)
-    // Metrics disabled to keep clippy clean without special cfgs
     let mut senders = Vec::with_capacity(worker_count);
     let mut worker_handles = Vec::with_capacity(worker_count);
-    for i in 0..worker_count {
+    for _ in 0..worker_count {
         let (tx, mut rx) = mpsc::channel::<tokio::net::TcpStream>(1024);
         senders.push(tx);
 
@@ -168,51 +69,45 @@ async fn main() -> Result<()> {
         let notify_cloned = Arc::clone(&notify);
         let shutdown_tx_cloned = shutdown_tx.clone();
 
-        let handle = std::thread::Builder::new()
-            .name(format!("rpc-worker-{}", i))
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build worker runtime");
-                rt.block_on(async move {
-                    let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
-                    let queue_client: queueber::protocol::queue::Client =
-                        capnp_rpc::new_client(server);
-                    // TODO: give this one a name
-                    let local = tokio::task::LocalSet::new();
-                    local
-                        .run_until(async move {
-                            while let Some(stream) = rx.recv().await {
-                                let client = queue_client.clone();
-                                let _jh = tokio::task::Builder::new()
-                                    .name("rpc_server")
-                                    .spawn_local(async move {
-                                        let (reader, writer) =
-                                            tokio_util::compat::TokioAsyncReadCompatExt::compat(
-                                                stream,
-                                            )
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build worker runtime");
+            rt.block_on(async move {
+                let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
+                let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
+                // TODO: give this one a name
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async move {
+                        while let Some(stream) = rx.recv().await {
+                            let client = queue_client.clone();
+                            let _jh = tokio::task::Builder::new()
+                                .name("rpc_server")
+                                .spawn_local(async move {
+                                    let (reader, writer) =
+                                        tokio_util::compat::TokioAsyncReadCompatExt::compat(stream)
                                             .split();
-                                        let network = twoparty::VatNetwork::new(
-                                            futures::io::BufReader::new(reader),
-                                            futures::io::BufWriter::new(writer),
-                                            rpc_twoparty_capnp::Side::Server,
-                                            Default::default(),
-                                        );
-                                        let rpc_system =
-                                            RpcSystem::new(Box::new(network), Some(client.client));
-                                        let _jh2 = tokio::task::Builder::new()
-                                            .name("rpc_system")
-                                            .spawn_local(rpc_system)
-                                            .unwrap();
-                                    })
-                                    .unwrap();
-                            }
-                        })
-                        .await;
-                });
-            })
-            .expect("spawn worker thread");
+                                    let network = twoparty::VatNetwork::new(
+                                        futures::io::BufReader::new(reader),
+                                        futures::io::BufWriter::new(writer),
+                                        rpc_twoparty_capnp::Side::Server,
+                                        Default::default(),
+                                    );
+                                    let rpc_system =
+                                        RpcSystem::new(Box::new(network), Some(client.client));
+                                    let _jh2 = tokio::task::Builder::new()
+                                        .name("rpc_system")
+                                        .spawn_local(rpc_system)
+                                        .unwrap();
+                                })
+                                .unwrap();
+                        }
+                    })
+                    .await;
+            });
+        });
         worker_handles.push(handle);
     }
 

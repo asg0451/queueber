@@ -1,5 +1,5 @@
 use capnp::message::{self, TypedReader};
-use capnp::serialize as serialize_mode;
+use capnp::serialize_packed;
 use rocksdb::{Options, SliceTransform, TransactionDB, WriteBatchWithTransaction};
 use std::io::BufReader;
 use std::path::Path;
@@ -34,23 +34,6 @@ impl Storage {
             Some(|_key: &[u8]| true),
         );
         opts.set_prefix_extractor(ns_prefix);
-        // RocksDB tuning for better latency and concurrency
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(2);
-        opts.increase_parallelism(parallelism);
-        opts.set_max_background_jobs((2 * parallelism).max(2));
-
-        // Block-based table with Bloom filter for prefix workloads
-        let mut table_opts = rocksdb::BlockBasedOptions::default();
-        table_opts.set_bloom_filter(10.0, false);
-        table_opts.set_format_version(5);
-        opts.set_block_based_table_factory(&table_opts);
-
-        // Smooth I/O
-        opts.set_bytes_per_sync(1 << 20);
-        opts.set_wal_bytes_per_sync(1 << 20);
-
         opts.create_if_missing(true);
         let txn_opts = rocksdb::TransactionDBOptions::default();
         let db = TransactionDB::open(&opts, &txn_opts, path)?;
@@ -104,7 +87,7 @@ impl Storage {
         stored_item.set_id(id);
         stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
         let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
-        serialize_mode::write_message(&mut stored_contents, &simsg)?;
+        serialize_packed::write_message(&mut stored_contents, &simsg)?;
 
         let mut batch = WriteBatchWithTransaction::<true>::default();
         batch.put(main_key.as_ref(), &stored_contents);
@@ -225,36 +208,31 @@ impl Storage {
             // Try to claim this item atomically using a transaction
             let txn = self.db.transaction();
             // Lock both the index entry and the main key to avoid concurrent polls claiming it
-            let idx_value_opt = txn.get_for_update(&idx_key, true)?;
+            let _ = txn.get_for_update(&idx_key, true)?;
             let main_value_opt = txn.get_for_update(&main_key, true)?;
             let Some(main_value) = main_value_opt else {
                 // Check if this is a database integrity issue or just normal concurrency
-                // If another poller already claimed and removed the available entry (and possibly
-                // the index), we should skip this entry rather than failing. This can also happen
-                // if the item was acknowledged quickly under its lease.
+                // If the visibility index entry exists but the main key doesn't, that's a database integrity issue
+                // If the main key exists but is in in-progress state, that's normal concurrency
                 let id_suffix = AvailableKey::id_suffix_from_key_bytes(&main_key);
                 let in_progress_key = InProgressKey::from_id(id_suffix);
                 if txn.get(&in_progress_key)?.is_some() {
                     // Item was already claimed by another poll, skip it
                     continue;
                 } else {
-                    // If the visibility index entry itself no longer exists, this is a benign race
-                    // (we iterated a stale view). Skip it.
-                    if idx_value_opt.is_none() {
-                        continue;
-                    }
-
-                    // Otherwise, the index points at a non-existent main key and there is no
-                    // in-progress entry. Treat this as a stale/orphaned index entry and self-heal
-                    // by deleting it within the same transaction that holds the lock to avoid
-                    // deadlocks/timeouts, then commit.
-                    txn.delete(&idx_key)?;
-                    txn.commit()?;
-                    continue;
+                    // Invariant: visibility index should point to an available item. If it's gone,
+                    // fail fast rather than silently healing; this indicates a concurrency bug.
+                    return Err(crate::errors::Error::AssertionFailed {
+                        msg: format!(
+                            "database integrity violated: main key not found for visibility entry: {:?}",
+                            &main_key
+                        ),
+                        backtrace: std::backtrace::Backtrace::capture(),
+                    });
                 }
             };
 
-            let stored_item_message = serialize_mode::read_message(
+            let stored_item_message = serialize_packed::read_message(
                 BufReader::new(&main_value[..]), // TODO: avoid allocation
                 message::ReaderOptions::new(),
             )?;
@@ -302,16 +280,15 @@ impl Storage {
             lease_entry_keys.set(i as u32, item_reader.get_id()?);
         }
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
-        serialize_mode::write_message(&mut lease_entry_bs, &lease_entry)?;
+        serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
 
-        if !polled_items.is_empty() {
-            // Write the lease entry only if we actually polled items
-            let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
-            in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
-            // index the lease by expiry time for the background sweeper
-            in_progress_batch.put(lease_expiry_index_key.as_ref(), lease_key.as_ref());
-            self.db.write(in_progress_batch)?;
-        }
+        // Write the lease entry
+        let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
+        in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
+        // index the lease by expiry time for the background sweeper
+        in_progress_batch.put(lease_expiry_index_key.as_ref(), lease_key.as_ref());
+
+        self.db.write(in_progress_batch)?;
 
         Ok((lease, polled_items))
     }
@@ -336,7 +313,7 @@ impl Storage {
         };
 
         // Parse lease entry and verify it contains the id
-        let lease_msg = serialize_mode::read_message(
+        let lease_msg = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -377,7 +354,7 @@ impl Storage {
                 out_keys.set(i as u32, k);
             }
             let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
-            serialize_mode::write_message(&mut buf, &msg)?;
+            serialize_packed::write_message(&mut buf, &msg)?;
             batch.put(lease_key.as_ref(), &buf);
         }
 
@@ -428,7 +405,7 @@ impl Storage {
             let lease_value = lease_value_opt.unwrap();
 
             // Parse lease entry keys
-            let lease_msg = serialize_mode::read_message(
+            let lease_msg = serialize_packed::read_message(
                 BufReader::new(&lease_value[..]),
                 message::ReaderOptions::new(),
             )?;
@@ -444,7 +421,7 @@ impl Storage {
                 let in_progress_key = InProgressKey::from_id(id);
                 if let Some(value) = self.db.get(in_progress_key.as_ref())? {
                     // Parse stored item to get id and contents
-                    let msg = serialize_mode::read_message(
+                    let msg = serialize_packed::read_message(
                         BufReader::new(&value[..]),
                         message::ReaderOptions::new(),
                     )?;
@@ -463,7 +440,7 @@ impl Storage {
                     out_item.set_id(stored_item.get_id()?);
                     out_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
                     let mut out_buf = Vec::with_capacity(out_msg.size_in_words() * 8);
-                    serialize_mode::write_message(&mut out_buf, &out_msg)?;
+                    serialize_packed::write_message(&mut out_buf, &out_msg)?;
 
                     let avail_key = AvailableKey::from_id(id);
                     batch.put(avail_key.as_ref(), &out_buf);
@@ -523,7 +500,7 @@ mod tests {
             .db
             .get(lease_key.as_ref())?
             .ok_or("lease not found")?;
-        let lease_entry = serialize_mode::read_message(
+        let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -576,7 +553,7 @@ mod tests {
                 .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
-            let msg = serialize_mode::read_message(
+            let msg = serialize_packed::read_message(
                 BufReader::new(&value[..]),
                 message::ReaderOptions::new(),
             )?;
@@ -597,7 +574,7 @@ mod tests {
             .db
             .get(lease_key.as_ref())?
             .ok_or("lease not found")?;
-        let lease_entry = serialize_mode::read_message(
+        let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -645,7 +622,7 @@ mod tests {
         // lease entry should contain only id2
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
-        let lease_entry = serialize_mode::read_message(
+        let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -697,9 +674,7 @@ mod tests {
 
         let db_path = "/tmp/queueber_test_db_remove_wrong_lease";
         let storage = Storage::new(Path::new(db_path)).unwrap();
-        scopeguard::defer!({
-            std::fs::remove_dir_all(db_path).ok();
-        });
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
 
         // add one item and poll
         let mut msg = Builder::new_default();
@@ -721,7 +696,7 @@ mod tests {
         // original lease entry still exists and contains the id
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
-        let lease_entry = serialize_mode::read_message(
+        let lease_entry = serialize_packed::read_message(
             BufReader::new(&lease_value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -755,9 +730,7 @@ mod tests {
 
         let db_path = "/tmp/queueber_test_db_future_visibility";
         let storage = Storage::new(Path::new(db_path)).unwrap();
-        scopeguard::defer!({
-            std::fs::remove_dir_all(db_path).ok();
-        });
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
 
         // add one item with future visibility (e.g., 60 seconds)
         let mut msg = Builder::new_default();
@@ -781,7 +754,7 @@ mod tests {
             .db
             .get(avail_key.as_ref())?
             .ok_or("missing available value")?;
-        let msg = serialize_mode::read_message(
+        let msg = serialize_packed::read_message(
             std::io::BufReader::new(&value[..]),
             message::ReaderOptions::new(),
         )?;
@@ -853,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_visibility_index_entry_is_healed() -> Result<()> {
+    fn stale_visibility_index_entry_fails_fast() -> Result<()> {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .try_init();
@@ -869,12 +842,12 @@ mod tests {
         batch.put(idx_key.as_ref(), main_key.as_ref());
         storage.db.write(batch)?;
 
-        // Poll should self-heal by deleting the orphaned index and not panic
-        let (_lease, items) = storage.get_next_available_entries(1)?;
-        assert_eq!(items.len(), 0);
-        // The index entry should be gone after healing
-        assert!(storage.db.get(idx_key.as_ref())?.is_none());
-        Ok(())
+        // Poll should fail fast with an assertion failure due to broken invariant
+        match storage.get_next_available_entries(1) {
+            Err(crate::errors::Error::AssertionFailed { .. }) => Ok(()),
+            Ok(_) => panic!("expected AssertionFailed, got Ok(..)"),
+            Err(e) => panic!("expected AssertionFailed, got {}", e),
+        }
     }
 
     #[test]
