@@ -184,6 +184,10 @@ impl Storage {
 
         let mut polled_items = Vec::with_capacity(n);
 
+        // Use a single transaction to claim up to n items and write the lease.
+        let txn = self.db.transaction();
+        let mut did_write = false;
+
         for kv in iter {
             if polled_items.len() >= n {
                 break;
@@ -205,16 +209,11 @@ impl Storage {
                 break;
             }
 
-            // Try to claim this item atomically using a transaction
-            let txn = self.db.transaction();
-            // Lock both the index entry and the main key to avoid concurrent polls claiming it
+            // Try to claim this item atomically using the transaction; lock both keys
             let idx_value_opt = txn.get_for_update(&idx_key, true)?;
             let main_value_opt = txn.get_for_update(&main_key, true)?;
             let Some(main_value) = main_value_opt else {
                 // Check if this is a database integrity issue or just normal concurrency
-                // If another poller already claimed and removed the available entry (and possibly
-                // the index), we should skip this entry rather than failing. This can also happen
-                // if the item was acknowledged quickly under its lease.
                 let id_suffix = AvailableKey::id_suffix_from_key_bytes(&main_key);
                 let in_progress_key = InProgressKey::from_id(id_suffix);
                 if txn.get(&in_progress_key)?.is_some() {
@@ -228,11 +227,9 @@ impl Storage {
                     }
 
                     // Otherwise, the index points at a non-existent main key and there is no
-                    // in-progress entry. Treat this as a stale/orphaned index entry and self-heal
-                    // by deleting it within the same transaction that holds the lock to avoid
-                    // deadlocks/timeouts, then commit.
+                    // in-progress entry. Treat this as a stale/orphaned index entry and self-heal.
                     txn.delete(&idx_key)?;
-                    txn.commit()?;
+                    did_write = true;
                     continue;
                 }
             };
@@ -265,18 +262,17 @@ impl Storage {
             let polled_item = builder.into_typed().into_reader();
             polled_items.push(polled_item);
 
-            // move the item to in progress
+            // move the item to in progress within the same transaction
             let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
-            // Apply moves inside the transaction to guarantee exclusivity
             txn.delete(&main_key)?;
             txn.put(new_main_key.as_ref(), &main_value)?;
             txn.delete(&idx_key)?;
-            txn.commit()?;
+            did_write = true;
         }
 
         // Build the lease entry by re-reading the IDs from the polled_items
         // vector. capnp lists aren't dynamically sized so we need to know how
-        // many to init before we start writing (?)
+        // many to init before we start writing (?))
         let mut lease_entry = message::Builder::new_default();
         let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
         let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
@@ -288,12 +284,14 @@ impl Storage {
         serialize_packed::write_message(&mut lease_entry_bs, &lease_entry)?;
 
         if !polled_items.is_empty() {
-            // Write the lease entry only if we actually polled items
-            let mut in_progress_batch = WriteBatchWithTransaction::<true>::default();
-            in_progress_batch.put(lease_key.as_ref(), &lease_entry_bs);
-            // index the lease by expiry time for the background sweeper
-            in_progress_batch.put(lease_expiry_index_key.as_ref(), lease_key.as_ref());
-            self.db.write(in_progress_batch)?;
+            // Write the lease entry and its expiry index inside the same transaction
+            txn.put(lease_key.as_ref(), &lease_entry_bs)?;
+            txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
+            did_write = true;
+        }
+
+        if did_write {
+            txn.commit()?;
         }
 
         Ok((lease, polled_items))
