@@ -278,7 +278,8 @@ impl Storage {
         // vector. capnp lists aren't dynamically sized so we need to know how
         // many to init before we start writing (?)
         let mut lease_entry = message::Builder::new_default();
-        let lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
+        let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
+        lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
         let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
         for (i, typed_item) in polled_items.iter().enumerate() {
             let item_reader: protocol::polled_item::Reader = typed_item.get()?;
@@ -374,10 +375,6 @@ impl Storage {
     pub fn expire_due_leases(&self) -> Result<usize> {
         let iter = self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
 
-        let now_secs: u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-
         let mut processed = 0usize;
 
         for kv in iter {
@@ -388,27 +385,63 @@ impl Storage {
                 LeaseExpiryIndexKey::PREFIX
             );
 
+            // Lock and re-validate the index entry inside a transaction to avoid races with extend()
+            let txn = self.db.transaction();
+            let idx_val_locked = txn.get_for_update(&idx_key, true)?;
+            if idx_val_locked.is_none() {
+                // Index was removed (e.g., due to extend); skip
+                txn.commit()?;
+                continue;
+            }
+
             let Some((expiry_ts_secs, lease_bytes)) =
                 LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)
             else {
+                txn.commit()?;
                 continue;
             };
+
+            let now_secs: u64 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
             if expiry_ts_secs > now_secs {
+                // Because keys are ordered by timestamp, we can stop scanning
+                txn.commit()?;
                 break;
             }
 
             let lease_key = LeaseKey::from_lease_bytes(lease_bytes);
 
-            // Load the lease entry; if missing, just delete the expiry index
+            // Load the lease entry; if missing, just delete the expiry index atomically
             let lease_value_opt = self.db.get(lease_key.as_ref())?;
             if lease_value_opt.is_none() {
-                let mut batch = WriteBatchWithTransaction::<true>::default();
-                batch.delete(&idx_key);
-                self.db.write(batch)?;
+                txn.delete(&idx_key)?;
+                txn.commit()?;
                 processed += 1;
                 continue;
             }
             let lease_value = lease_value_opt.unwrap();
+
+            // If a newer expiry index exists for this lease (i.e., extend() ran),
+            // then this index key is stale; delete it and continue without requeueing.
+            let mut has_newer_expiry_for_lease = false;
+            for kv2 in self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
+                let (idx2, _v2) = kv2?;
+                if let Some((ts2, lease2)) = LeaseExpiryIndexKey::split_ts_and_lease(&idx2)
+                    && lease2 == lease_bytes
+                {
+                    if ts2 > expiry_ts_secs {
+                        has_newer_expiry_for_lease = true;
+                        // Do not break; continue to consume iterator for fairness, but flag is set
+                    }
+                }
+            }
+            if has_newer_expiry_for_lease {
+                txn.delete(&idx_key)?;
+                txn.commit()?;
+                processed += 1;
+                continue;
+            }
 
             // Parse lease entry keys
             let lease_msg = serialize_packed::read_message(
@@ -416,12 +449,16 @@ impl Storage {
                 message::ReaderOptions::new(),
             )?;
             let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+            // If lease's embedded expiry is in the future relative to this index ts, skip
+            if lease_entry_reader.get_expiry_ts_secs() > expiry_ts_secs {
+                txn.delete(&idx_key)?;
+                txn.commit()?;
+                processed += 1;
+                continue;
+            }
             let keys = lease_entry_reader.get_keys()?;
 
-            let mut batch = WriteBatchWithTransaction::<true>::default();
-
-            // For each id, if it's still in in_progress, move back to available and
-            // restore the visibility index entry with visibility at now
+            // For each id, if it's still in in_progress, move back to available and restore index
             for res in keys.iter() {
                 let Ok(id) = res else { continue };
                 let in_progress_key = InProgressKey::from_id(id);
@@ -449,21 +486,79 @@ impl Storage {
                     serialize_packed::write_message(&mut out_buf, &out_msg)?;
 
                     let avail_key = AvailableKey::from_id(id);
-                    batch.put(avail_key.as_ref(), &out_buf);
-                    batch.put(vis_idx_now.as_ref(), avail_key.as_ref());
-                    batch.delete(in_progress_key.as_ref());
+                    txn.put(avail_key.as_ref(), &out_buf)?;
+                    txn.put(vis_idx_now.as_ref(), avail_key.as_ref())?;
+                    txn.delete(in_progress_key.as_ref())?;
                 }
             }
 
             // Remove the lease entry and its expiry index
-            batch.delete(lease_key.as_ref());
-            batch.delete(&idx_key);
-
-            self.db.write(batch)?;
+            txn.delete(lease_key.as_ref())?;
+            txn.delete(&idx_key)?;
+            txn.commit()?;
             processed += 1;
         }
 
         Ok(processed)
+    }
+
+    /// Extend an existing lease's validity by resetting its expiry to now + lease_validity_secs.
+    /// Returns false if the lease does not exist.
+    pub fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
+        // Validate lease exists; if not, do nothing
+        let lease_key = LeaseKey::from_lease_bytes(lease);
+        if self.db.get(lease_key.as_ref())?.is_none() {
+            return Ok(false);
+        }
+
+        // Compute new expiry index key
+        let now = std::time::SystemTime::now();
+        let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let new_idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, lease);
+
+        // Find current expiry index entry for this lease (if any)
+        let mut existing_idx_key: Option<Vec<u8>> = None;
+        for kv in self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
+            let (idx_key, _val) = kv?;
+            if let Some((_ts, lbytes)) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)
+                && lbytes == lease
+            {
+                existing_idx_key = Some(idx_key.to_vec());
+                break;
+            }
+        }
+
+        // First, publish the new expiry index entry so the sweeper can observe it immediately.
+        self.db.put(new_idx_key.as_ref(), lease_key.as_ref())?;
+
+        // Best-effort: remove the old expiry index entry if it still exists. It's fine if this
+        // races and the key is already gone or locked by an ongoing sweep.
+        if let Some(k) = existing_idx_key {
+            let _ = self.db.delete(&k);
+        }
+
+        // Update the lease entry's expiryTsSecs while preserving keys
+        if let Some(lease_value) = self.db.get(lease_key.as_ref())? {
+            let lease_msg = serialize_packed::read_message(
+                BufReader::new(&lease_value[..]),
+                message::ReaderOptions::new(),
+            )?;
+            let lease_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+            let keys = lease_reader.get_keys()?;
+            let mut out = message::Builder::new_default();
+            let mut builder = out.init_root::<protocol::lease_entry::Builder>();
+            builder.set_expiry_ts_secs(expiry_ts_secs);
+            let mut out_keys = builder.reborrow().init_keys(keys.len());
+            for i in 0..keys.len() {
+                out_keys.set(i, keys.get(i)?);
+            }
+            let mut buf = Vec::with_capacity(out.size_in_words() * 8);
+            serialize_packed::write_message(&mut buf, &out)?;
+            self.db.put(lease_key.as_ref(), &buf)?;
+        }
+        Ok(true)
     }
 }
 
@@ -711,6 +806,49 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys.get(0)?, b"only");
 
+        Ok(())
+    }
+
+    #[test]
+    fn extend_existing_lease_updates_expiry_index() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_extend";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // Add and poll to create a lease with 1s expiry
+        storage.add_available_item_from_parts(b"id1", b"p", 0)?;
+        let (lease, items) = storage.get_next_available_entries_with_lease(1, 1)?;
+        assert_eq!(items.len(), 1);
+
+        // Extend the lease by 3s; should return true
+        let ok = storage.extend_lease(&lease, 3)?;
+        assert!(ok);
+
+        // Sleep slightly over 1s and ensure lease hasn't expired yet
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let n = storage.expire_due_leases()?;
+        assert_eq!(n, 0, "lease should not expire after extend");
+
+        Ok(())
+    }
+
+    #[test]
+    fn extend_unknown_lease_returns_false() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_extend_unknown";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        let lease: [u8; 16] = uuid::Uuid::now_v7().into_bytes();
+        let ok = storage.extend_lease(&lease, 1)?;
+        assert!(!ok);
         Ok(())
     }
 
