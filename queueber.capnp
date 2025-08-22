@@ -49,6 +49,16 @@ interface Queue {
     add @00 (req :AddRequest) -> (resp :AddResponse);
     remove @01 (req :RemoveRequest) -> (resp :RemoveResponse);
     poll @02 (req :PollRequest) -> (resp :PollResponse);
+    extend @03 (req :ExtendRequest) -> (resp :ExtendResponse);
+}
+
+struct ExtendRequest {
+    lease @0 :Data;
+    leaseValiditySecs @1 :UInt64;
+}
+
+struct ExtendResponse {
+    extended @0 :Bool;
 }
 
 
@@ -61,4 +71,5 @@ struct StoredItem {
 
 struct LeaseEntry {
     keys @0 :List(Data);
+    expiryTsSecs @1 :UInt64;
 }

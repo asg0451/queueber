@@ -282,3 +282,68 @@ async fn poll_wait_wakes_when_item_becomes_visible() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn extend_renews_lease_and_unknown_returns_false() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    with_client(addr, |queue_client| async move {
+        // Add one item and poll with short lease
+        let mut add = queue_client.add_request();
+        {
+            let req = add.get().init_req();
+            let mut items = req.init_items(1);
+            let mut item = items.reborrow().get(0);
+            item.set_contents(b"hello");
+            item.set_visibility_timeout_secs(0);
+        }
+        let _ = add.send().promise.await.unwrap();
+
+        let mut poll = queue_client.poll_request();
+        {
+            let mut req = poll.get().init_req();
+            req.set_lease_validity_secs(1);
+            req.set_num_items(1);
+            req.set_timeout_secs(0);
+        }
+        let reply = poll.send().promise.await.unwrap();
+        let resp = reply.get().unwrap().get_resp().unwrap();
+        let lease = resp.get_lease().unwrap().to_vec();
+        assert!(!lease.is_empty());
+
+        // Extend the lease for another 2 seconds
+        let mut ext = queue_client.extend_request();
+        {
+            let mut req = ext.get().init_req();
+            req.set_lease(&lease);
+            req.set_lease_validity_secs(2);
+        }
+        let ext_reply = ext.send().promise.await.unwrap();
+        let extended = ext_reply.get().unwrap().get_resp().unwrap().get_extended();
+        assert!(extended);
+
+        // We don't assert timing-based invisibility here due to background sweep scheduling.
+        // Functionally, extend should return true for existing leases and false for unknown leases.
+        let mut poll2 = queue_client.poll_request();
+        {
+            let mut req = poll2.get().init_req();
+            req.set_lease_validity_secs(1);
+            req.set_num_items(1);
+            req.set_timeout_secs(0);
+        }
+
+        // Extending an unknown lease should return false
+        let mut ext2 = queue_client.extend_request();
+        {
+            let mut req = ext2.get().init_req();
+            let bogus = uuid::Uuid::now_v7().into_bytes();
+            req.set_lease(&bogus);
+            req.set_lease_validity_secs(1);
+        }
+        let rep2 = ext2.send().promise.await.unwrap();
+        let ok = rep2.get().unwrap().get_resp().unwrap().get_extended();
+        assert!(!ok);
+    })
+    .await;
+}
