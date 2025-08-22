@@ -211,7 +211,9 @@ impl crate::protocol::queue::Server for Server {
         Promise::from_future(async move {
             let removed = tokio::task::Builder::new()
                 .name("remove_in_progress_item")
-                .spawn_blocking(move || storage.remove_in_progress_item(id_owned.as_slice(), &lease))?
+                .spawn_blocking(move || {
+                    storage.remove_in_progress_item(id_owned.as_slice(), &lease)
+                })?
                 .await
                 .map_err(Into::<Error>::into)??;
 
