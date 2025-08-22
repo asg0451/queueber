@@ -26,9 +26,10 @@
   - [ ] (perf) add `--workers` CLI flag and name RPC worker threads
   - [ ] (perf) log top-level Tokio runtime metrics at startup (requires `--cfg tokio_unstable`)
   - [ ] (perf) offload blocking RocksDB work from RPC thread:
-    - [ ] `add()` already uses `spawn_blocking`
+    - [X] `add()` already uses `spawn_blocking`
     - [ ] `poll()` wraps `get_next_available_entries_with_lease` in `spawn_blocking`
     - [ ] `remove()` wraps `remove_in_progress_item` in `spawn_blocking`
+    - [ ] `extend()`?
     - [ ] (perf) improve wakeups: replace `Notify` with a versioned `watch<u64>` epoch channel to avoid lost wakeups and stampedes
     - [X] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
     - [ ] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
