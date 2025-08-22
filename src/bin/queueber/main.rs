@@ -6,7 +6,7 @@ use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{server::Server, storage::Storage};
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 // see https://github.com/capnproto/capnproto-rust/blob/master/example/addressbook_send/addressbook_send.rs
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     }
 
     let storage = Arc::new(Storage::new(&args.data_dir)?);
-    let notify = Arc::new(Notify::new());
+    let (epoch_tx, epoch_rx) = tokio::sync::watch::channel::<u64>(0);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Build a small pool of RPC workers. Each worker runs a single-threaded runtime with a LocalSet
@@ -66,7 +66,8 @@ async fn main() -> Result<()> {
         senders.push(tx);
 
         let storage_cloned = Arc::clone(&storage);
-        let notify_cloned = Arc::clone(&notify);
+        let epoch_tx_cloned = epoch_tx.clone();
+        let epoch_rx_cloned = epoch_rx.clone();
         let shutdown_tx_cloned = shutdown_tx.clone();
 
         let handle = std::thread::spawn(move || {
@@ -75,7 +76,12 @@ async fn main() -> Result<()> {
                 .build()
                 .expect("build worker runtime");
             rt.block_on(async move {
-                let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
+                let server = Server::new(
+                    storage_cloned,
+                    epoch_tx_cloned,
+                    epoch_rx_cloned,
+                    shutdown_tx_cloned,
+                );
                 let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
                 // TODO: give this one a name
                 let local = tokio::task::LocalSet::new();

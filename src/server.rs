@@ -1,7 +1,6 @@
 use capnp::capability::Promise;
 use capnp::message::{Builder, HeapAllocator, TypedReader};
 use std::sync::Arc;
-use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Duration;
 
@@ -15,7 +14,8 @@ use crate::protocol::queue::{
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs
 pub struct Server {
     storage: Arc<Storage>,
-    notify: Arc<Notify>,
+    epoch_tx: watch::Sender<u64>,
+    epoch_rx: watch::Receiver<u64>,
     #[allow(dead_code)]
     shutdown_tx: watch::Sender<bool>,
 }
@@ -23,11 +23,12 @@ pub struct Server {
 impl Server {
     pub fn new(
         storage: Arc<Storage>,
-        notify: Arc<Notify>,
+        epoch_tx: watch::Sender<u64>,
+        epoch_rx: watch::Receiver<u64>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
         let bg_storage = Arc::clone(&storage);
-        let bg_notify = Arc::clone(&notify);
+        let bg_epoch_tx = epoch_tx.clone();
         let lease_expiry_shutdown = shutdown_tx.clone();
         let visibility_wakeup_shutdown = shutdown_tx.clone();
 
@@ -45,7 +46,7 @@ impl Server {
                     {
                         Ok(Ok(n)) => {
                             if n > 0 {
-                                bg_notify.notify_one();
+                                bg_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
                             }
                         }
                         Ok(Err(_e)) => {
@@ -64,7 +65,7 @@ impl Server {
 
         // Background task to wake pollers when any invisible message becomes visible.
         let vis_storage = Arc::clone(&storage);
-        let vis_notify = Arc::clone(&notify);
+        let vis_epoch_tx = epoch_tx.clone();
         tokio::task::Builder::new()
             .name("visibility_wakeup")
             .spawn(async move {
@@ -87,13 +88,13 @@ impl Server {
                                 .map(|d| d.as_secs())
                                 .unwrap_or(ts_secs);
                             if ts_secs <= now_secs {
-                                vis_notify.notify_one();
+                                vis_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
                                 // Avoid busy loop; small sleep before checking again.
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             } else {
                                 let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
                                 tokio::time::sleep(sleep_dur).await;
-                                vis_notify.notify_one();
+                                vis_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
                             }
                         }
                         Ok(Ok(None)) => {
@@ -118,7 +119,8 @@ impl Server {
 
         Self {
             storage,
-            notify,
+            epoch_tx,
+            epoch_rx,
             shutdown_tx,
         }
     }
@@ -150,7 +152,7 @@ impl crate::protocol::queue::Server for Server {
         let any_immediately_visible = items_owned.iter().any(|(_, vis)| *vis == 0);
 
         let storage = Arc::clone(&self.storage);
-        let notify = Arc::clone(&self.notify);
+        let epoch_tx = self.epoch_tx.clone();
         let ids_for_resp = ids.clone();
 
         Promise::from_future(async move {
@@ -168,7 +170,7 @@ impl crate::protocol::queue::Server for Server {
                 .map_err(Into::<Error>::into)??;
 
             if any_immediately_visible {
-                notify.notify_one();
+                epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
             }
 
             // Build the response on the RPC thread.
@@ -209,7 +211,7 @@ impl crate::protocol::queue::Server for Server {
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
         let storage = Arc::clone(&self.storage);
-        let notify = Arc::clone(&self.notify);
+        let mut rx = self.epoch_rx.clone();
 
         Promise::from_future(async move {
             let req = params.get()?.get_req()?;
@@ -247,12 +249,12 @@ impl crate::protocol::queue::Server for Server {
                         }
                         let remaining = d - now;
                         tokio::select! {
-                            _ = notify.notified() => {},
+                            _ = rx.changed() => {},
                             _ = tokio::time::sleep(remaining) => { return Ok(()); },
                         }
                     }
                     None => {
-                        notify.notified().await;
+                        let _ = rx.changed().await;
                     }
                 }
             }

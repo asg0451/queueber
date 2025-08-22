@@ -35,13 +35,12 @@ fn start_test_server() -> TestServerHandle {
             use queueber::protocol::queue::Client as QueueClient;
             use queueber::server::Server;
             use std::sync::Arc;
-            use tokio::sync::Notify;
 
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let storage = Arc::new(Storage::new(&data_path).unwrap());
-            let notify = Arc::new(Notify::new());
-            let server = Server::new(storage, notify, shutdown_tx);
+            let (epoch_tx, epoch_rx) = tokio::sync::watch::channel::<u64>(0);
+            let server = Server::new(storage, epoch_tx, epoch_rx, shutdown_tx);
             let queue_client: QueueClient = capnp_rpc::new_client(server);
 
             // Indicate that the server is ready to accept connections
@@ -274,6 +273,66 @@ async fn poll_wait_wakes_when_item_becomes_visible() {
         let resp = reply.get().unwrap().get_resp().unwrap();
         let items = resp.get_items().unwrap();
         assert!(!items.is_empty());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn multiple_pollers_wake_on_single_epoch_bump() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    with_client(addr, |queue_client| async move {
+        // Start two concurrent polls that wait indefinitely
+        let mut poll_req1 = queue_client.poll_request();
+        {
+            let mut req = poll_req1.get().init_req();
+            req.set_lease_validity_secs(30);
+            req.set_num_items(1);
+            req.set_timeout_secs(0);
+        }
+        let mut poll_req2 = queue_client.poll_request();
+        {
+            let mut req = poll_req2.get().init_req();
+            req.set_lease_validity_secs(30);
+            req.set_num_items(1);
+            req.set_timeout_secs(0);
+        }
+
+        let p1 = tokio::task::spawn_local(async move { poll_req1.send().promise.await.unwrap() });
+        let p2 = tokio::task::spawn_local(async move { poll_req2.send().promise.await.unwrap() });
+
+        // After a short delay, add two items that are immediately visible
+        let client_for_add = queue_client.clone();
+        let add_task = tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut add = client_for_add.add_request();
+            {
+                let req = add.get().init_req();
+                let mut items = req.init_items(2);
+                for i in 0..2 {
+                    let mut item = items.reborrow().get(i);
+                    item.set_contents(b"hello");
+                    item.set_visibility_timeout_secs(0);
+                }
+            }
+            let _ = add.send().promise.await.unwrap();
+        });
+
+        let r1 = tokio::time::timeout(Duration::from_secs(3), p1)
+            .await
+            .expect("p1")
+            .unwrap();
+        let r2 = tokio::time::timeout(Duration::from_secs(3), p2)
+            .await
+            .expect("p2")
+            .unwrap();
+        add_task.await.unwrap();
+
+        let resp1 = r1.get().unwrap().get_resp().unwrap();
+        let resp2 = r2.get().unwrap().get_resp().unwrap();
+        assert!(!resp1.get_items().unwrap().is_empty());
+        assert!(!resp2.get_items().unwrap().is_empty());
     })
     .await;
 }
