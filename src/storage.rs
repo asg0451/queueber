@@ -1,14 +1,13 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize;
 use rocksdb::{Options, SliceTransform, TransactionDB, WriteBatchWithTransaction};
-use std::io::BufReader;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::dbkeys::{
     AvailableKey, InProgressKey, LeaseExpiryIndexKey, LeaseKey, VisibilityIndexKey,
 };
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::protocol;
 
 pub struct Storage {
@@ -74,6 +73,7 @@ impl Storage {
         contents: &[u8],
         visibility_timeout_secs: u64,
     ) -> Result<()> {
+        // Build keys and contents
         let main_key = AvailableKey::from_id(id);
         let now = std::time::SystemTime::now();
         let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
@@ -88,6 +88,8 @@ impl Storage {
         stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
         let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
         serialize::write_message(&mut stored_contents, &simsg)?;
+
+        // Atomically insert the item and visibility index entry
 
         let mut batch = WriteBatchWithTransaction::<true>::default();
         batch.put(main_key.as_ref(), &stored_contents);
@@ -105,6 +107,7 @@ impl Storage {
         Ok(())
     }
 
+    // TODO: swap which one wraps which
     pub fn add_available_items_from_parts<'a, I>(&self, items: I) -> Result<()>
     where
         I: IntoIterator<Item = (&'a [u8], (&'a [u8], u64))>,
@@ -121,55 +124,30 @@ impl Storage {
     pub fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
         let mut iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
         if let Some(kv) = iter.next() {
-            let (idx_key, _val) = kv?;
-            debug_assert_eq!(
-                &idx_key[..VisibilityIndexKey::PREFIX.len()],
-                VisibilityIndexKey::PREFIX
-            );
-            Ok(VisibilityIndexKey::parse_visible_ts_secs(&idx_key))
+            let (idx_key, _) = kv?;
+            Ok(Some(VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?))
         } else {
             Ok(None)
         }
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn get_next_available_entries(
         &self,
         n: usize,
-    ) -> Result<(
-        Lease,
-        Vec<
-            TypedReader<
-                capnp::message::Builder<message::HeapAllocator>,
-                protocol::polled_item::Owned,
-            >,
-        >,
-    )> {
+    ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
         // default lease validity of 30 seconds for callers that don't provide it
         self.get_next_available_entries_with_lease(n, 30)
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn get_next_available_entries_with_lease(
         &self,
         n: usize,
         lease_validity_secs: u64,
-    ) -> Result<(
-        Lease,
-        Vec<
-            TypedReader<
-                capnp::message::Builder<message::HeapAllocator>,
-                protocol::polled_item::Owned,
-            >,
-        >,
-    )> {
-        // Determine current time (secs since epoch) to filter visible items.
+    ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
+        // Create a lease and its expiry index entry
         let now = std::time::SystemTime::now();
         let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
-
-        // move these items to in progress and create a lease
-        // TODO: use a mockable clock
-        let lease = Uuid::now_v7().into_bytes();
+        let lease = Uuid::now_v7().into_bytes(); // TODO: use a mockable clock
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
             .duration_since(std::time::UNIX_EPOCH)?
@@ -177,72 +155,38 @@ impl Storage {
         let lease_expiry_index_key =
             LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, &lease);
 
-        // Iterate over visibility index entries in lexicographic order; since
-        // timestamps are encoded big-endian in the key, this corresponds to
-        // ascending time order.
-        let iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
+        // Find the next n items that are available and visible.
+        // Use a transaction for consistency, though I don't like paying the cost for it.
+        let txn = self.db.transaction();
+        let viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
 
         let mut polled_items = Vec::with_capacity(n);
 
-        // Use a single transaction to claim up to n items and write the lease.
-        let txn = self.db.transaction();
-        let mut did_write = false;
-
-        for kv in iter {
-            if polled_items.len() >= n {
-                break;
-            }
-
+        for kv in viz_iter.take(n) {
             let (idx_key, main_key) = kv?;
 
-            debug_assert_eq!(
-                &idx_key[..VisibilityIndexKey::PREFIX.len()],
-                VisibilityIndexKey::PREFIX
-            );
-
-            // Parse visible-at timestamp using helper; because keys are time-ordered (BE),
-            // we can stop scanning as soon as we hit a future timestamp.
-            let Some(visible_at_secs) = VisibilityIndexKey::parse_visible_ts_secs(&idx_key) else {
-                continue;
-            };
+            let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
             if visible_at_secs > now_secs {
+                // Because keys are ordered by timestamp, we can stop scanning.
                 break;
             }
 
-            // Try to claim this item atomically using the transaction; lock both keys
-            let idx_value_opt = txn.get_for_update(&idx_key, true)?;
-            let main_value_opt = txn.get_for_update(&main_key, true)?;
-            let Some(main_value) = main_value_opt else {
-                // Check if this is a database integrity issue or just normal concurrency
-                let id_suffix = AvailableKey::id_suffix_from_key_bytes(&main_key);
-                let in_progress_key = InProgressKey::from_id(id_suffix);
-                if txn.get(&in_progress_key)?.is_some() {
-                    // Item was already claimed by another poll, skip it
-                    continue;
-                } else {
-                    // If the visibility index entry itself no longer exists, this is a benign race
-                    // (we iterated a stale view). Skip it.
-                    if idx_value_opt.is_none() {
-                        continue;
-                    }
+            // Fetch the item. Lock it and its index to prevent races.
+            let _idx_value = txn
+                .get_pinned_for_update(&idx_key, true)?
+                .ok_or_else(|| Error::assertion_failed("visibility index entry not found"))?;
+            let main_value = txn
+                .get_pinned_for_update(&main_key, true)?
+                .ok_or_else(|| Error::assertion_failed("main key not found"))?;
 
-                    // Otherwise, the index points at a non-existent main key and there is no
-                    // in-progress entry. Treat this as a stale/orphaned index entry and self-heal.
-                    txn.delete(&idx_key)?;
-                    did_write = true;
-                    continue;
-                }
-            };
-
-            let stored_item_message = serialize::read_message(
-                BufReader::new(&main_value[..]), // TODO: avoid allocation
-                message::ReaderOptions::new(),
-            )?;
+            // Fetch and decode.
+            let stored_item_message =
+                serialize::read_message(&main_value[..], message::ReaderOptions::new())?;
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
             debug_assert!(!stored_item.get_id()?.is_empty());
-            // The value stored at the visibility index key is the available main key
-            // for the item. Ensure it matches the item's id.
+            debug_assert!(!stored_item.get_contents()?.is_empty());
+            debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
             debug_assert_eq!(
                 stored_item.get_id()?,
                 AvailableKey::id_suffix_from_key_bytes(&main_key)
@@ -254,7 +198,7 @@ impl Storage {
                 String::from_utf8_lossy(stored_item.get_contents()?)
             );
 
-            // build the polled item
+            // Build the polled item.
             let mut builder = message::Builder::new_default(); // TODO: reduce allocs
             let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
             polled_item.set_contents(stored_item.get_contents()?);
@@ -262,38 +206,28 @@ impl Storage {
             let polled_item = builder.into_typed().into_reader();
             polled_items.push(polled_item);
 
-            // move the item to in progress within the same transaction
+            // Move the item to in progress and delete the index entry.
             let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
             txn.delete(&main_key)?;
             txn.put(new_main_key.as_ref(), &main_value)?;
             txn.delete(&idx_key)?;
-            did_write = true;
         }
 
-        // Build the lease entry by re-reading the IDs from the polled_items
-        // vector. capnp lists aren't dynamically sized so we need to know how
-        // many to init before we start writing (?))
-        let mut lease_entry = message::Builder::new_default();
-        let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
-        lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
-        let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
-        for (i, typed_item) in polled_items.iter().enumerate() {
-            let item_reader: protocol::polled_item::Reader = typed_item.get()?;
-            lease_entry_keys.set(i as u32, item_reader.get_id()?);
+        // If no items were found, return a nil lease and empty polled items. TODO: is this to golangy (:
+        if polled_items.is_empty() {
+            return Ok((Uuid::nil().into_bytes(), Vec::new()));
         }
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
+
+        // Build the lease entry.
+        let lease_entry = build_lease_entry_message(lease_validity_secs, &polled_items)?;
+        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
         serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
-        if !polled_items.is_empty() {
-            // Write the lease entry and its expiry index inside the same transaction
-            txn.put(lease_key.as_ref(), &lease_entry_bs)?;
-            txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
-            did_write = true;
-        }
+        // Write the lease entry and its expiry index
+        txn.put(lease_key.as_ref(), &lease_entry_bs)?;
+        txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
 
-        if did_write {
-            txn.commit()?;
-        }
+        txn.commit()?;
 
         Ok((lease, polled_items))
     }
@@ -305,65 +239,62 @@ impl Storage {
         let in_progress_key = InProgressKey::from_id(id);
         let lease_key = LeaseKey::from_lease_bytes(lease);
 
+        let txn = self.db.transaction();
         // Validate item exists in in_progress
-        let in_progress_value_opt = self.db.get(in_progress_key.as_ref())?;
-        if in_progress_value_opt.is_none() {
+        if txn.get_pinned_for_update(&in_progress_key, true)?.is_none() {
             return Ok(false);
         }
 
         // Validate lease exists
-        let lease_value_opt = self.db.get(lease_key.as_ref())?;
-        let Some(lease_value) = lease_value_opt else {
+        let Some(lease_value) = txn.get_pinned_for_update(&lease_key, true)? else {
+            tracing::info!("lease entry not found: {:?}", Uuid::from_bytes(*lease));
             return Ok(false);
         };
 
-        // Parse lease entry and verify it contains the id
-        let lease_msg = serialize::read_message(
-            BufReader::new(&lease_value[..]),
+        // Parse lease entry and verify it contains the id.
+        // TODO: make the keys inside sorted so we can binary search for the id.
+        // TODO: use this api everywhere.
+        let lease_msg = serialize::read_message_from_flat_slice(
+            &mut &lease_value[..],
             message::ReaderOptions::new(),
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let keys = lease_entry_reader.get_keys()?;
-
-        // Build filtered keys excluding the provided id using iterator combinators
-        let mut found = false;
-        let kept_keys: Vec<&[u8]> = keys
+        let Some((found_idx, _)) = keys
             .iter()
-            .filter_map(|res| match res {
-                Ok(k) if k == id => {
-                    found = true;
-                    None
-                }
-                Ok(k) => Some(k),
-                Err(_) => None,
-            })
-            .collect();
-
-        if !found {
+            .enumerate()
+            .find(|(_, k)| k.as_ref().ok() == Some(&id))
+        else {
             return Ok(false);
-        }
+        };
 
-        // Prepare batch: delete in_progress item; update or delete lease entry
-        let mut batch = WriteBatchWithTransaction::<true>::default();
-        batch.delete(in_progress_key.as_ref());
+        // Delete item from in_progress.
+        txn.delete(in_progress_key.as_ref())?;
 
-        if kept_keys.is_empty() {
-            // No items remain under this lease; remove lease entry
-            batch.delete(lease_key.as_ref());
+        // Rewrite the lease entry to exclude the id. If no items remain under this lease,
+        // delete the lease entry instead.
+        if keys.len() - 1 == 0 {
+            txn.delete(lease_key.as_ref())?;
         } else {
-            // Rebuild lease entry with remaining keys
-            let mut msg = message::Builder::new_default();
+            // Rebuild lease entry with remaining keys.
+            // TODO: this could be done more efficiently by unifying the above search and this one.
+            let mut msg = message::Builder::new_default(); // TODO: reduce allocs
             let builder = msg.init_root::<protocol::lease_entry::Builder>();
-            let mut out_keys = builder.init_keys(kept_keys.len() as u32);
-            for (i, k) in kept_keys.into_iter().enumerate() {
+            let mut out_keys = builder.init_keys(keys.len() as u32 - 1);
+            let mut i = 0;
+            for (_, k) in keys.iter().enumerate().filter(|(i, _)| *i != found_idx) {
+                let k = k?;
                 out_keys.set(i as u32, k);
+                i += 1;
             }
-            let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
+            let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
             serialize::write_message(&mut buf, &msg)?;
-            batch.put(lease_key.as_ref(), &buf);
+            txn.put(lease_key.as_ref(), &buf)?;
         }
+        drop(lease_value);
 
-        self.db.write(batch)?;
+        txn.commit()?;
+
         Ok(true)
     }
 
@@ -371,10 +302,14 @@ impl Storage {
     /// in-progress items back to available and delete the lease and its index.
     /// Returns the number of expired leases processed.
     pub fn expire_due_leases(&self) -> Result<usize> {
-        let iter = self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
+        let now_secs: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
 
         let mut processed = 0usize;
 
+        let txn = self.db.transaction();
+        let iter = txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
         for kv in iter {
             let (idx_key, _lease_key_bytes_val) = kv?;
 
@@ -383,168 +318,115 @@ impl Storage {
                 LeaseExpiryIndexKey::PREFIX
             );
 
-            // Lock and re-validate the index entry inside a transaction to avoid races with extend()
-            let txn = self.db.transaction();
-            let idx_val_locked = txn.get_for_update(&idx_key, true)?;
-            if idx_val_locked.is_none() {
-                // Index was removed (e.g., due to extend); skip
-                txn.commit()?;
-                continue;
-            }
+            let _idx_val = txn.get_pinned_for_update(&idx_key, true)?.ok_or_else(|| {
+                Error::assertion_failed("visibility index entry not found after we scanned it")
+            })?;
 
-            let Some((expiry_ts_secs, lease_bytes)) =
-                LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)
-            else {
-                txn.commit()?;
-                continue;
-            };
+            let (expiry_ts_secs, lease_bytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
 
-            let now_secs: u64 = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
             if expiry_ts_secs > now_secs {
                 // Because keys are ordered by timestamp, we can stop scanning
-                txn.commit()?;
                 break;
             }
 
             let lease_key = LeaseKey::from_lease_bytes(lease_bytes);
 
-            // Load the lease entry; if missing, just delete the expiry index atomically
-            let lease_value_opt = self.db.get(lease_key.as_ref())?;
-            if lease_value_opt.is_none() {
-                txn.delete(&idx_key)?;
-                txn.commit()?;
-                processed += 1;
-                continue;
-            }
-            let lease_value = lease_value_opt.unwrap();
+            // Load the lease entry.
+            let lease_value = txn
+                .get_pinned_for_update(lease_key.as_ref(), true)?
+                .ok_or_else(|| {
+                    Error::assertion_failed(&format!(
+                        "lease entry {:?} not found for expiry index {:?}",
+                        lease_key, idx_key
+                    ))
+                })?;
 
-            // If a newer expiry index exists for this lease (i.e., extend() ran),
-            // then this index key is stale; delete it and continue without requeueing.
-            let mut has_newer_expiry_for_lease = false;
-            for kv2 in self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
-                let (idx2, _v2) = kv2?;
-                if let Some((ts2, lease2)) = LeaseExpiryIndexKey::split_ts_and_lease(&idx2)
-                    && lease2 == lease_bytes
-                {
-                    if ts2 > expiry_ts_secs {
-                        has_newer_expiry_for_lease = true;
-                        // Do not break; continue to consume iterator for fairness, but flag is set
-                    }
-                }
-            }
-            if has_newer_expiry_for_lease {
-                txn.delete(&idx_key)?;
-                txn.commit()?;
-                processed += 1;
-                continue;
-            }
+            // TODO: ensure extend doesnt create multiple index entries for the same lease.
 
             // Parse lease entry keys
-            let lease_msg = serialize::read_message(
-                BufReader::new(&lease_value[..]),
+            let lease_msg = serialize::read_message_from_flat_slice(
+                &mut &lease_value[..],
                 message::ReaderOptions::new(),
             )?;
             let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
-            // If lease's embedded expiry is in the future relative to this index ts, skip
-            if lease_entry_reader.get_expiry_ts_secs() > expiry_ts_secs {
-                txn.delete(&idx_key)?;
-                txn.commit()?;
-                processed += 1;
-                continue;
-            }
-            let keys = lease_entry_reader.get_keys()?;
+            let keys = lease_entry_reader.get_keys()?; // TODO: rename to ids
 
-            // For each id, if it's still in in_progress, move back to available and restore index
-            for res in keys.iter() {
-                let Ok(id) = res else { continue };
-                let in_progress_key = InProgressKey::from_id(id);
-                if let Some(value) = self.db.get(in_progress_key.as_ref())? {
-                    // Parse stored item to get id and contents
-                    let msg = serialize::read_message(
-                        BufReader::new(&value[..]),
-                        message::ReaderOptions::new(),
-                    )?;
-                    let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
+            // Move each item back to available.
+            for id in keys.iter() {
+                let id = id?;
+                let in_progress_key = InProgressKey::from_id(&id);
+                let item_value = txn
+                    .get_pinned_for_update(in_progress_key.as_ref(), true)?
+                    .ok_or_else(|| {
+                        Error::assertion_failed(&format!(
+                            "in_progress entry {:?} not found for lease entry {:?}",
+                            in_progress_key, lease_key
+                        ))
+                    })?;
 
-                    // Build a new stored_item with visibility index for now
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs();
-                    let vis_idx_now =
-                        VisibilityIndexKey::from_visible_ts_and_id(now_secs, stored_item.get_id()?);
-
-                    let mut out_msg = message::Builder::new_default();
-                    let mut out_item = out_msg.init_root::<protocol::stored_item::Builder>();
-                    out_item.set_contents(stored_item.get_contents()?);
-                    out_item.set_id(stored_item.get_id()?);
-                    out_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
-                    let mut out_buf = Vec::with_capacity(out_msg.size_in_words() * 8);
-                    serialize::write_message(&mut out_buf, &out_msg)?;
-
-                    let avail_key = AvailableKey::from_id(id);
-                    txn.put(avail_key.as_ref(), &out_buf)?;
-                    txn.put(vis_idx_now.as_ref(), avail_key.as_ref())?;
-                    txn.delete(in_progress_key.as_ref())?;
-                }
+                // Write the item back to available, and add a visibility index entry.
+                let avail_key = AvailableKey::from_id(id);
+                txn.put(avail_key.as_ref(), &item_value)?;
+                let vis_idx_now = VisibilityIndexKey::from_visible_ts_and_id(now_secs, id);
+                txn.put(vis_idx_now.as_ref(), avail_key.as_ref())?;
+                txn.delete(in_progress_key.as_ref())?;
             }
 
             // Remove the lease entry and its expiry index
             txn.delete(lease_key.as_ref())?;
             txn.delete(&idx_key)?;
-            txn.commit()?;
             processed += 1;
         }
-
+        txn.commit()?;
         Ok(processed)
     }
 
     /// Extend an existing lease's validity by resetting its expiry to now + lease_validity_secs.
     /// Returns false if the lease does not exist.
     pub fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
+        let txn = self.db.transaction();
         // Validate lease exists; if not, do nothing
         let lease_key = LeaseKey::from_lease_bytes(lease);
-        if self.db.get(lease_key.as_ref())?.is_none() {
+        if txn
+            .get_pinned_for_update(lease_key.as_ref(), true)?
+            .is_none()
+        {
             return Ok(false);
         }
 
-        // Compute new expiry index key
+        // Compute and write the new expiry index key.
         let now = std::time::SystemTime::now();
         let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let new_idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, lease);
+        txn.put(new_idx_key.as_ref(), lease_key.as_ref())?;
 
-        // Find current expiry index entry for this lease (if any)
+        // Find current expiry index entry for this lease and delete it.
+        // TODO: add this index entry to the lease entry so we can do a point lookup.
         let mut existing_idx_key: Option<Vec<u8>> = None;
-        for kv in self.db.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
+        for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
             let (idx_key, _val) = kv?;
-            if let Some((_ts, lbytes)) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)
-                && lbytes == lease
-            {
+            let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
+            if lbytes == lease {
                 existing_idx_key = Some(idx_key.to_vec());
                 break;
             }
         }
-
-        // First, publish the new expiry index entry so the sweeper can observe it immediately.
-        self.db.put(new_idx_key.as_ref(), lease_key.as_ref())?;
-
-        // Best-effort: remove the old expiry index entry if it still exists. It's fine if this
-        // races and the key is already gone or locked by an ongoing sweep.
         if let Some(k) = existing_idx_key {
-            let _ = self.db.delete(&k);
+            txn.delete(&k)?;
         }
 
         // Update the lease entry's expiryTsSecs while preserving keys
-        if let Some(lease_value) = self.db.get(lease_key.as_ref())? {
-            let lease_msg = serialize::read_message(
-                BufReader::new(&lease_value[..]),
+        if let Some(lease_value) = txn.get_pinned_for_update(lease_key.as_ref(), true)? {
+            let lease_msg = serialize::read_message_from_flat_slice(
+                &mut &lease_value[..],
                 message::ReaderOptions::new(),
             )?;
             let lease_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
             let keys = lease_reader.get_keys()?;
+
+            // TODO: do this with set_root or some such / more efficiently.
             let mut out = message::Builder::new_default();
             let mut builder = out.init_root::<protocol::lease_entry::Builder>();
             builder.set_expiry_ts_secs(expiry_ts_secs);
@@ -554,19 +436,38 @@ impl Storage {
             }
             let mut buf = Vec::with_capacity(out.size_in_words() * 8);
             serialize::write_message(&mut buf, &out)?;
-            self.db.put(lease_key.as_ref(), &buf)?;
+            txn.put(lease_key.as_ref(), &buf)?;
         }
         Ok(true)
     }
 }
 
-// it's a uuidv7
+/// uuidv7 bytes
 type Lease = [u8; 16];
 
-// helper key builders moved to `crate::dbkeys` newtypes
+type PolledItemOwnedReader =
+    TypedReader<capnp::message::Builder<message::HeapAllocator>, protocol::polled_item::Owned>;
+
+fn build_lease_entry_message(
+    lease_validity_secs: u64,
+    polled_items: &[PolledItemOwnedReader],
+) -> Result<capnp::message::Builder<message::HeapAllocator>> {
+    // Build the lease entry. capnp lists aren't dynamically sized so we
+    // need to know how many to init before we start writing (?).
+    let mut lease_entry = message::Builder::new_default();
+    let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
+    lease_entry_builder.set_expiry_ts_secs(lease_validity_secs);
+    let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
+    for (i, typed_item) in polled_items.iter().enumerate() {
+        let item_reader: protocol::polled_item::Reader = typed_item.get()?;
+        lease_entry_keys.set(i as u32, item_reader.get_id()?);
+    }
+    Ok(lease_entry)
+}
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufReader;
     use std::sync::Arc;
 
     use super::*;
@@ -962,31 +863,6 @@ mod tests {
 
         let (_lease2, items2) = storage.get_next_available_entries(1)?;
         assert_eq!(items2.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn stale_visibility_index_entry_is_healed() -> Result<()> {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .try_init();
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let storage = Storage::new(tmp.path()).expect("storage");
-
-        // Create a visibility index entry pointing at a non-existent main key
-        let ghost_id = b"ghost";
-        let idx_key = VisibilityIndexKey::from_visible_ts_and_id(0, ghost_id);
-        let main_key = AvailableKey::from_id(ghost_id);
-        let mut batch = WriteBatchWithTransaction::<true>::default();
-        batch.put(idx_key.as_ref(), main_key.as_ref());
-        storage.db.write(batch)?;
-
-        // Poll should self-heal by deleting the orphaned index and not panic
-        let (_lease, items) = storage.get_next_available_entries(1)?;
-        assert_eq!(items.len(), 0);
-        // The index entry should be gone after healing
-        assert!(storage.db.get(idx_key.as_ref())?.is_none());
         Ok(())
     }
 

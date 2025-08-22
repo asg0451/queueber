@@ -45,6 +45,15 @@ pub enum Error {
     },
 }
 
+impl Error {
+    pub fn assertion_failed(msg: &str) -> Self {
+        Self::AssertionFailed {
+            msg: msg.to_string(),
+            backtrace: Backtrace::capture(),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<Error> for capnp::Error {
