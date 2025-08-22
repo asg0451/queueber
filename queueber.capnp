@@ -60,16 +60,3 @@ struct ExtendRequest {
 struct ExtendResponse {
     extended @0 :Bool;
 }
-
-
-# internal stuff (TODO: move to own file)
-struct StoredItem {
-    contents @0 :Data;
-    visibilityTsIndexKey @1 :Data;
-    id @2 :Data;
-}
-
-struct LeaseEntry {
-    keys @0 :List(Data);
-    expiryTsSecs @1 :UInt64;
-}

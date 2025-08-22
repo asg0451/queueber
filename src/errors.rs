@@ -43,6 +43,14 @@ pub enum Error {
         source: std::time::SystemTimeError,
         backtrace: Backtrace,
     },
+    #[error("item not found")]
+    ItemNotFound { backtrace: Backtrace },
+    #[error("uuid error: {source}")]
+    Uuid {
+        #[from]
+        source: uuid::Error,
+        backtrace: Backtrace,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -6,6 +6,3 @@ pub mod errors;
 pub mod protocol;
 pub mod server;
 pub mod storage;
-
-// Re-export commonly used types
-pub use crate::storage::Storage;
