@@ -23,7 +23,7 @@
 - [X] (minor) integrate tokio console into queueber
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
 - [ ] (perf) improve performance and cpu utilization. see docs/perf-notes.md
-  - [ ] (perf) add `--workers` CLI flag and name RPC worker threads
+  - [X] (perf) add `--workers` CLI flag and name RPC worker threads
   - [ ] (perf) log top-level Tokio runtime metrics at startup (requires `--cfg tokio_unstable`)
   - [ ] (perf) offload blocking RocksDB work from RPC thread:
     - [X] `add()` already uses `spawn_blocking`
