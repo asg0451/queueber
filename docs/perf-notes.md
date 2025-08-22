@@ -61,7 +61,7 @@ Recommended fixes (incremental):
    - Consider a dedicated `rayon`/custom thread pool for storage ops if you want stronger isolation from Tokio's blocking pool.
 
 2) Improve wakeups:
-   - Replace the `Notify` primitive with a versioned `watch<u64>` epoch channel. Maintain an `AtomicU64` epoch; on add/visibility/expiry, increment and `tx.send(epoch)`. In the poll loop, check DB first; if empty, capture `*rx.borrow()` and wait on `rx.changed()` (or `select!` with timeout). This avoids lost notifications, naturally coalesces multiple events, and scales to many waiters without stampedes.
+   - Switch `notify.notify_one()` to `notify.notify_waiters()` when items become visible or are added. This wakes all waiters; you may add simple backoff if stampedes become an issue.
 
 3) De-duplicate background tasks:
    - Spawn a single `lease_expiry` and a single `visibility_wakeup` task in the top-level runtime, not per worker. They can still use `spawn_blocking` for DB access and notify the shared `Notify`.
@@ -77,7 +77,7 @@ Recommended fixes (incremental):
 ### Low-overhead wins
 
 - Serialization:
-  - Use `capnp::serialize` (unpacked) everywhere to reduce CPU. Revisit packed only if bandwidth is a bottleneck.
+  - `serialize_packed` trades bandwidth for CPU. Add a feature flag to switch hot paths to `capnp::serialize` (unpacked) for lower CPU during benchmarks.
   - Reuse buffers for message building to reduce alloc pressure on hot paths.
 
 - DB write batching:
@@ -106,9 +106,10 @@ If you can make per-connection work `Send` (or isolate the non-`Send` parts), yo
 ### What to implement first
 
 1) Name worker threads and add a `--workers` CLI flag; log both `worker_count` and top-level runtime metrics at startup so it’s unambiguous how many threads are active.
-2) Use unpacked Cap’n Proto serialization (`capnp::serialize`) across the board. No feature flag.
+2) Add a feature-flag to toggle packed vs. unpacked Cap’n Proto serialization for storage.
 3) Batch claims and include lease writes in the same RocksDB transaction.
 4) Add a tuned `BlockBasedOptions` with bloom filters and increase `max_background_jobs`.
 5) Consider switching to `SO_REUSEPORT` per-worker accept.
 
 These yield quick, measurable wins without changing external behavior.
+
