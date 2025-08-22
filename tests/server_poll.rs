@@ -41,6 +41,11 @@ fn start_test_server() -> TestServerHandle {
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let storage = Arc::new(Storage::new(&data_path).unwrap());
             let notify = Arc::new(Notify::new());
+            queueber::server::spawn_background_tasks(
+                Arc::clone(&storage),
+                Arc::clone(&notify),
+                shutdown_tx.clone(),
+            );
             let server = Server::new(storage, notify, shutdown_tx);
             let queue_client: QueueClient = capnp_rpc::new_client(server);
 

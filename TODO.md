@@ -30,7 +30,7 @@
     - [ ] `poll()` wraps `get_next_available_entries_with_lease` in `spawn_blocking`
     - [ ] `remove()` wraps `remove_in_progress_item` in `spawn_blocking`
     - [ ] (perf) improve wakeups: replace `Notify` with a versioned `watch<u64>` epoch channel to avoid lost wakeups and stampedes
-    - [ ] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
+    - [X] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
     - [ ] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
     - [ ] (perf) RocksDB tuning: increase parallelism/background jobs and add bloom filters
     - [ ] (perf) switch to unpacked Cap’n Proto serialization (`capnp::serialize`) everywhere
