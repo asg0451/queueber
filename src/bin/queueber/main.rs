@@ -4,7 +4,10 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
-use queueber::{server::Server, storage::Storage};
+use queueber::{
+    metrics_atomic::create_atomic_metrics, metrics_server::MetricsServer,
+    metrics_wrapper_atomic::AtomicMetricsWrapper, server::Server, storage::Storage,
+};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -18,6 +21,14 @@ struct Args {
     /// Address to listen on (host:port)
     #[arg(short = 'l', long = "listen", default_value = "127.0.0.1:9090")]
     listen: String,
+
+    /// Enable metrics collection and server
+    #[arg(long = "enable-metrics")]
+    enable_metrics: bool,
+
+    /// Metrics server address (host:port)
+    #[arg(short = 'm', long = "metrics", default_value = "127.0.0.1:9091")]
+    metrics: String,
 
     /// Data directory for RocksDB
     #[arg(short = 'd', long = "data-dir", default_value = "/tmp/queueber/data")]
@@ -50,9 +61,37 @@ async fn main() -> Result<()> {
         std::fs::remove_dir_all(&args.data_dir)?;
     }
 
-    let storage = Arc::new(Storage::new(&args.data_dir)?);
+    // Create metrics (opt-in)
+    let atomic_metrics = if args.enable_metrics {
+        create_atomic_metrics()
+    } else {
+        queueber::metrics_atomic::AtomicMetrics::new()
+    };
+
+    let storage = Arc::new(Storage::new_with_metrics(
+        &args.data_dir,
+        AtomicMetricsWrapper::new(if args.enable_metrics {
+            Some(atomic_metrics.clone())
+        } else {
+            None
+        }),
+    )?);
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Start metrics server (only if enabled)
+    if args.enable_metrics {
+        let metrics_server = MetricsServer::new(
+            prometheus_client::registry::Registry::default(),
+            atomic_metrics.clone(),
+        );
+        let metrics_addr = args.metrics.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server.start(&metrics_addr).await {
+                tracing::error!("Metrics server failed: {}", e);
+            }
+        });
+    }
 
     // Build a small pool of RPC workers. Each worker runs a single-threaded runtime with a LocalSet
     let worker_count = std::thread::available_parallelism()
@@ -68,6 +107,7 @@ async fn main() -> Result<()> {
         let storage_cloned = Arc::clone(&storage);
         let notify_cloned = Arc::clone(&notify);
         let shutdown_tx_cloned = shutdown_tx.clone();
+        let atomic_metrics_cloned = atomic_metrics.clone();
 
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -75,7 +115,16 @@ async fn main() -> Result<()> {
                 .build()
                 .expect("build worker runtime");
             rt.block_on(async move {
-                let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
+                let server = Server::new_with_metrics(
+                    storage_cloned,
+                    notify_cloned,
+                    shutdown_tx_cloned,
+                    AtomicMetricsWrapper::new(if args.enable_metrics {
+                        Some(atomic_metrics_cloned)
+                    } else {
+                        None
+                    }),
+                );
                 let queue_client: queueber::protocol::queue::Client = capnp_rpc::new_client(server);
                 // TODO: give this one a name
                 let local = tokio::task::LocalSet::new();

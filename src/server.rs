@@ -3,10 +3,11 @@ use capnp::message::{Builder, HeapAllocator, TypedReader};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::sync::watch;
-use tokio::time::Duration;
 
 use crate::Storage;
+use crate::background_tasks::BackgroundTasks;
 use crate::errors::{Error, Result};
+use crate::metrics_wrapper_atomic::AtomicMetricsWrapper;
 use crate::protocol::queue::{
     AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
@@ -18,6 +19,7 @@ pub struct Server {
     notify: Arc<Notify>,
     #[allow(dead_code)]
     shutdown_tx: watch::Sender<bool>,
+    metrics: AtomicMetricsWrapper,
 }
 
 impl Server {
@@ -26,100 +28,29 @@ impl Server {
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
-        let bg_storage = Arc::clone(&storage);
-        let bg_notify = Arc::clone(&notify);
-        let lease_expiry_shutdown = shutdown_tx.clone();
-        let visibility_wakeup_shutdown = shutdown_tx.clone();
+        Self::new_with_metrics(storage, notify, shutdown_tx, AtomicMetricsWrapper::none())
+    }
 
-        // Background task to expire leases periodically
-        tokio::task::Builder::new()
-            .name("lease_expiry")
-            .spawn(async move {
-                loop {
-                    let st = Arc::clone(&bg_storage);
-                    match tokio::task::Builder::new()
-                        .name("expire_due_leases")
-                        .spawn_blocking(move || st.expire_due_leases())
-                        .unwrap()
-                        .await
-                    {
-                        Ok(Ok(n)) => {
-                            if n > 0 {
-                                bg_notify.notify_one();
-                            }
-                        }
-                        Ok(Err(_e)) => {
-                            let _ = lease_expiry_shutdown.send(true);
-                            break;
-                        }
-                        Err(_join_err) => {
-                            let _ = lease_expiry_shutdown.send(true);
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            })
-            .unwrap();
-
-        // Background task to wake pollers when any invisible message becomes visible.
-        let vis_storage = Arc::clone(&storage);
-        let vis_notify = Arc::clone(&notify);
-        tokio::task::Builder::new()
-            .name("visibility_wakeup")
-            .spawn(async move {
-                loop {
-                    // Peek earliest visibility timestamp from RocksDB (blocking)
-                    let next_vis_opt = tokio::task::Builder::new()
-                        .name("peek_next_visibility_ts_secs")
-                        .spawn_blocking({
-                            let st = Arc::clone(&vis_storage);
-                            move || st.peek_next_visibility_ts_secs()
-                        })
-                        .unwrap()
-                        .await;
-
-                    match next_vis_opt {
-                        Ok(Ok(Some(ts_secs))) => {
-                            // Compute duration until visibility; if already visible, notify now.
-                            let now_secs = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(ts_secs);
-                            if ts_secs <= now_secs {
-                                vis_notify.notify_one();
-                                // Avoid busy loop; small sleep before checking again.
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            } else {
-                                let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
-                                tokio::time::sleep(sleep_dur).await;
-                                vis_notify.notify_one();
-                            }
-                        }
-                        Ok(Ok(None)) => {
-                            // No items; back off
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
-                        // TODO: can this be prettier?
-                        Ok(Err(e)) => {
-                            tracing::error!("peek_next_visibility_ts_secs: {}", e);
-                            let _ = visibility_wakeup_shutdown.send(true);
-                            break;
-                        }
-                        Err(join_err) => {
-                            tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
-                            let _ = visibility_wakeup_shutdown.send(true);
-                            break;
-                        }
-                    }
-                }
-            })
-            .unwrap();
+    pub fn new_with_metrics(
+        storage: Arc<Storage>,
+        notify: Arc<Notify>,
+        shutdown_tx: watch::Sender<bool>,
+        metrics: AtomicMetricsWrapper,
+    ) -> Self {
+        // Spawn background tasks
+        let background_tasks = BackgroundTasks::new(
+            Arc::clone(&storage),
+            Arc::clone(&notify),
+            shutdown_tx.clone(),
+            metrics.clone(),
+        );
+        background_tasks.spawn_all();
 
         Self {
             storage,
             notify,
             shutdown_tx,
+            metrics,
         }
     }
 }
@@ -152,34 +83,39 @@ impl crate::protocol::queue::Server for Server {
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
         let ids_for_resp = ids.clone();
+        let metrics = self.metrics.clone();
 
         Promise::from_future(async move {
-            // Offload RocksDB work to the blocking thread pool.
-            tokio::task::Builder::new()
-                .name("add_available_items_from_parts")
-                .spawn_blocking(move || {
-                    let iter = ids
-                        .iter()
-                        .map(|id| id.as_slice())
-                        .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
-                    storage.add_available_items_from_parts(iter)
-                })?
+            metrics
+                .time_request("add", || async {
+                    // Offload RocksDB work to the blocking thread pool.
+                    tokio::task::Builder::new()
+                        .name("add_available_items_from_parts")
+                        .spawn_blocking(move || {
+                            let iter = ids
+                                .iter()
+                                .map(|id| id.as_slice())
+                                .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+                            storage.add_available_items_from_parts(iter)
+                        })?
+                        .await
+                        .map_err(Into::<Error>::into)??;
+
+                    if any_immediately_visible {
+                        notify.notify_one();
+                    }
+
+                    // Build the response on the RPC thread.
+                    let mut ids_builder = results
+                        .get()
+                        .init_resp()
+                        .init_ids(ids_for_resp.len() as u32);
+                    for (i, id) in ids_for_resp.iter().enumerate() {
+                        ids_builder.set(i as u32, id);
+                    }
+                    Ok(())
+                })
                 .await
-                .map_err(Into::<Error>::into)??;
-
-            if any_immediately_visible {
-                notify.notify_one();
-            }
-
-            // Build the response on the RPC thread.
-            let mut ids_builder = results
-                .get()
-                .init_resp()
-                .init_ids(ids_for_resp.len() as u32);
-            for (i, id) in ids_for_resp.iter().enumerate() {
-                ids_builder.set(i as u32, id);
-            }
-            Ok(())
         })
     }
 
@@ -189,73 +125,96 @@ impl crate::protocol::queue::Server for Server {
         mut results: RemoveResults,
     ) -> Promise<(), capnp::Error> {
         let req = params.get()?.get_req()?;
-        let id = req.get_id()?;
-        let lease_bytes = req.get_lease()?;
+        let id = req.get_id()?.to_vec();
+        let lease_bytes = req.get_lease()?.to_vec();
 
         if lease_bytes.len() != 16 {
             return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
         }
         let mut lease: [u8; 16] = [0; 16];
-        lease.copy_from_slice(lease_bytes);
+        lease.copy_from_slice(&lease_bytes);
 
-        let removed = self
-            .storage
-            .remove_in_progress_item(id, &lease)
-            .map_err(Into::into)?;
+        let storage = Arc::clone(&self.storage);
+        let metrics = self.metrics.clone();
 
-        results.get().init_resp().set_removed(removed);
-        Promise::ok(())
+        Promise::from_future(async move {
+            let result = metrics
+                .time_request("remove", || async {
+                    storage
+                        .remove_in_progress_item(&id, &lease)
+                        .map_err(Into::into)
+                })
+                .await;
+
+            match result {
+                Ok(removed) => {
+                    results.get().init_resp().set_removed(removed);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        })
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
+        let metrics = self.metrics.clone();
 
         Promise::from_future(async move {
-            let req = params.get()?.get_req()?;
-            let lease_validity_secs = req.get_lease_validity_secs();
-            if lease_validity_secs == 0 {
-                return Err(capnp::Error::failed(
-                    "invariant: leaseValiditySecs must be > 0".to_string(),
-                ));
-            }
-            let num_items = match req.get_num_items() {
-                0 => 1,
-                n => n as usize,
-            };
-            let timeout_secs = req.get_timeout_secs();
+            metrics
+                .time_request("poll", || async {
+                    let req = params.get()?.get_req()?;
+                    let lease_validity_secs = req.get_lease_validity_secs();
+                    if lease_validity_secs == 0 {
+                        return Err(capnp::Error::failed(
+                            "invariant: leaseValiditySecs must be > 0".to_string(),
+                        ));
+                    }
+                    let num_items = match req.get_num_items() {
+                        0 => 1,
+                        n => n as usize,
+                    };
+                    let timeout_secs = req.get_timeout_secs();
 
-            let deadline = if timeout_secs > 0 {
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
-            } else {
-                None
-            };
+                    let deadline = if timeout_secs > 0 {
+                        Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(timeout_secs),
+                        )
+                    } else {
+                        None
+                    };
 
-            loop {
-                let (lease, items) = storage
-                    .get_next_available_entries_with_lease(num_items, lease_validity_secs)?;
-                if !items.is_empty() {
-                    write_poll_response(&lease, items, &mut results)?;
-                    return Ok(());
-                }
-
-                match deadline {
-                    Some(d) => {
-                        let now = std::time::Instant::now();
-                        if now >= d {
+                    loop {
+                        let (lease, items) = storage.get_next_available_entries_with_lease(
+                            num_items,
+                            lease_validity_secs,
+                        )?;
+                        if !items.is_empty() {
+                            write_poll_response(&lease, items, &mut results)?;
                             return Ok(());
                         }
-                        let remaining = d - now;
-                        tokio::select! {
-                            _ = notify.notified() => {},
-                            _ = tokio::time::sleep(remaining) => { return Ok(()); },
+
+                        match deadline {
+                            Some(d) => {
+                                let now = std::time::Instant::now();
+                                if now >= d {
+                                    return Ok(());
+                                }
+                                let remaining = d - now;
+                                tokio::select! {
+                                    _ = notify.notified() => {},
+                                    _ = tokio::time::sleep(remaining) => { return Ok(()); },
+                                }
+                            }
+                            None => {
+                                notify.notified().await;
+                            }
                         }
                     }
-                    None => {
-                        notify.notified().await;
-                    }
-                }
-            }
+                })
+                .await
         })
     }
 }
