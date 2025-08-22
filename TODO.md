@@ -26,13 +26,14 @@
   - [ ] (perf) add `--workers` CLI flag and name RPC worker threads
   - [ ] (perf) log top-level Tokio runtime metrics at startup (requires `--cfg tokio_unstable`)
   - [ ] (perf) offload blocking RocksDB work from RPC thread:
-    - [X] `add()` already uses `spawn_blocking`
-    - [X] `poll()` wraps `get_next_available_entries_with_lease` in `spawn_blocking`
-    - [X] `remove()` wraps `remove_in_progress_item` in `spawn_blocking`
-    - [ ] (perf) improve wakeups: replace `Notify` with a versioned `watch<u64>` epoch channel to avoid lost wakeups and stampedes
-    - [ ] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
-    - [ ] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
-    - [ ] (perf) RocksDB tuning: increase parallelism/background jobs and add bloom filters
-    - [ ] (perf) switch to unpacked Cap’n Proto serialization (`capnp::serialize`) everywhere
-    - [ ] (perf) per-worker accept via `SO_REUSEPORT`
-    - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
+  - [X] `add()` already uses `spawn_blocking`
+  - [X] `poll()` wraps `get_next_available_entries_with_lease` in `spawn_blocking`
+  - [X] `remove()` wraps `remove_in_progress_item` in `spawn_blocking`
+  - [ ] `extend()` wraps in spawn blocking?
+  - [ ] (perf) improve wakeups: replace `Notify` with a versioned `watch<u64>` epoch channel to avoid lost wakeups and stampedes
+  - [X] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
+  - [ ] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
+  - [ ] (perf) RocksDB tuning: increase parallelism/background jobs and add bloom filters
+  - [X] (perf) switch to unpacked Cap’n Proto serialization (`capnp::serialize`) everywhere
+  - [ ] (perf) per-worker accept via `SO_REUSEPORT`
+  - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
