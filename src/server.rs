@@ -204,13 +204,20 @@ impl crate::protocol::queue::Server for Server {
         let mut lease: [u8; 16] = [0; 16];
         lease.copy_from_slice(lease_bytes);
 
-        let removed = self
-            .storage
-            .remove_in_progress_item(id, &lease)
-            .map_err(Into::into)?;
+        // Own the id bytes so they can be moved across await boundaries.
+        let id_owned = id.to_vec();
 
-        results.get().init_resp().set_removed(removed);
-        Promise::ok(())
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let removed = tokio::task::Builder::new()
+                .name("remove_in_progress_item")
+                .spawn_blocking(move || storage.remove_in_progress_item(id_owned.as_slice(), &lease))?
+                .await
+                .map_err(Into::<Error>::into)??;
+
+            results.get().init_resp().set_removed(removed);
+            Ok(())
+        })
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
@@ -238,8 +245,16 @@ impl crate::protocol::queue::Server for Server {
             };
 
             loop {
-                let (lease, items) = storage
-                    .get_next_available_entries_with_lease(num_items, lease_validity_secs)?;
+                let (lease, items) = tokio::task::Builder::new()
+                    .name("get_next_available_entries_with_lease")
+                    .spawn_blocking({
+                        let st = Arc::clone(&storage);
+                        move || {
+                            st.get_next_available_entries_with_lease(num_items, lease_validity_secs)
+                        }
+                    })?
+                    .await
+                    .map_err(Into::<Error>::into)??;
                 if !items.is_empty() {
                     write_poll_response(&lease, items, &mut results)?;
                     return Ok(());
