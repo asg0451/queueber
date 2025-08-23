@@ -39,7 +39,9 @@ fn start_test_server() -> TestServerHandle {
 
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            let storage = Arc::new(Storage::new(&data_path).unwrap());
+            let storage = Arc::new(queueber::storage::RetriedStorage::new(
+                Storage::new(&data_path).unwrap(),
+            ));
             let notify = Arc::new(Notify::new());
             queueber::server::spawn_background_tasks(
                 Arc::clone(&storage),
