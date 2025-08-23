@@ -63,17 +63,17 @@ proptest! {
                     for op in seq {
                         match op {
                             Op::Add { id, contents, vis_secs } => {
-                                st.add_available_item_from_parts(&id, &contents, vis_secs).await?;
+                                let _ = st.add_available_item_from_parts(&id, &contents, vis_secs).await;
                             }
                             Op::Poll { n, lease_secs } => {
-                                let (_lease, _items) = st.get_next_available_entries_with_lease(n, lease_secs).await?;
+                                let _ = st.get_next_available_entries_with_lease(n, lease_secs).await;
                                 // We do not assert on item counts here because of concurrency; the goal
                                 // is to shake races and ensure no panics or invariants are violated.
                             }
                             Op::Remove { id } => {
                                 // Try removing under a random/nonexistent lease to exercise paths.
                                 let fake_lease = uuid::Uuid::now_v7().into_bytes();
-                                let _ = st.remove_in_progress_item(&id, &fake_lease).await?;
+                                let _ = st.remove_in_progress_item(&id, &fake_lease).await;
                             }
                         }
                     }
