@@ -574,18 +574,13 @@ impl RetriedStorage<Storage> {
         with_rocksdb_busy_retry_async("add_available_item_from_parts", || {
             let inner_ref = std::sync::Arc::clone(&inner);
             let state_ref = std::sync::Arc::clone(&state);
-            let id_ptr = id as *const [u8];
-            let contents_ptr = contents as *const [u8];
             async move {
                 {
                     let mut guard = state_ref.lock().unwrap();
                     if guard.attempt > 0 && guard.owned.is_none() {
-                        // Safety: we only deref these pointers synchronously before await
-                        let id_ref: &[u8] = unsafe { &*id_ptr };
-                        let contents_ref: &[u8] = unsafe { &*contents_ptr };
                         guard.owned = Some((
-                            std::sync::Arc::<[u8]>::from(id_ref),
-                            std::sync::Arc::<[u8]>::from(contents_ref),
+                            std::sync::Arc::<[u8]>::from(id.to_vec()),
+                            std::sync::Arc::<[u8]>::from(contents.to_vec()),
                         ));
                     }
                 }
@@ -785,13 +780,11 @@ impl RetriedStorage<Storage> {
         with_rocksdb_busy_retry_async("remove_in_progress_item", || {
             let inner_ref = std::sync::Arc::clone(&inner);
             let state_ref = std::sync::Arc::clone(&state);
-            let id_ptr = id as *const [u8];
             async move {
                 {
                     let mut guard = state_ref.lock().unwrap();
                     if guard.attempt > 0 && guard.owned_id.is_none() {
-                        let id_ref: &[u8] = unsafe { &*id_ptr };
-                        guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id_ref));
+                        guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id.to_vec()));
                     }
                 }
 
