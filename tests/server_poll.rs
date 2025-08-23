@@ -6,7 +6,7 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 
 use queueber::protocol::queue;
-use queueber::storage::Storage;
+use queueber::storage::{RetriedStorage, Storage};
 
 struct TestServerHandle {
     _data_dir: tempfile::TempDir,
@@ -39,7 +39,7 @@ fn start_test_server() -> TestServerHandle {
 
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            let storage = Arc::new(Storage::new(&data_path).unwrap());
+            let storage = Arc::new(RetriedStorage::new(Storage::new(&data_path).unwrap()));
             let notify = Arc::new(Notify::new());
             queueber::server::spawn_background_tasks(
                 Arc::clone(&storage),

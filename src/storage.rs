@@ -1,6 +1,9 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize;
-use rocksdb::{OptimisticTransactionDB, Options, SliceTransform, WriteBatchWithTransaction};
+use rocksdb::{
+    OptimisticTransactionDB, OptimisticTransactionOptions, Options, SliceTransform,
+    WriteBatchWithTransaction, WriteOptions,
+};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -163,7 +166,9 @@ impl Storage {
 
         // Find the next n items that are available and visible.
         // Use a transaction for consistency, though I don't like paying the cost for it.
-        let txn = self.db.transaction();
+        let mut opts = OptimisticTransactionOptions::default();
+        opts.set_snapshot(true);
+        let txn = self.db.transaction_opt(&WriteOptions::default(), &opts);
         let viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
 
         let mut polled_items = Vec::with_capacity(n);
