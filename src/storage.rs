@@ -1,6 +1,6 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize;
-use rocksdb::{Options, SliceTransform, TransactionDB, WriteBatchWithTransaction};
+use rocksdb::{OptimisticTransactionDB, Options, SliceTransform, WriteBatchWithTransaction};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -11,7 +11,7 @@ use crate::errors::{Error, Result};
 use crate::protocol;
 
 pub struct Storage {
-    db: TransactionDB,
+    db: OptimisticTransactionDB,
 }
 
 impl Storage {
@@ -34,8 +34,7 @@ impl Storage {
         );
         opts.set_prefix_extractor(ns_prefix);
         opts.create_if_missing(true);
-        let txn_opts = rocksdb::TransactionDBOptions::default();
-        let db = TransactionDB::open(&opts, &txn_opts, path)?;
+        let db = OptimisticTransactionDB::open(&opts, path)?;
         Ok(Self { db })
     }
 
