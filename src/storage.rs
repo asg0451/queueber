@@ -526,94 +526,79 @@ impl RetriedStorage<Storage> {
     ) -> Result<()> {
         let inner = std::sync::Arc::clone(&self.inner);
 
-        // Zero-copy fast path on first attempt using block_in_place.
-        // Fall back to Arc<[u8]> + spawn_blocking only on retries.
-        const MAX_RETRIES: u32 = 8;
-        const BASE_DELAY_MS: u64 = 10;
-        const MAX_DELAY_MS: u64 = 1000;
-
         type OwnedBuffers = (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>);
+        struct State {
+            attempt: u32,
+            owned: Option<OwnedBuffers>,
+        }
+        let state = std::sync::Arc::new(std::sync::Mutex::new(State {
+            attempt: 0,
+            owned: None,
+        }));
 
-        let mut attempt: u32 = 0;
-        // Lazily materialized owned buffers for retry attempts
-        let mut owned_buffers: Option<OwnedBuffers> = None;
-
-        loop {
-            let result = if let Some((id_arc, contents_arc)) = owned_buffers.as_ref() {
-                let inner_ref = std::sync::Arc::clone(&inner);
-                let id_arc = std::sync::Arc::clone(id_arc);
-                let contents_arc = std::sync::Arc::clone(contents_arc);
-                tokio::task::spawn_blocking(move || {
-                    inner_ref.add_available_item_from_parts(
-                        &id_arc,
-                        &contents_arc,
-                        visibility_timeout_secs,
-                    )
-                })
-                .await
-                .map_err(Into::<Error>::into)??;
-                Ok(())
-            } else {
-                let inner_ref = std::sync::Arc::clone(&inner);
-                // No allocation on first attempt. If we're on a current-thread runtime,
-                // call directly; otherwise use block_in_place to avoid starving.
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle)
-                        if handle.runtime_flavor()
-                            == tokio::runtime::RuntimeFlavor::CurrentThread =>
-                    {
-                        inner_ref.add_available_item_from_parts(
-                            id,
-                            contents,
-                            visibility_timeout_secs,
-                        )
-                    }
-                    _ => tokio::task::block_in_place(move || {
-                        inner_ref.add_available_item_from_parts(
-                            id,
-                            contents,
-                            visibility_timeout_secs,
-                        )
-                    }),
+        with_rocksdb_busy_retry_async("add_available_item_from_parts", || {
+            let inner_ref = std::sync::Arc::clone(&inner);
+            let state_ref = std::sync::Arc::clone(&state);
+            let id_ptr = id as *const [u8];
+            let contents_ptr = contents as *const [u8];
+            async move {
+                let mut guard = state_ref.lock().unwrap();
+                if guard.attempt > 0 && guard.owned.is_none() {
+                    // Safety: we only deref these pointers synchronously before await
+                    let id_ref: &[u8] = unsafe { &*id_ptr };
+                    let contents_ref: &[u8] = unsafe { &*contents_ptr };
+                    guard.owned = Some((
+                        std::sync::Arc::<[u8]>::from(id_ref),
+                        std::sync::Arc::<[u8]>::from(contents_ref),
+                    ));
                 }
-            };
 
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let is_busy = matches!(
-                        e,
-                        Error::Rocksdb { ref source, .. } if source.kind() == rocksdb::ErrorKind::Busy
-                    );
-                    if !is_busy {
-                        return Err(e);
-                    }
-                    if attempt >= MAX_RETRIES {
-                        tracing::warn!(operation = %"add_available_item_from_parts", attempts = attempt + 1, "RocksDB Busy: giving up after max retries");
-                        return Err(e);
-                    }
-
-                    // Prepare owned buffers once when we know we'll retry
-                    if owned_buffers.is_none() {
-                        owned_buffers = Some((
-                            std::sync::Arc::<[u8]>::from(id),
-                            std::sync::Arc::<[u8]>::from(contents),
-                        ));
-                    }
-
-                    let exp = 1u64 << attempt.min(20);
-                    let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
-                    let jitter_ms = if ceiling == 0 {
-                        0
-                    } else {
-                        rand::thread_rng().gen_range(0..=ceiling)
+                if let Some((ref id_arc, ref contents_arc)) = guard.owned {
+                    let id_arc = std::sync::Arc::clone(id_arc);
+                    let contents_arc = std::sync::Arc::clone(contents_arc);
+                    drop(guard);
+                    tokio::task::spawn_blocking(move || {
+                        inner_ref.add_available_item_from_parts(
+                            &id_arc,
+                            &contents_arc,
+                            visibility_timeout_secs,
+                        )
+                    })
+                    .await
+                    .map_err(Into::<Error>::into)??;
+                    let mut guard = state_ref.lock().unwrap();
+                    guard.attempt = guard.attempt.saturating_add(1);
+                    Ok(())
+                } else {
+                    // First attempt: zero-copy direct or block_in_place depending on runtime
+                    drop(guard);
+                    let res = match tokio::runtime::Handle::try_current() {
+                        Ok(handle)
+                            if handle.runtime_flavor()
+                                == tokio::runtime::RuntimeFlavor::CurrentThread =>
+                        {
+                            inner_ref.add_available_item_from_parts(
+                                id,
+                                contents,
+                                visibility_timeout_secs,
+                            )
+                        }
+                        _ => tokio::task::block_in_place(move || {
+                            inner_ref.add_available_item_from_parts(
+                                id,
+                                contents,
+                                visibility_timeout_secs,
+                            )
+                        }),
                     };
-                    tracing::debug!(operation = %"add_available_item_from_parts", attempt = attempt + 1, delay_ms = jitter_ms, "RocksDB Busy: backing off with jitter");
-                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-                    attempt = attempt.saturating_add(1);
+                    // Increment attempt after finishing
+                    let mut guard = state_ref.lock().unwrap();
+                    guard.attempt = guard.attempt.saturating_add(1);
+                    res.map(|_| ())
                 }
             }
-        }
+        })
+        .await
     }
 
     pub async fn add_available_items_from_parts<'a, I>(&self, items: I) -> Result<()>
@@ -621,91 +606,79 @@ impl RetriedStorage<Storage> {
         I: IntoIterator<Item = (&'a [u8], (&'a [u8], u64))>,
     {
         type BorrowedItem<'b> = (&'b [u8], (&'b [u8], u64));
-        // Collect borrowed view once (no copies) for first attempt.
+        type OwnedItem = (std::sync::Arc<[u8]>, (std::sync::Arc<[u8]>, u64));
+
         let borrowed: Vec<BorrowedItem<'a>> = items.into_iter().collect();
         let inner = std::sync::Arc::clone(&self.inner);
+        let borrowed_arc = std::sync::Arc::new(borrowed);
 
-        const MAX_RETRIES: u32 = 8;
-        const BASE_DELAY_MS: u64 = 10;
-        const MAX_DELAY_MS: u64 = 1000;
+        struct State {
+            attempt: u32,
+            owned: Option<std::sync::Arc<Vec<OwnedItem>>>,
+        }
+        let state = std::sync::Arc::new(std::sync::Mutex::new(State {
+            attempt: 0,
+            owned: None,
+        }));
 
-        let mut attempt: u32 = 0;
-        // Lazily materialized owned items for retry attempts
-        type OwnedItem = (std::sync::Arc<[u8]>, (std::sync::Arc<[u8]>, u64));
-        let mut owned_items: Option<std::sync::Arc<Vec<OwnedItem>>> = None;
-
-        loop {
-            let result = if let Some(owned_ref) = owned_items.as_ref() {
-                let inner_ref = std::sync::Arc::clone(&inner);
-                let owned_ref = std::sync::Arc::clone(owned_ref);
-                tokio::task::spawn_blocking(move || {
-                    let iter = owned_ref
+        with_rocksdb_busy_retry_async("add_available_items_from_parts", || {
+            let inner_ref = std::sync::Arc::clone(&inner);
+            let state_ref = std::sync::Arc::clone(&state);
+            let borrowed_ref = std::sync::Arc::clone(&borrowed_arc);
+            async move {
+                let mut guard = state_ref.lock().unwrap();
+                if guard.attempt > 0 && guard.owned.is_none() {
+                    let owned_vec: Vec<OwnedItem> = borrowed_ref
                         .iter()
-                        .map(|(id, (c, v))| (id.as_ref(), (c.as_ref(), *v)));
-                    inner_ref.add_available_items_from_parts(iter)
-                })
-                .await
-                .map_err(Into::<Error>::into)??;
-                Ok(())
-            } else {
-                let inner_ref = std::sync::Arc::clone(&inner);
-                let borrowed_ref = &borrowed;
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle)
-                        if handle.runtime_flavor()
-                            == tokio::runtime::RuntimeFlavor::CurrentThread =>
-                    {
-                        let iter = borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
-                        inner_ref.add_available_items_from_parts(iter)
-                    }
-                    _ => tokio::task::block_in_place(move || {
-                        let iter = borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
-                        inner_ref.add_available_items_from_parts(iter)
-                    }),
+                        .map(|(id, (c, v))| {
+                            (
+                                std::sync::Arc::<[u8]>::from(*id),
+                                (std::sync::Arc::<[u8]>::from(*c), *v),
+                            )
+                        })
+                        .collect();
+                    guard.owned = Some(std::sync::Arc::new(owned_vec));
                 }
-            };
 
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let is_busy = matches!(
-                        e,
-                        Error::Rocksdb { ref source, .. } if source.kind() == rocksdb::ErrorKind::Busy
-                    );
-                    if !is_busy {
-                        return Err(e);
-                    }
-                    if attempt >= MAX_RETRIES {
-                        tracing::warn!(operation = %"add_available_items_from_parts", attempts = attempt + 1, "RocksDB Busy: giving up after max retries");
-                        return Err(e);
-                    }
-
-                    if owned_items.is_none() {
-                        let owned_vec: Vec<OwnedItem> = borrowed
+                if let Some(owned_ref) = guard.owned.as_ref().cloned() {
+                    drop(guard);
+                    tokio::task::spawn_blocking(move || {
+                        let iter = owned_ref
                             .iter()
-                            .map(|(id, (c, v))| {
-                                (
-                                    std::sync::Arc::<[u8]>::from(*id),
-                                    (std::sync::Arc::<[u8]>::from(*c), *v),
-                                )
+                            .map(|(id, (c, v))| (id.as_ref(), (c.as_ref(), *v)));
+                        inner_ref.add_available_items_from_parts(iter)
+                    })
+                    .await
+                    .map_err(Into::<Error>::into)??;
+                    let mut guard = state_ref.lock().unwrap();
+                    guard.attempt = guard.attempt.saturating_add(1);
+                    Ok(())
+                } else {
+                    drop(guard);
+                    let res = match tokio::runtime::Handle::try_current() {
+                        Ok(handle)
+                            if handle.runtime_flavor()
+                                == tokio::runtime::RuntimeFlavor::CurrentThread =>
+                        {
+                            let iter = borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
+                            inner_ref.add_available_items_from_parts(iter)
+                        }
+                        _ => {
+                            let borrowed_ref = std::sync::Arc::clone(&borrowed_ref);
+                            tokio::task::block_in_place(move || {
+                                let iter =
+                                    borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
+                                inner_ref.add_available_items_from_parts(iter)
                             })
-                            .collect();
-                        owned_items = Some(std::sync::Arc::new(owned_vec));
-                    }
-
-                    let exp = 1u64 << attempt.min(20);
-                    let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
-                    let jitter_ms = if ceiling == 0 {
-                        0
-                    } else {
-                        rand::thread_rng().gen_range(0..=ceiling)
+                        }
                     };
-                    tracing::debug!(operation = %"add_available_items_from_parts", attempt = attempt + 1, delay_ms = jitter_ms, "RocksDB Busy: backing off with jitter");
-                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-                    attempt = attempt.saturating_add(1);
+                    let mut guard = state_ref.lock().unwrap();
+                    guard.attempt = guard.attempt.saturating_add(1);
+                    res.map(|_| ())
                 }
             }
-        }
+        })
+        .await
     }
 
     pub async fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
@@ -762,72 +735,59 @@ impl RetriedStorage<Storage> {
     }
 
     pub async fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
-        let lease_copy = *lease; // small copy
+        let lease_copy = *lease;
         let inner = std::sync::Arc::clone(&self.inner);
 
-        const MAX_RETRIES: u32 = 8;
-        const BASE_DELAY_MS: u64 = 10;
-        const MAX_DELAY_MS: u64 = 1000;
+        struct State {
+            attempt: u32,
+            owned_id: Option<std::sync::Arc<[u8]>>,
+        }
+        let state = std::sync::Arc::new(std::sync::Mutex::new(State {
+            attempt: 0,
+            owned_id: None,
+        }));
 
-        let mut attempt: u32 = 0;
-        let mut owned_id: Option<std::sync::Arc<[u8]>> = None;
-
-        loop {
-            let result = if let Some(id_arc) = owned_id.as_ref() {
-                let inner_ref = std::sync::Arc::clone(&inner);
-                let id_arc = std::sync::Arc::clone(id_arc);
-                Ok(tokio::task::spawn_blocking(move || {
-                    inner_ref.remove_in_progress_item(&id_arc, &lease_copy)
-                })
-                .await
-                .map_err(Into::<Error>::into)??)
-            } else {
-                let inner_ref = std::sync::Arc::clone(&inner);
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle)
-                        if handle.runtime_flavor()
-                            == tokio::runtime::RuntimeFlavor::CurrentThread =>
-                    {
-                        inner_ref.remove_in_progress_item(id, &lease_copy)
-                    }
-                    _ => tokio::task::block_in_place(move || {
-                        inner_ref.remove_in_progress_item(id, &lease_copy)
-                    }),
+        with_rocksdb_busy_retry_async("remove_in_progress_item", || {
+            let inner_ref = std::sync::Arc::clone(&inner);
+            let state_ref = std::sync::Arc::clone(&state);
+            let id_ptr = id as *const [u8];
+            async move {
+                let mut guard = state_ref.lock().unwrap();
+                if guard.attempt > 0 && guard.owned_id.is_none() {
+                    let id_ref: &[u8] = unsafe { &*id_ptr };
+                    guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id_ref));
                 }
-            };
 
-            match result {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    let is_busy = matches!(
-                        e,
-                        Error::Rocksdb { ref source, .. } if source.kind() == rocksdb::ErrorKind::Busy
-                    );
-                    if !is_busy {
-                        return Err(e);
-                    }
-                    if attempt >= MAX_RETRIES {
-                        tracing::warn!(operation = %"remove_in_progress_item", attempts = attempt + 1, "RocksDB Busy: giving up after max retries");
-                        return Err(e);
-                    }
-
-                    if owned_id.is_none() {
-                        owned_id = Some(std::sync::Arc::<[u8]>::from(id));
-                    }
-
-                    let exp = 1u64 << attempt.min(20);
-                    let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
-                    let jitter_ms = if ceiling == 0 {
-                        0
-                    } else {
-                        rand::thread_rng().gen_range(0..=ceiling)
-                    };
-                    tracing::debug!(operation = %"remove_in_progress_item", attempt = attempt + 1, delay_ms = jitter_ms, "RocksDB Busy: backing off with jitter");
-                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-                    attempt = attempt.saturating_add(1);
+                if let Some(id_arc) = guard.owned_id.as_ref().cloned() {
+                    drop(guard);
+                    let out = tokio::task::spawn_blocking(move || {
+                        inner_ref.remove_in_progress_item(&id_arc, &lease_copy)
+                    })
+                    .await
+                    .map_err(Into::<Error>::into)??;
+                    let mut guard = state_ref.lock().unwrap();
+                    guard.attempt = guard.attempt.saturating_add(1);
+                    Ok(out)
+                } else {
+                    drop(guard);
+                    let out = match tokio::runtime::Handle::try_current() {
+                        Ok(handle)
+                            if handle.runtime_flavor()
+                                == tokio::runtime::RuntimeFlavor::CurrentThread =>
+                        {
+                            inner_ref.remove_in_progress_item(id, &lease_copy)
+                        }
+                        _ => tokio::task::block_in_place(move || {
+                            inner_ref.remove_in_progress_item(id, &lease_copy)
+                        }),
+                    }?;
+                    let mut guard = state_ref.lock().unwrap();
+                    guard.attempt = guard.attempt.saturating_add(1);
+                    Ok(out)
                 }
             }
-        }
+        })
+        .await
     }
 
     pub async fn expire_due_leases(&self) -> Result<usize> {
