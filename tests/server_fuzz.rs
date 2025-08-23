@@ -58,30 +58,35 @@ proptest! {
         for seq in op_sequences {
             let st = Arc::clone(&storage);
             handles.push(std::thread::spawn(move || -> queueber::errors::Result<()> {
-                for op in seq {
-                    match op {
-                        Op::Add { id, contents, vis_secs } => {
-                            st.add_available_item_from_parts(&id, &contents, vis_secs)?;
-                        }
-                        Op::Poll { n, lease_secs } => {
-                            let (_lease, _items) = st.get_next_available_entries_with_lease(n, lease_secs)?;
-                            // We do not assert on item counts here because of concurrency; the goal
-                            // is to shake races and ensure no panics or invariants are violated.
-                        }
-                        Op::Remove { id } => {
-                            // Try removing under a random/nonexistent lease to exercise paths.
-                            let fake_lease = uuid::Uuid::now_v7().into_bytes();
-                            let _ = st.remove_in_progress_item(&id, &fake_lease)?;
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(async move {
+                    for op in seq {
+                        match op {
+                            Op::Add { id, contents, vis_secs } => {
+                                st.add_available_item_from_parts(&id, &contents, vis_secs).await?;
+                            }
+                            Op::Poll { n, lease_secs } => {
+                                let (_lease, _items) = st.get_next_available_entries_with_lease(n, lease_secs).await?;
+                                // We do not assert on item counts here because of concurrency; the goal
+                                // is to shake races and ensure no panics or invariants are violated.
+                            }
+                            Op::Remove { id } => {
+                                // Try removing under a random/nonexistent lease to exercise paths.
+                                let fake_lease = uuid::Uuid::now_v7().into_bytes();
+                                let _ = st.remove_in_progress_item(&id, &fake_lease).await?;
+                            }
                         }
                     }
-                }
-                Ok(())
+                    queueber::errors::Result::Ok(())
+                })
             }));
         }
 
         // Periodically run the expiry sweeper from the main thread to add pressure.
         for _ in 0..3 {
-            let _ = storage.expire_due_leases();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let st = Arc::clone(&storage);
+            let _ = rt.block_on(async move { st.expire_due_leases().await });
         }
 
         for h in handles { h.join().expect("thread join").expect("thread result"); }
@@ -89,6 +94,7 @@ proptest! {
         // Final integrity check: visibility index entries should either point to
         // an available item or belong to the future; a direct call to the existing
         // poll path should not panic and should respect invariants.
-        let _ = storage.get_next_available_entries(32)?;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _ = rt.block_on(async move { storage.get_next_available_entries(32).await });
     }
 }

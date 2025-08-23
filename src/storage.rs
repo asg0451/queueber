@@ -196,11 +196,9 @@ impl Storage {
             }
 
             // Fetch and decode the item.
-            let Some(main_value) = txn.get_pinned_for_update(&main_key, true)? else {
-                // Stale index entry referencing a missing available key; clean it up.
-                txn.delete(&idx_key)?;
-                continue;
-            };
+            let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
+                Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
+            })?;
             let stored_item_message = serialize::read_message_from_flat_slice(
                 &mut &main_value[..],
                 message::ReaderOptions::new(),
@@ -232,9 +230,11 @@ impl Storage {
 
             // Move the item to in progress and delete the index entry.
             let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
+            // First remove the visibility index so others won't see it.
+            txn.delete(&idx_key)?;
+            // Then move the value from available -> in_progress.
             txn.delete(&main_key)?;
             txn.put(new_main_key.as_ref(), &main_value)?;
-            txn.delete(&idx_key)?;
         }
 
         // If no items were found, return a nil lease and empty polled items. TODO: is this to golangy (:
@@ -352,10 +352,9 @@ impl Storage {
                 LeaseExpiryIndexKey::PREFIX
             );
 
-            // Try to lock the index entry; if missing, skip.
-            if txn.get_pinned_for_update(&idx_key, true)?.is_none() {
-                continue;
-            }
+            let _idx_val = txn.get_pinned_for_update(&idx_key, true)?.ok_or_else(|| {
+                Error::assertion_failed("visibility index entry not found after we scanned it. expiry should be the only one deleting leases (once expiry is single flighted... TODO)")
+            })?;
 
             let (expiry_ts_secs, lease_bytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
 
@@ -367,11 +366,14 @@ impl Storage {
             let lease_key = LeaseKey::from_lease_bytes(lease_bytes);
 
             // Load the lease entry.
-            let Some(lease_value) = txn.get_pinned_for_update(lease_key.as_ref(), true)? else {
-                // Stale expiry index pointing to a missing lease entry; clean it up.
-                txn.delete(&idx_key)?;
-                continue;
-            };
+            let lease_value = txn
+                .get_pinned_for_update(lease_key.as_ref(), true)?
+                .ok_or_else(|| {
+                    Error::assertion_failed(&format!(
+                        "lease entry {:?} not found for expiry index {:?}",
+                        lease_key, idx_key
+                    ))
+                })?;
 
             // TODO: ensure extend doesnt create multiple index entries for the same lease.
 
@@ -492,105 +494,177 @@ fn build_lease_entry_message(
 
 // Retry wrapper that composes busy-retry behavior around a `Storage` instance.
 pub struct RetriedStorage<S> {
-    inner: S,
+    inner: std::sync::Arc<S>,
 }
 
 impl RetriedStorage<Storage> {
     pub fn new(inner: Storage) -> Self {
-        Self { inner }
+        Self {
+            inner: std::sync::Arc::new(inner),
+        }
     }
 
-    pub fn into_inner(self) -> Storage {
+    pub fn into_inner(self) -> std::sync::Arc<Storage> {
         self.inner
     }
 }
 
 impl RetriedStorage<Storage> {
-    pub fn add_available_item_from_parts(
+    pub async fn add_available_item_from_parts(
         &self,
         id: &[u8],
         contents: &[u8],
         visibility_timeout_secs: u64,
     ) -> Result<()> {
-        with_rocksdb_busy_retry("add_available_item_from_parts", || {
-            self.inner
-                .add_available_item_from_parts(id, contents, visibility_timeout_secs)
+        let id_owned = id.to_vec();
+        let contents_owned = contents.to_vec();
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async("add_available_item_from_parts", move || {
+            let id_owned = id_owned.clone();
+            let contents_owned = contents_owned.clone();
+            let inner = std::sync::Arc::clone(&inner);
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    inner.add_available_item_from_parts(
+                        &id_owned,
+                        &contents_owned,
+                        visibility_timeout_secs,
+                    )
+                })
+                .await
+                .map_err(Into::<Error>::into)??;
+                Ok(())
+            }
         })
+        .await
     }
 
-    pub fn add_available_items_from_parts<'a, I>(&self, items: I) -> Result<()>
+    pub async fn add_available_items_from_parts<'a, I>(&self, items: I) -> Result<()>
     where
         I: IntoIterator<Item = (&'a [u8], (&'a [u8], u64))>,
     {
         type OwnedItem = (Vec<u8>, (Vec<u8>, u64));
-        // Collect into owned buffers so we can retry without consuming the iterator.
-        let owned: Vec<OwnedItem> = items
+        let owned_vec: Vec<OwnedItem> = items
             .into_iter()
             .map(|(id, (c, v))| (id.to_vec(), (c.to_vec(), v)))
             .collect();
-        with_rocksdb_busy_retry("add_available_items_from_parts", || {
-            let iter = owned
-                .iter()
-                .map(|(id, (c, v))| (id.as_slice(), (c.as_slice(), *v)));
-            self.inner.add_available_items_from_parts(iter)
+        let owned = std::sync::Arc::new(owned_vec);
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async("add_available_items_from_parts", move || {
+            let owned = std::sync::Arc::clone(&owned);
+            let inner = std::sync::Arc::clone(&inner);
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let iter = owned
+                        .iter()
+                        .map(|(id, (c, v))| (id.as_slice(), (c.as_slice(), *v)));
+                    inner.add_available_items_from_parts(iter)
+                })
+                .await
+                .map_err(Into::<Error>::into)??;
+                Ok(())
+            }
         })
+        .await
     }
 
-    pub fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
-        with_rocksdb_busy_retry("peek_next_visibility_ts_secs", || {
-            self.inner.peek_next_visibility_ts_secs()
+    pub async fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async("peek_next_visibility_ts_secs", move || async move {
+            let out = tokio::task::spawn_blocking(move || inner.peek_next_visibility_ts_secs())
+                .await
+                .map_err(Into::<Error>::into)??;
+            Ok(out)
         })
+        .await
     }
 
-    pub fn get_next_available_entries(
+    pub async fn get_next_available_entries(
         &self,
         n: usize,
     ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
-        with_rocksdb_busy_retry("get_next_available_entries", || {
-            self.inner.get_next_available_entries(n)
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async("get_next_available_entries", move || async move {
+            let out = tokio::task::spawn_blocking(move || inner.get_next_available_entries(n))
+                .await
+                .map_err(Into::<Error>::into)??;
+            Ok(out)
         })
+        .await
     }
 
-    pub fn get_next_available_entries_with_lease(
+    pub async fn get_next_available_entries_with_lease(
         &self,
         n: usize,
         lease_validity_secs: u64,
     ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
-        with_rocksdb_busy_retry("get_next_available_entries_with_lease", || {
-            self.inner
-                .get_next_available_entries_with_lease(n, lease_validity_secs)
-        })
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async(
+            "get_next_available_entries_with_lease",
+            move || async move {
+                let out = tokio::task::spawn_blocking(move || {
+                    inner.get_next_available_entries_with_lease(n, lease_validity_secs)
+                })
+                .await
+                .map_err(Into::<Error>::into)??;
+                Ok(out)
+            },
+        )
+        .await
     }
 
-    pub fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
-        with_rocksdb_busy_retry("remove_in_progress_item", || {
-            self.inner.remove_in_progress_item(id, lease)
+    pub async fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
+        let id = id.to_vec();
+        let lease = *lease;
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async("remove_in_progress_item", move || async move {
+            let out =
+                tokio::task::spawn_blocking(move || inner.remove_in_progress_item(&id, &lease))
+                    .await
+                    .map_err(Into::<Error>::into)??;
+            Ok(out)
         })
+        .await
     }
 
-    pub fn expire_due_leases(&self) -> Result<usize> {
-        with_rocksdb_busy_retry("expire_due_leases", || self.inner.expire_due_leases())
+    pub async fn expire_due_leases(&self) -> Result<usize> {
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async("expire_due_leases", move || async move {
+            let out = tokio::task::spawn_blocking(move || inner.expire_due_leases())
+                .await
+                .map_err(Into::<Error>::into)??;
+            Ok(out)
+        })
+        .await
     }
 
-    pub fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
-        with_rocksdb_busy_retry("extend_lease", || {
-            self.inner.extend_lease(lease, lease_validity_secs)
+    pub async fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
+        let lease = *lease;
+        let inner = std::sync::Arc::clone(&self.inner);
+        with_rocksdb_busy_retry_async("extend_lease", move || async move {
+            let out = tokio::task::spawn_blocking(move || {
+                inner.extend_lease(&lease, lease_validity_secs)
+            })
+            .await
+            .map_err(Into::<Error>::into)??;
+            Ok(out)
         })
+        .await
     }
 }
 
-// Exponential backoff with jitter busy-retry helper used by RetriedStorage.
-fn with_rocksdb_busy_retry<T, F>(name: &str, mut f: F) -> Result<T>
+async fn with_rocksdb_busy_retry_async<T, Fut, F>(name: &str, mut f: F) -> Result<T>
 where
-    F: FnMut() -> Result<T>,
+    Fut: std::future::Future<Output = Result<T>>,
+    F: FnMut() -> Fut,
 {
-    const MAX_RETRIES: u32 = 8; // total attempts = MAX_RETRIES + 1 (initial)
-    const BASE_DELAY_MS: u64 = 10; // starting backoff
-    const MAX_DELAY_MS: u64 = 1000; // cap per attempt
+    const MAX_RETRIES: u32 = 8;
+    const BASE_DELAY_MS: u64 = 10;
+    const MAX_DELAY_MS: u64 = 1000;
 
     let mut attempt: u32 = 0;
     loop {
-        match f() {
+        match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
                 let is_busy = matches!(
@@ -604,17 +678,16 @@ where
                     tracing::warn!(operation = %name, attempts = attempt + 1, "RocksDB Busy: giving up after max retries");
                     return Err(e);
                 }
-                let exp = 1u64 << attempt.min(20); // 2^attempt capped
+                let exp = 1u64 << attempt.min(20);
                 let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
                 let jitter_ms = if ceiling == 0 {
                     0
                 } else {
-                    thread_rng().gen_range(0..=ceiling)
+                    rand::thread_rng().gen_range(0..=ceiling)
                 };
                 tracing::debug!(operation = %name, attempt = attempt + 1, delay_ms = jitter_ms, "RocksDB Busy: backing off with jitter");
-                std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                 attempt = attempt.saturating_add(1);
-                continue;
             }
         }
     }
@@ -1038,7 +1111,15 @@ mod tests {
         // Add 10 items that are immediately visible
         for _ in 0..10 {
             let id = Uuid::now_v7().as_bytes().to_vec();
-            retried.add_available_item_from_parts(&id, b"payload", 0)?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                retried
+                    .add_available_item_from_parts(&id, b"payload", 0)
+                    .await
+            })?;
         }
 
         // Spawn 3 concurrent polls, each trying to get 4 items
@@ -1049,7 +1130,12 @@ mod tests {
             let st = Arc::clone(&retried);
             let results = Arc::clone(&results);
             handles.push(std::thread::spawn(move || -> Result<()> {
-                let (_lease, items) = st.get_next_available_entries(4)?;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let (_lease, items) =
+                    rt.block_on(async { st.get_next_available_entries(4).await })?;
                 let mut item_ids = Vec::new();
                 for item in items {
                     let item_reader = item.get()?;
