@@ -463,6 +463,7 @@ impl Storage {
             serialize::write_message(&mut buf, &out)?;
             txn.put(lease_key.as_ref(), &buf)?;
         }
+        txn.commit()?;
         Ok(true)
     }
 }
