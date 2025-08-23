@@ -195,10 +195,10 @@ impl Storage {
             );
 
             // Attempt to lock the index entry so we know it's ours.
-            if txn.get_pinned_for_update(&idx_key, true)?.is_none() {
+            let Some(main_key) = txn.get_pinned_for_update(&idx_key, true)? else {
                 // We lost the race on this one, try another.
                 continue;
-            }
+            };
 
             // Fetch and decode the item.
             let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
