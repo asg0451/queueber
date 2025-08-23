@@ -101,7 +101,7 @@ impl Storage {
             Uuid::from_slice(id).unwrap_or_default(),
             contents.len(),
             Uuid::from_slice(
-                VisibilityIndexKey::split_ts_and_id(&visibility_index_key.as_ref())
+                VisibilityIndexKey::split_ts_and_id(visibility_index_key.as_ref())
                     .unwrap()
                     .1
             )
@@ -312,11 +312,12 @@ impl Storage {
             let mut msg = message::Builder::new_default(); // TODO: reduce allocs
             let builder = msg.init_root::<protocol::lease_entry::Builder>();
             let mut out_keys = builder.init_keys(keys.len() as u32 - 1);
-            let mut i = 0;
+            let mut new_idx = 0;
+            #[allow(clippy::explicit_counter_loop)] // TODO: clean this up
             for (_, k) in keys.iter().enumerate().filter(|(i, _)| *i != found_idx) {
                 let k = k?;
-                out_keys.set(i as u32, k);
-                i += 1;
+                out_keys.set(new_idx as u32, k);
+                new_idx += 1;
             }
             let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
             serialize::write_message(&mut buf, &msg)?;
@@ -385,7 +386,7 @@ impl Storage {
             // Move each item back to available.
             for id in keys.iter() {
                 let id = id?;
-                let in_progress_key = InProgressKey::from_id(&id);
+                let in_progress_key = InProgressKey::from_id(id);
                 let item_value = txn
                     .get_pinned_for_update(in_progress_key.as_ref(), true)?
                     .ok_or_else(|| {
