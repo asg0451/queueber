@@ -97,11 +97,17 @@ impl Storage {
         self.db.write(batch)?;
 
         tracing::debug!(
-            "inserted item (from parts): ({}: {}), ({}: {})",
-            String::from_utf8_lossy(main_key.as_ref()),
-            String::from_utf8_lossy(&stored_contents),
-            String::from_utf8_lossy(visibility_index_key.as_ref()),
-            String::from_utf8_lossy(main_key.as_ref())
+            "inserted item (from parts): ({}: <contents len: {}>), (viz/{}: avail/{})",
+            Uuid::from_slice(id).unwrap_or_default(),
+            contents.len(),
+            Uuid::from_slice(
+                VisibilityIndexKey::split_ts_and_id(&visibility_index_key.as_ref())
+                    .unwrap()
+                    .1
+            )
+            .unwrap_or_default(),
+            Uuid::from_slice(AvailableKey::id_suffix_from_key_bytes(main_key.as_ref()))
+                .unwrap_or_default()
         );
 
         Ok(())
@@ -162,7 +168,11 @@ impl Storage {
 
         let mut polled_items = Vec::with_capacity(n);
 
-        for kv in viz_iter.take(n) {
+        for kv in viz_iter {
+            if polled_items.len() >= n {
+                break;
+            }
+
             let (idx_key, main_key) = kv?;
 
             let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
@@ -171,18 +181,24 @@ impl Storage {
                 break;
             }
 
-            // Fetch the item. Lock it and its index to prevent races.
-            let _idx_value = txn.get_pinned_for_update(&idx_key, true)?.ok_or_else(|| {
-                Error::assertion_failed(&format!("visibility index entry not found even though we scanned to get here in a txn: {:?}", VisibilityIndexKey::split_ts_and_id(&idx_key)))
+            tracing::debug!(
+                "got visibility index entry: (viz/{}: avail/{})",
+                Uuid::from_slice(VisibilityIndexKey::split_ts_and_id(&idx_key).unwrap().1)
+                    .unwrap_or_default(),
+                Uuid::from_slice(AvailableKey::id_suffix_from_key_bytes(&main_key))
+                    .unwrap_or_default()
+            );
 
-                // `RUST_LOG=debug cargo t concurrent_polls_do_not_get_overlapping_messages -- --nocapture`
-                // shows that the id is only 6 bytes. data corruption? TODO: why???
-            })?;
+            // Attempt to lock the index entry so we know it's ours.
+            if txn.get_pinned_for_update(&idx_key, true)?.is_none() {
+                // We lost the race on this one, try another.
+                continue;
+            }
+
+            // Fetch and decode the item.
             let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
                 Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
             })?;
-
-            // Fetch and decode.
             let stored_item_message =
                 serialize::read_message(&main_value[..], message::ReaderOptions::new())?;
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
@@ -196,9 +212,9 @@ impl Storage {
             );
 
             tracing::debug!(
-                "got stored item: {{id: {}, contents: {}}}",
-                String::from_utf8_lossy(stored_item.get_id()?),
-                String::from_utf8_lossy(stored_item.get_contents()?)
+                "got stored item: (id: {}, contents: <contents len: {}>)",
+                Uuid::from_slice(stored_item.get_id()?).unwrap_or_default(),
+                stored_item.get_contents()?.len()
             );
 
             // Build the polled item.
@@ -231,6 +247,16 @@ impl Storage {
         txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
 
         txn.commit()?;
+
+        tracing::debug!(
+            "handed out lease: {:?} with {} items: {:?}",
+            Uuid::from_bytes(lease),
+            polled_items.len(),
+            polled_items
+                .iter()
+                .map(|i| Uuid::from_slice(i.get().unwrap().get_id().unwrap()).unwrap_or_default())
+                .collect::<Vec<_>>()
+        );
 
         Ok((lease, polled_items))
     }
@@ -872,16 +898,18 @@ mod tests {
     #[test]
     fn concurrent_polls_do_not_get_overlapping_messages() -> Result<()> {
         let _ = tracing_subscriber::fmt()
+            .with_thread_ids(true)
             .with_max_level(tracing::Level::INFO)
+            .with_env_filter(std::env::var("RUST_LOG").unwrap_or_default())
             .try_init();
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let storage = Arc::new(Storage::new(tmp.path()).expect("storage"));
 
         // Add 10 items that are immediately visible
-        for i in 0..10 {
-            let id = format!("item-{}", i);
-            storage.add_available_item_from_parts(id.as_bytes(), b"payload", 0)?;
+        for _ in 0..10 {
+            let id = Uuid::now_v7().as_bytes().to_vec();
+            storage.add_available_item_from_parts(&id, b"payload", 0)?;
         }
 
         // Spawn 3 concurrent polls, each trying to get 4 items
