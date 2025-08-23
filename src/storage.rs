@@ -427,17 +427,15 @@ impl Storage {
                 let (idx2, _v2) = kv2?;
                 if let Some((ts2, lease2)) = LeaseExpiryIndexKey::split_ts_and_lease(&idx2)
                     && lease2 == lease_bytes
+                    && ts2 > expiry_ts_secs
                 {
-                    if ts2 > expiry_ts_secs {
-                        has_newer_expiry_for_lease = true;
-                        // Do not break; continue to consume iterator for fairness, but flag is set
-                    }
+                    has_newer_expiry_for_lease = true;
+                    // Do not break; continue to consume iterator for fairness, but flag is set
                 }
             }
             if has_newer_expiry_for_lease {
                 txn.delete(&idx_key)?;
                 txn.commit()?;
-                processed += 1;
                 continue;
             }
 
@@ -451,7 +449,6 @@ impl Storage {
             if lease_entry_reader.get_expiry_ts_secs() > expiry_ts_secs {
                 txn.delete(&idx_key)?;
                 txn.commit()?;
-                processed += 1;
                 continue;
             }
             let keys = lease_entry_reader.get_keys()?;
