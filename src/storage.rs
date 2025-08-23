@@ -199,8 +199,10 @@ impl Storage {
             let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
                 Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
             })?;
-            let stored_item_message =
-                serialize::read_message(&main_value[..], message::ReaderOptions::new())?;
+            let stored_item_message = serialize::read_message_from_flat_slice(
+                &mut &main_value[..],
+                message::ReaderOptions::new(),
+            )?;
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
             debug_assert!(!stored_item.get_id()?.is_empty());
@@ -348,7 +350,7 @@ impl Storage {
             );
 
             let _idx_val = txn.get_pinned_for_update(&idx_key, true)?.ok_or_else(|| {
-                Error::assertion_failed("visibility index entry not found after we scanned it")
+                Error::assertion_failed("visibility index entry not found after we scanned it. expiry should be the only one deleting leases (once expiry is single flighted... TODO)")
             })?;
 
             let (expiry_ts_secs, lease_bytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
@@ -496,7 +498,6 @@ fn build_lease_entry_message(
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader;
     use std::sync::Arc;
 
     use super::*;
@@ -529,8 +530,8 @@ mod tests {
             .db
             .get(lease_key.as_ref())?
             .ok_or("lease not found")?;
-        let lease_entry = serialize::read_message(
-            BufReader::new(&lease_value[..]),
+        let lease_entry = serialize::read_message_from_flat_slice(
+            &mut &lease_value[..],
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
@@ -582,8 +583,10 @@ mod tests {
                 .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
-            let msg =
-                serialize::read_message(BufReader::new(&value[..]), message::ReaderOptions::new())?;
+            let msg = serialize::read_message_from_flat_slice(
+                &mut &value[..],
+                message::ReaderOptions::new(),
+            )?;
             let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
 
             // available entry must be gone
@@ -601,8 +604,8 @@ mod tests {
             .db
             .get(lease_key.as_ref())?
             .ok_or("lease not found")?;
-        let lease_entry = serialize::read_message(
-            BufReader::new(&lease_value[..]),
+        let lease_entry = serialize::read_message_from_flat_slice(
+            &mut &lease_value[..],
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
@@ -649,8 +652,8 @@ mod tests {
         // lease entry should contain only id2
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
-        let lease_entry = serialize::read_message(
-            BufReader::new(&lease_value[..]),
+        let lease_entry = serialize::read_message_from_flat_slice(
+            &mut &lease_value[..],
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
@@ -723,8 +726,8 @@ mod tests {
         // original lease entry still exists and contains the id
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
-        let lease_entry = serialize::read_message(
-            BufReader::new(&lease_value[..]),
+        let lease_entry = serialize::read_message_from_flat_slice(
+            &mut &lease_value[..],
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
@@ -746,7 +749,7 @@ mod tests {
         scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
 
         // Add and poll to create a lease with 1s expiry
-        storage.add_available_item_from_parts(b"id1", b"p", 0)?;
+        storage.add_available_item_from_parts(Uuid::now_v7().as_bytes(), b"p", 0)?;
         let (lease, items) = storage.get_next_available_entries_with_lease(1, 1)?;
         assert_eq!(items.len(), 1);
 
@@ -824,8 +827,8 @@ mod tests {
             .db
             .get(avail_key.as_ref())?
             .ok_or("missing available value")?;
-        let msg = serialize::read_message(
-            std::io::BufReader::new(&value[..]),
+        let msg = serialize::read_message_from_flat_slice(
+            &mut &value[..],
             message::ReaderOptions::new(),
         )?;
         let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
