@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-capnp = { version = "0.21.4", features = ["rpc_try"] }
+capnp = { version = "0.21.4", features = ["rpc_try", "unaligned"] }
 capnp-rpc = "0.21.0"
 clap = { version = "4.5.20", features = ["derive"] }
 color-eyre = "0.6.5"

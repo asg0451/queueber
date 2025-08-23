@@ -4,10 +4,8 @@
 - [X] (minor) set the rocksdb setting that helps with prefix scans
 - [X] (minor) proper command setup (cli args, etc)
 - [X] (minor) ci
-- [ ] (minor) rocksdb settings tuning
 - [X] (major) server concurrency (either normally or via partitioning)
 - [X] (major) server parallelism
-- [ ] (major) server/storage sharding
 - [X] (major) move storage to an io thread pool
 - [X] (feat) implement lease expiry via a background thread
 - [X] (feat) implement poll in server
@@ -19,21 +17,24 @@
 - [X] (bugfix) polling returns early if it's woken by a new message being added, *even if it isnt visible*.
 - [X] (bugfix) poll-waiting isnt interrupted when a message becomes visible
 - [X] (minor) clean up cursed client stress mode
-- [ ] (minor) perf analysis on queueber while being stressed
 - [X] (minor) integrate tokio console into queueber
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
-- [ ] (perf) improve performance and cpu utilization. see docs/perf-notes.md
-  - [ ] (perf) add `--workers` CLI flag and name RPC worker threads
-  - [ ] (perf) log top-level Tokio runtime metrics at startup (requires `--cfg tokio_unstable`)
-  - [ ] (perf) offload blocking RocksDB work from RPC thread:
-  - [X] `add()` already uses `spawn_blocking`
-  - [X] `poll()` wraps `get_next_available_entries_with_lease` in `spawn_blocking`
-  - [X] `remove()` wraps `remove_in_progress_item` in `spawn_blocking`
-  - [ ] `extend()` wraps in spawn blocking?
-  - [ ] (perf) improve wakeups: replace `Notify` with a versioned `watch<u64>` epoch channel to avoid lost wakeups and stampedes
-  - [X] (perf) de-duplicate background tasks: run single `lease_expiry` and `visibility_wakeup` in top-level runtime
-  - [X] (perf) batch DB moves in `get_next_available_entries_with_lease` into a single transaction
-  - [ ] (perf) RocksDB tuning: increase parallelism/background jobs and add bloom filters
-  - [X] (perf) switch to unpacked Cap’n Proto serialization (`capnp::serialize`) everywhere
-  - [ ] (perf) per-worker accept via `SO_REUSEPORT`
-  - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
+- [ ] (minor) perf analysis on queueber while being stressed
+- [ ] (minor) make sure all storage stuff happens within a spawn_blocking or similar
+- [ ] (minor) rocksdb settings tuning
+- [ ] (major) server/storage sharding
+- [ ] (major) fix server parallelism -- it's not right currently
+- [ ] (major) make sure there's only one copy of each background task running in the system
+- [ ] (bugfix) why does the server just shut down under stress after a while with exit code 0 ...
+- [ ] (perf) add `--workers` CLI flag and name RPC worker threads
+- [ ] (perf) improve poll wakeups
+- [ ] (perf) per-worker accept via `SO_REUSEPORT`
+- [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
+- [ ] (minor) rename keys to ids in `LeaseEntry`, or actually put keys in there. either way
+- [ ] (minor) make `add_available_item_from_parts` wrap `add_available_items_from_parts`, not the other way around
+- [ ] (minor) use a mockable clock when generating uuidv7s
+- [ ] (minor) use a mockable clock when generating uuidv7s
+- [ ] (perf) reduce unnecessary allocs, such as when copying data or allocating buffers. some is called out in code comments
+- [ ] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
+- [ ] (major) ensure `extend` doesnt create multiple index entries for the same lease.
+- [ ] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending

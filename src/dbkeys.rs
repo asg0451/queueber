@@ -1,5 +1,9 @@
 //! Strongly-typed wrappers for RocksDB keys to avoid prefix mixups.
 
+use std::backtrace::Backtrace;
+
+use crate::errors::{Error, Result};
+
 /// Key for items that are available to be polled: `b"available/" + id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableKey(Vec<u8>);
@@ -105,28 +109,36 @@ impl VisibilityIndexKey {
     }
 
     /// Parse the visible-at timestamp (secs since epoch) from a visibility index key.
-    /// Returns None if the key is malformed or doesn't have enough bytes.
-    pub fn parse_visible_ts_secs(idx_key: &[u8]) -> Option<u64> {
+    pub fn parse_visible_ts_secs(idx_key: &[u8]) -> Result<u64> {
+        debug_assert_eq!(
+            &idx_key[..VisibilityIndexKey::PREFIX.len()],
+            VisibilityIndexKey::PREFIX
+        );
+
         let ts_start = Self::PREFIX.len();
         let ts_end = ts_start + 8;
         if idx_key.len() < ts_end + 1 {
-            // need at least trailing '/' after ts
-            return None;
+            return Err(Error::AssertionFailed {
+                msg: format!("malformed key: {:?}", idx_key),
+                backtrace: Backtrace::capture(),
+            });
         }
         let mut ts_be = [0u8; 8];
         ts_be.copy_from_slice(&idx_key[ts_start..ts_end]);
-        Some(u64::from_be_bytes(ts_be))
+        Ok(u64::from_be_bytes(ts_be))
     }
 
     /// Split a visibility index key into (timestamp_secs, id_slice).
-    /// Returns None if the key is malformed.
-    pub fn split_ts_and_id(idx_key: &[u8]) -> Option<(u64, &[u8])> {
+    pub fn split_ts_and_id(idx_key: &[u8]) -> Result<(u64, &[u8])> {
         let ts = Self::parse_visible_ts_secs(idx_key)?;
         let id_start = Self::PREFIX.len() + 8 + 1; // prefix + ts + '/'
         if id_start > idx_key.len() {
-            return None;
+            return Err(Error::AssertionFailed {
+                msg: format!("malformed key: {:?}", idx_key),
+                backtrace: Backtrace::capture(),
+            });
         }
-        Some((ts, &idx_key[id_start..]))
+        Ok((ts, &idx_key[id_start..]))
     }
 }
 
@@ -174,24 +186,35 @@ impl LeaseExpiryIndexKey {
         &self.0
     }
 
-    pub fn parse_expiry_ts_secs(idx_key: &[u8]) -> Option<u64> {
+    pub fn parse_expiry_ts_secs(idx_key: &[u8]) -> Result<u64> {
         let ts_start = Self::PREFIX.len();
         let ts_end = ts_start + 8;
         if idx_key.len() < ts_end + 1 {
-            return None;
+            return Err(Error::assertion_failed(&format!(
+                "malformed key: {:?}",
+                idx_key
+            )));
         }
         let mut ts_be = [0u8; 8];
         ts_be.copy_from_slice(&idx_key[ts_start..ts_end]);
-        Some(u64::from_be_bytes(ts_be))
+        Ok(u64::from_be_bytes(ts_be))
     }
 
-    pub fn split_ts_and_lease(idx_key: &[u8]) -> Option<(u64, &[u8])> {
+    pub fn split_ts_and_lease(idx_key: &[u8]) -> Result<(u64, &[u8])> {
+        debug_assert_eq!(
+            &idx_key[..LeaseExpiryIndexKey::PREFIX.len()],
+            LeaseExpiryIndexKey::PREFIX
+        );
+
         let ts = Self::parse_expiry_ts_secs(idx_key)?;
         let lease_start = Self::PREFIX.len() + 8 + 1; // prefix + ts + '/'
         if lease_start > idx_key.len() {
-            return None;
+            return Err(Error::assertion_failed(&format!(
+                "malformed key: {:?}",
+                idx_key
+            )));
         }
-        Some((ts, &idx_key[lease_start..]))
+        Ok((ts, &idx_key[lease_start..]))
     }
 }
 
