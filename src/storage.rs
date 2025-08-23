@@ -1,6 +1,9 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize;
-use rocksdb::{OptimisticTransactionDB, Options, SliceTransform, WriteBatchWithTransaction};
+use rocksdb::{
+    Direction, IteratorMode, OptimisticTransactionDB, Options, ReadOptions, SliceTransform,
+    WriteBatchWithTransaction,
+};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -164,7 +167,16 @@ impl Storage {
         // Find the next n items that are available and visible.
         // Use a transaction for consistency, though I don't like paying the cost for it.
         let txn = self.db.transaction();
-        let viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
+        // Bind all reads/iteration in this poll to a single snapshot
+        let snap = txn.snapshot();
+        let mut ro_iter = ReadOptions::default();
+        ro_iter.set_snapshot(&snap);
+        let mut ro_get = ReadOptions::default();
+        ro_get.set_snapshot(&snap);
+        // Prefix-bounded forward iterator from the prefix start
+        let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
+        // iterator_opt takes ReadOptions by value; pass ownership of ro_iter here.
+        let viz_iter = txn.iterator_opt(mode, ro_iter);
 
         let mut polled_items = Vec::with_capacity(n);
 
@@ -190,13 +202,16 @@ impl Storage {
             );
 
             // Attempt to lock the index entry so we know it's ours.
-            if txn.get_pinned_for_update(&idx_key, true)?.is_none() {
+            if txn
+                .get_pinned_for_update_opt(&idx_key, true, &ro_get)?
+                .is_none()
+            {
                 // We lost the race on this one, try another.
                 continue;
             }
 
             // Fetch and decode the item.
-            let Some(main_value) = txn.get_pinned_for_update(&main_key, true)? else {
+            let Some(main_value) = txn.get_pinned_for_update_opt(&main_key, true, &ro_get)? else {
                 // Another transaction likely moved/deleted the main value after we scanned
                 // the index. Clean up the stale index entry and continue.
                 txn.delete(&idx_key)?;
@@ -259,6 +274,7 @@ impl Storage {
         txn.put(lease_key.as_ref(), &lease_entry_bs)?;
         txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
 
+        drop(snap);
         txn.commit()?;
 
         tracing::debug!(
@@ -405,8 +421,27 @@ impl Storage {
 
                 // Write the item back to available, and add a visibility index entry.
                 let avail_key = AvailableKey::from_id(id);
-                txn.put(avail_key.as_ref(), &item_value)?;
+                // Overwrite the stored item's embedded visibility index key to the new one
+                let stored_msg = serialize::read_message_from_flat_slice(
+                    &mut &item_value[..],
+                    message::ReaderOptions::new(),
+                )?;
+                let mut builder = capnp::message::Builder::new_default();
+                {
+                    let item_reader = stored_msg.get_root::<protocol::stored_item::Reader>()?;
+                    let mut stored_item = builder.init_root::<protocol::stored_item::Builder>();
+                    stored_item.set_contents(item_reader.get_contents()?);
+                    stored_item.set_id(item_reader.get_id()?);
+                    // set below after vis_idx_now computed
+                }
                 let vis_idx_now = VisibilityIndexKey::from_visible_ts_and_id(now_secs, id);
+                {
+                    let mut stored_item = builder.get_root::<protocol::stored_item::Builder>()?;
+                    stored_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
+                }
+                let mut updated = Vec::with_capacity(builder.size_in_words() * 8);
+                serialize::write_message(&mut updated, &builder)?;
+                txn.put(avail_key.as_ref(), &updated)?;
                 txn.put(vis_idx_now.as_ref(), avail_key.as_ref())?;
                 txn.delete(in_progress_key.as_ref())?;
             }
@@ -542,21 +577,22 @@ impl RetriedStorage<Storage> {
             let id_ptr = id as *const [u8];
             let contents_ptr = contents as *const [u8];
             async move {
-                let mut guard = state_ref.lock().unwrap();
-                if guard.attempt > 0 && guard.owned.is_none() {
-                    // Safety: we only deref these pointers synchronously before await
-                    let id_ref: &[u8] = unsafe { &*id_ptr };
-                    let contents_ref: &[u8] = unsafe { &*contents_ptr };
-                    guard.owned = Some((
-                        std::sync::Arc::<[u8]>::from(id_ref),
-                        std::sync::Arc::<[u8]>::from(contents_ref),
-                    ));
+                {
+                    let mut guard = state_ref.lock().unwrap();
+                    if guard.attempt > 0 && guard.owned.is_none() {
+                        // Safety: we only deref these pointers synchronously before await
+                        let id_ref: &[u8] = unsafe { &*id_ptr };
+                        let contents_ref: &[u8] = unsafe { &*contents_ptr };
+                        guard.owned = Some((
+                            std::sync::Arc::<[u8]>::from(id_ref),
+                            std::sync::Arc::<[u8]>::from(contents_ref),
+                        ));
+                    }
                 }
-
-                if let Some((ref id_arc, ref contents_arc)) = guard.owned {
-                    let id_arc = std::sync::Arc::clone(id_arc);
-                    let contents_arc = std::sync::Arc::clone(contents_arc);
-                    drop(guard);
+                if let Some((id_arc, contents_arc)) = {
+                    let guard = state_ref.lock().unwrap();
+                    guard.owned.as_ref().cloned()
+                } {
                     tokio::task::spawn_blocking(move || {
                         inner_ref.add_available_item_from_parts(
                             &id_arc,
@@ -571,7 +607,6 @@ impl RetriedStorage<Storage> {
                     Ok(())
                 } else {
                     // First attempt: zero-copy direct or block_in_place depending on runtime
-                    drop(guard);
                     let res = match tokio::runtime::Handle::try_current() {
                         Ok(handle)
                             if handle.runtime_flavor()
@@ -626,22 +661,23 @@ impl RetriedStorage<Storage> {
             let state_ref = std::sync::Arc::clone(&state);
             let borrowed_ref = std::sync::Arc::clone(&borrowed_arc);
             async move {
-                let mut guard = state_ref.lock().unwrap();
-                if guard.attempt > 0 && guard.owned.is_none() {
-                    let owned_vec: Vec<OwnedItem> = borrowed_ref
-                        .iter()
-                        .map(|(id, (c, v))| {
-                            (
-                                std::sync::Arc::<[u8]>::from(*id),
-                                (std::sync::Arc::<[u8]>::from(*c), *v),
-                            )
-                        })
-                        .collect();
-                    guard.owned = Some(std::sync::Arc::new(owned_vec));
+                {
+                    let mut guard = state_ref.lock().unwrap();
+                    if guard.attempt > 0 && guard.owned.is_none() {
+                        let owned_vec: Vec<OwnedItem> = borrowed_ref
+                            .iter()
+                            .map(|(id, (c, v))| {
+                                (
+                                    std::sync::Arc::<[u8]>::from(*id),
+                                    (std::sync::Arc::<[u8]>::from(*c), *v),
+                                )
+                            })
+                            .collect();
+                        guard.owned = Some(std::sync::Arc::new(owned_vec));
+                    }
                 }
 
-                if let Some(owned_ref) = guard.owned.as_ref().cloned() {
-                    drop(guard);
+                if let Some(owned_ref) = { state_ref.lock().unwrap().owned.as_ref().cloned() } {
                     tokio::task::spawn_blocking(move || {
                         let iter = owned_ref
                             .iter()
@@ -654,7 +690,6 @@ impl RetriedStorage<Storage> {
                     guard.attempt = guard.attempt.saturating_add(1);
                     Ok(())
                 } else {
-                    drop(guard);
                     let res = match tokio::runtime::Handle::try_current() {
                         Ok(handle)
                             if handle.runtime_flavor()
@@ -752,14 +787,15 @@ impl RetriedStorage<Storage> {
             let state_ref = std::sync::Arc::clone(&state);
             let id_ptr = id as *const [u8];
             async move {
-                let mut guard = state_ref.lock().unwrap();
-                if guard.attempt > 0 && guard.owned_id.is_none() {
-                    let id_ref: &[u8] = unsafe { &*id_ptr };
-                    guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id_ref));
+                {
+                    let mut guard = state_ref.lock().unwrap();
+                    if guard.attempt > 0 && guard.owned_id.is_none() {
+                        let id_ref: &[u8] = unsafe { &*id_ptr };
+                        guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id_ref));
+                    }
                 }
 
-                if let Some(id_arc) = guard.owned_id.as_ref().cloned() {
-                    drop(guard);
+                if let Some(id_arc) = { state_ref.lock().unwrap().owned_id.as_ref().cloned() } {
                     let out = tokio::task::spawn_blocking(move || {
                         inner_ref.remove_in_progress_item(&id_arc, &lease_copy)
                     })
@@ -769,7 +805,6 @@ impl RetriedStorage<Storage> {
                     guard.attempt = guard.attempt.saturating_add(1);
                     Ok(out)
                 } else {
-                    drop(guard);
                     let out = match tokio::runtime::Handle::try_current() {
                         Ok(handle)
                             if handle.runtime_flavor()
