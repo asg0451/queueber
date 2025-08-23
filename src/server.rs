@@ -211,7 +211,9 @@ impl crate::protocol::queue::Server for Server {
         Promise::from_future(async move {
             let removed = tokio::task::Builder::new()
                 .name("remove_in_progress_item")
-                .spawn_blocking(move || storage.remove_in_progress_item(id_owned.as_slice(), &lease))?
+                .spawn_blocking(move || {
+                    storage.remove_in_progress_item(id_owned.as_slice(), &lease)
+                })?
                 .await
                 .map_err(Into::<Error>::into)??;
 
@@ -299,12 +301,16 @@ impl crate::protocol::queue::Server for Server {
         let mut lease: [u8; 16] = [0; 16];
         lease.copy_from_slice(lease_bytes);
 
-        let extended = self
-            .storage
-            .extend_lease(&lease, lease_validity_secs)
-            .map_err(Into::into)?;
-        results.get().init_resp().set_extended(extended);
-        Promise::ok(())
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let extended = tokio::task::Builder::new()
+                .name("extend_lease")
+                .spawn_blocking(move || storage.extend_lease(&lease, lease_validity_secs))?
+                .await
+                .map_err(Into::<Error>::into)??;
+            results.get().init_resp().set_extended(extended);
+            Ok(())
+        })
     }
 }
 
