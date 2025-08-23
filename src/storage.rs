@@ -149,6 +149,31 @@ impl Storage {
         n: usize,
         lease_validity_secs: u64,
     ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
+        let mut last_err: Option<Error> = None;
+        for _attempt in 0..5 {
+            match self.try_get_next_available_entries_with_lease(n, lease_validity_secs) {
+                Ok(v) => return Ok(v),
+                Err(e @ Error::Rocksdb { .. }) => {
+                    let s = e.to_string();
+                    if s.contains("Resource busy") || s.contains("Busy") {
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::assertion_failed("unknown rocksdb busy error")))
+    }
+
+    fn try_get_next_available_entries_with_lease(
+        &self,
+        n: usize,
+        lease_validity_secs: u64,
+    ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
         // Create a lease and its expiry index entry
         let now = std::time::SystemTime::now();
         let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -160,8 +185,7 @@ impl Storage {
         let lease_expiry_index_key =
             LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, &lease);
 
-        // Find the next n items that are available and visible.
-        // Use a transaction for consistency, though I don't like paying the cost for it.
+        // Use a transaction for consistency
         let txn = self.db.transaction();
         let viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
 
@@ -176,87 +200,57 @@ impl Storage {
 
             let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
             if visible_at_secs > now_secs {
-                // Because keys are ordered by timestamp, we can stop scanning.
                 break;
             }
 
-            tracing::debug!(
-                "got visibility index entry: (viz/{}: avail/{})",
-                Uuid::from_slice(VisibilityIndexKey::split_ts_and_id(&idx_key).unwrap().1)
-                    .unwrap_or_default(),
-                Uuid::from_slice(AvailableKey::id_suffix_from_key_bytes(&main_key))
-                    .unwrap_or_default()
-            );
-
-            // Attempt to lock the index entry so we know it's ours.
+            // Lock the index entry
             if txn.get_pinned_for_update(&idx_key, true)?.is_none() {
-                // We lost the race on this one, try another.
                 continue;
             }
 
-            // Fetch and decode the item.
-            let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
-                Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
-            })?;
+            // Fetch and decode the item; if missing, delete stale index and continue
+            let Some(main_value) = txn.get_pinned_for_update(&main_key, true)? else {
+                txn.delete(&idx_key)?;
+                continue;
+            };
             let stored_item_message = serialize::read_message_from_flat_slice(
                 &mut &main_value[..],
                 message::ReaderOptions::new(),
             )?;
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
-            debug_assert!(!stored_item.get_id()?.is_empty());
-            debug_assert!(!stored_item.get_contents()?.is_empty());
-            debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
-            debug_assert_eq!(
-                stored_item.get_id()?,
-                AvailableKey::id_suffix_from_key_bytes(&main_key)
-            );
-
-            tracing::debug!(
-                "got stored item: (id: {}, contents: <contents len: {}>)",
-                Uuid::from_slice(stored_item.get_id()?).unwrap_or_default(),
-                stored_item.get_contents()?.len()
-            );
-
             // Build the polled item.
-            let mut builder = message::Builder::new_default(); // TODO: reduce allocs
+            let mut builder = message::Builder::new_default();
             let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
             polled_item.set_contents(stored_item.get_contents()?);
             polled_item.set_id(stored_item.get_id()?);
             let polled_item = builder.into_typed().into_reader();
             polled_items.push(polled_item);
 
-            // Move the item to in progress and delete the index entry.
+            // Move the item to in progress and delete the index entry
             let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
             txn.delete(&main_key)?;
             txn.put(new_main_key.as_ref(), &main_value)?;
             txn.delete(&idx_key)?;
         }
 
-        // If no items were found, return a nil lease and empty polled items. TODO: is this to golangy (:
         if polled_items.is_empty() {
             return Ok((Uuid::nil().into_bytes(), Vec::new()));
         }
 
-        // Build the lease entry.
+        // Build the lease entry and write it with the expiry index
         let lease_entry = build_lease_entry_message(lease_validity_secs, &polled_items)?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
+        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
-        // Write the lease entry and its expiry index
         txn.put(lease_key.as_ref(), &lease_entry_bs)?;
         txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
-
         txn.commit()?;
 
         tracing::debug!(
-            "handed out lease: {:?} with {} items: {:?}",
+            "handed out lease: {:?} with {} items",
             Uuid::from_bytes(lease),
             polled_items.len(),
-            polled_items
-                .iter()
-                .map(|i| Uuid::from_slice(i.get().unwrap().get_id().unwrap()).unwrap_or_default())
-                .collect::<Vec<_>>()
         );
 
         Ok((lease, polled_items))
