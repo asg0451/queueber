@@ -26,7 +26,7 @@
 - [ ] (major) fix server parallelism -- it's not right currently
 - [ ] (major) make sure there's only one copy of each background task running in the system
 - [ ] (bugfix) why does the server just shut down under stress after a while with exit code 0 ...
-- [ ] (perf) add `--workers` CLI flag and name RPC worker threads
+- [X] (perf) add `--workers` CLI flag and name RPC worker threads
 - [ ] (perf) improve poll wakeups
 - [ ] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)

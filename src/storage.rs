@@ -434,17 +434,12 @@ impl Storage {
 
         // Find current expiry index entry for this lease and delete it.
         // TODO: add this index entry to the lease entry so we can do a point lookup.
-        let mut existing_idx_key: Option<Vec<u8>> = None;
         for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
             let (idx_key, _val) = kv?;
             let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
-            if lbytes == lease {
-                existing_idx_key = Some(idx_key.to_vec());
-                break;
+            if lbytes == lease && idx_key.as_ref() != new_idx_key.as_ref() {
+                txn.delete(&idx_key)?;
             }
-        }
-        if let Some(k) = existing_idx_key {
-            txn.delete(&k)?;
         }
 
         // Update the lease entry's expiryTsSecs while preserving keys
