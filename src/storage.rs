@@ -152,7 +152,7 @@ impl Storage {
         // Create a lease and its expiry index entry
         let now = std::time::SystemTime::now();
         let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        let lease = Uuid::now_v7().into_bytes(); // TODO: use a mockable clock
+        let lease = Uuid::now_v7().into_bytes();
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
             .duration_since(std::time::UNIX_EPOCH)?
@@ -283,7 +283,6 @@ impl Storage {
 
         // Parse lease entry and verify it contains the id.
         // TODO: make the keys inside sorted so we can binary search for the id.
-        // TODO: use this api everywhere.
         let lease_msg = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
             message::ReaderOptions::new(),

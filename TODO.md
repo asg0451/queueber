@@ -30,3 +30,11 @@
 - [ ] (perf) improve poll wakeups
 - [ ] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
+- [ ] (minor) rename keys to ids in `LeaseEntry`, or actually put keys in there. either way
+- [ ] (minor) make `add_available_item_from_parts` wrap `add_available_items_from_parts`, not the other way around
+- [ ] (minor) use a mockable clock when generating uuidv7s
+- [ ] (minor) use a mockable clock when generating uuidv7s
+- [ ] (perf) reduce unnecessary allocs, such as when copying data or allocating buffers. some is called out in code comments
+- [ ] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
+- [ ] (major) ensure `extend` doesnt create multiple index entries for the same lease.
+- [ ] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending
