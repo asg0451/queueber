@@ -136,6 +136,7 @@ impl Storage {
         }
     }
 
+    // used in tests only
     pub fn get_next_available_entries(
         &self,
         n: usize,
@@ -465,6 +466,26 @@ impl Storage {
         }
         txn.commit()?;
         Ok(true)
+    }
+}
+
+// TODO: not very ergonomic to use
+pub async fn retry_on_resource_busy<F>(_name: &str, f: F) -> Result<()>
+where
+    F: Fn() -> Result<()> + Send + Sync + 'static,
+{
+    let f = std::sync::Arc::new(f);
+    loop {
+        let f_cloned = std::sync::Arc::clone(&f);
+        // Run on a blocking thread
+        let res = tokio::task::spawn_blocking(move || (f_cloned)()).await?;
+        match res {
+            Ok(()) => return Ok(()),
+            Err(Error::Rocksdb { ref source, .. }) if source.kind() == rocksdb::ErrorKind::Busy => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
