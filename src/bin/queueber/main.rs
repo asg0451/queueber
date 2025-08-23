@@ -4,7 +4,10 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
-use queueber::{server::Server, storage::Storage};
+use queueber::{
+    server::Server,
+    storage::{RetriedStorage, Storage},
+};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -63,7 +66,7 @@ async fn main() -> Result<()> {
         std::fs::remove_dir_all(&args.data_dir)?;
     }
 
-    let storage = Arc::new(Storage::new(&args.data_dir)?);
+    let storage = Arc::new(RetriedStorage::new(Storage::new(&args.data_dir)?));
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 

@@ -5,16 +5,16 @@ use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Duration;
 
-use crate::Storage;
-use crate::errors::{Error, Result};
+use crate::errors::Result;
 use crate::protocol::queue::{
     AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
+use crate::storage::{RetriedStorage, Storage};
 
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs
 pub struct Server {
-    storage: Arc<Storage>,
+    storage: Arc<RetriedStorage<Storage>>,
     notify: Arc<Notify>,
     #[allow(dead_code)]
     shutdown_tx: watch::Sender<bool>,
@@ -22,7 +22,7 @@ pub struct Server {
 
 impl Server {
     pub fn new(
-        storage: Arc<Storage>,
+        storage: Arc<RetriedStorage<Storage>>,
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
@@ -35,7 +35,7 @@ impl Server {
 }
 
 pub fn spawn_background_tasks(
-    storage: Arc<Storage>,
+    storage: Arc<RetriedStorage<Storage>>,
     notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
 ) {
@@ -48,29 +48,19 @@ pub fn spawn_background_tasks(
     tokio::task::Builder::new()
         .name("lease_expiry")
         .spawn(async move {
+            let st = Arc::clone(&bg_storage);
             loop {
-                let st = Arc::clone(&bg_storage);
-                match tokio::task::Builder::new()
-                    .name("expire_due_leases")
-                    .spawn_blocking(move || st.expire_due_leases())
-                    .unwrap()
-                    .await
-                {
-                    Ok(Ok(n)) => {
+                match st.expire_due_leases().await {
+                    Ok(n) => {
                         if n > 0 {
                             bg_notify.notify_one();
                         }
                     }
-                    Ok(Err(_e)) => {
-                        let _ = lease_expiry_shutdown.send(true);
-                        break;
-                    }
-                    Err(_join_err) => {
+                    Err(_e) => {
                         let _ = lease_expiry_shutdown.send(true);
                         break;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         })
         .unwrap();
@@ -83,17 +73,10 @@ pub fn spawn_background_tasks(
         .spawn(async move {
             loop {
                 // Peek earliest visibility timestamp from RocksDB (blocking)
-                let next_vis_opt = tokio::task::Builder::new()
-                    .name("peek_next_visibility_ts_secs")
-                    .spawn_blocking({
-                        let st = Arc::clone(&vis_storage);
-                        move || st.peek_next_visibility_ts_secs()
-                    })
-                    .unwrap()
-                    .await;
+                let next_vis_opt = vis_storage.peek_next_visibility_ts_secs().await;
 
                 match next_vis_opt {
-                    Ok(Ok(Some(ts_secs))) => {
+                    Ok(Some(ts_secs)) => {
                         // Compute duration until visibility; if already visible, notify now.
                         let now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -109,18 +92,12 @@ pub fn spawn_background_tasks(
                             vis_notify.notify_one();
                         }
                     }
-                    Ok(Ok(None)) => {
+                    Ok(None) => {
                         // No items; back off
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
-                    // TODO: can this be prettier?
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         tracing::error!("peek_next_visibility_ts_secs: {}", e);
-                        let _ = visibility_wakeup_shutdown.send(true);
-                        break;
-                    }
-                    Err(join_err) => {
-                        tracing::error!("peek_next_visibility_ts_secs: {}", join_err);
                         let _ = visibility_wakeup_shutdown.send(true);
                         break;
                     }
@@ -161,17 +138,11 @@ impl crate::protocol::queue::Server for Server {
 
         Promise::from_future(async move {
             // Offload RocksDB work to the blocking thread pool.
-            tokio::task::Builder::new()
-                .name("add_available_items_from_parts")
-                .spawn_blocking(move || {
-                    let iter = ids
-                        .iter()
-                        .map(|id| id.as_slice())
-                        .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
-                    storage.add_available_items_from_parts(iter)
-                })?
-                .await
-                .map_err(Into::<Error>::into)??;
+            let iter = ids
+                .iter()
+                .map(|id| id.as_slice())
+                .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+            storage.add_available_items_from_parts(iter).await?;
 
             if any_immediately_visible {
                 notify.notify_one();
@@ -209,13 +180,9 @@ impl crate::protocol::queue::Server for Server {
 
         let storage = Arc::clone(&self.storage);
         Promise::from_future(async move {
-            let removed = tokio::task::Builder::new()
-                .name("remove_in_progress_item")
-                .spawn_blocking(move || {
-                    storage.remove_in_progress_item(id_owned.as_slice(), &lease)
-                })?
-                .await
-                .map_err(Into::<Error>::into)??;
+            let removed = storage
+                .remove_in_progress_item(id_owned.as_slice(), &lease)
+                .await?;
 
             results.get().init_resp().set_removed(removed);
             Ok(())
@@ -247,16 +214,9 @@ impl crate::protocol::queue::Server for Server {
             };
 
             loop {
-                let (lease, items) = tokio::task::Builder::new()
-                    .name("get_next_available_entries_with_lease")
-                    .spawn_blocking({
-                        let st = Arc::clone(&storage);
-                        move || {
-                            st.get_next_available_entries_with_lease(num_items, lease_validity_secs)
-                        }
-                    })?
-                    .await
-                    .map_err(Into::<Error>::into)??;
+                let (lease, items) = storage
+                    .get_next_available_entries_with_lease(num_items, lease_validity_secs)
+                    .await?;
                 if !items.is_empty() {
                     write_poll_response(&lease, items, &mut results)?;
                     return Ok(());
@@ -301,12 +261,12 @@ impl crate::protocol::queue::Server for Server {
         let mut lease: [u8; 16] = [0; 16];
         lease.copy_from_slice(lease_bytes);
 
-        let extended = self
-            .storage
-            .extend_lease(&lease, lease_validity_secs)
-            .map_err(Into::into)?;
-        results.get().init_resp().set_extended(extended);
-        Promise::ok(())
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let extended = storage.extend_lease(&lease, lease_validity_secs).await?;
+            results.get().init_resp().set_extended(extended);
+            Ok(())
+        })
     }
 }
 

@@ -5,7 +5,7 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use queueber::protocol;
 use queueber::protocol::queue;
-use queueber::storage::Storage;
+use queueber::storage::{RetriedStorage, Storage};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
@@ -166,7 +166,7 @@ fn ensure_server_started() -> &'static ServerHandle {
                 use std::sync::Arc;
 
                 let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-                let storage = Arc::new(Storage::new(&data_path).unwrap());
+                let storage = Arc::new(RetriedStorage::new(Storage::new(&data_path).unwrap()));
                 let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
                 let notify = Arc::new(tokio::sync::Notify::new());
                 let server = Server::new(storage, notify, shutdown_tx);

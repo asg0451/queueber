@@ -1465,6 +1465,7 @@ dependencies = [
  "criterion",
  "futures 0.3.31",
  "proptest",
+ "rand 0.8.5",
  "rocksdb",
  "scopeguard",
  "tempfile",
