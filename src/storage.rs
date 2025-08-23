@@ -149,117 +149,107 @@ impl Storage {
         n: usize,
         lease_validity_secs: u64,
     ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
-        // Create a lease and its expiry index entry
-        let now = std::time::SystemTime::now();
-        let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        let lease = Uuid::now_v7().into_bytes();
-        let lease_key = LeaseKey::from_lease_bytes(&lease);
-        let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let lease_expiry_index_key =
-            LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, &lease);
+        let max_retries = 8u32;
+        for _ in 0..max_retries {
+            // Create a lease and its expiry index entry
+            let now = std::time::SystemTime::now();
+            let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            let lease = Uuid::now_v7().into_bytes();
+            let lease_key = LeaseKey::from_lease_bytes(&lease);
+            let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let lease_expiry_index_key =
+                LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, &lease);
 
-        // Find the next n items that are available and visible.
-        // Use a transaction for consistency, though I don't like paying the cost for it.
-        let txn = self.db.transaction();
-        let viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
+            // Find the next n items that are available and visible.
+            // Use a transaction for consistency, though I don't like paying the cost for it.
+            let txn = self.db.transaction();
+            let viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
 
-        let mut polled_items = Vec::with_capacity(n);
+            let mut polled_items = Vec::with_capacity(n);
 
-        for kv in viz_iter {
-            if polled_items.len() >= n {
-                break;
+            for kv in viz_iter {
+                if polled_items.len() >= n {
+                    break;
+                }
+
+                let (idx_key, main_key) = kv?;
+
+                let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
+                if visible_at_secs > now_secs {
+                    // Because keys are ordered by timestamp, we can stop scanning.
+                    break;
+                }
+
+                // Attempt to lock the index entry so we know it's ours.
+                if txn.get_pinned_for_update(&idx_key, true)?.is_none() {
+                    // We lost the race on this one, try another.
+                    continue;
+                }
+
+                // Fetch and decode the item.
+                let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
+                    Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
+                })?;
+                let stored_item_message = serialize::read_message_from_flat_slice(
+                    &mut &main_value[..],
+                    message::ReaderOptions::new(),
+                )?;
+                let stored_item =
+                    stored_item_message.get_root::<protocol::stored_item::Reader>()?;
+
+                debug_assert!(!stored_item.get_id()?.is_empty());
+                debug_assert!(!stored_item.get_contents()?.is_empty());
+                debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
+                debug_assert_eq!(
+                    stored_item.get_id()?,
+                    AvailableKey::id_suffix_from_key_bytes(&main_key)
+                );
+
+                // Build the polled item.
+                let mut builder = message::Builder::new_default(); // TODO: reduce allocs
+                let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
+                polled_item.set_contents(stored_item.get_contents()?);
+                polled_item.set_id(stored_item.get_id()?);
+                let polled_item = builder.into_typed().into_reader();
+                polled_items.push(polled_item);
+
+                // Move the item to in progress and delete the index entry.
+                let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
+                txn.delete(&main_key)?;
+                txn.put(new_main_key.as_ref(), &main_value)?;
+                txn.delete(&idx_key)?;
             }
 
-            let (idx_key, main_key) = kv?;
-
-            let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
-            if visible_at_secs > now_secs {
-                // Because keys are ordered by timestamp, we can stop scanning.
-                break;
+            // If no items were found, return a nil lease and empty polled items.
+            if polled_items.is_empty() {
+                return Ok((Uuid::nil().into_bytes(), Vec::new()));
             }
 
-            tracing::debug!(
-                "got visibility index entry: (viz/{}: avail/{})",
-                Uuid::from_slice(VisibilityIndexKey::split_ts_and_id(&idx_key).unwrap().1)
-                    .unwrap_or_default(),
-                Uuid::from_slice(AvailableKey::id_suffix_from_key_bytes(&main_key))
-                    .unwrap_or_default()
-            );
+            // Build the lease entry.
+            let lease_entry = build_lease_entry_message(lease_validity_secs, &polled_items)?;
+            let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
+            serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
-            // Attempt to lock the index entry so we know it's ours.
-            if txn.get_pinned_for_update(&idx_key, true)?.is_none() {
-                // We lost the race on this one, try another.
-                continue;
+            // Write the lease entry and its expiry index
+            txn.put(lease_key.as_ref(), &lease_entry_bs)?;
+            txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
+
+            match txn.commit() {
+                Ok(()) => {
+                    return Ok((lease, polled_items));
+                }
+                Err(e) => {
+                    if e.as_ref().to_string().contains("Resource busy") {
+                        // retry
+                        continue;
+                    }
+                    return Err(e.into());
+                }
             }
-
-            // Fetch and decode the item.
-            let main_value = txn.get_pinned_for_update(&main_key, true)?.ok_or_else(|| {
-                Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
-            })?;
-            let stored_item_message = serialize::read_message_from_flat_slice(
-                &mut &main_value[..],
-                message::ReaderOptions::new(),
-            )?;
-            let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
-
-            debug_assert!(!stored_item.get_id()?.is_empty());
-            debug_assert!(!stored_item.get_contents()?.is_empty());
-            debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
-            debug_assert_eq!(
-                stored_item.get_id()?,
-                AvailableKey::id_suffix_from_key_bytes(&main_key)
-            );
-
-            tracing::debug!(
-                "got stored item: (id: {}, contents: <contents len: {}>)",
-                Uuid::from_slice(stored_item.get_id()?).unwrap_or_default(),
-                stored_item.get_contents()?.len()
-            );
-
-            // Build the polled item.
-            let mut builder = message::Builder::new_default(); // TODO: reduce allocs
-            let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
-            polled_item.set_contents(stored_item.get_contents()?);
-            polled_item.set_id(stored_item.get_id()?);
-            let polled_item = builder.into_typed().into_reader();
-            polled_items.push(polled_item);
-
-            // Move the item to in progress and delete the index entry.
-            let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
-            txn.delete(&main_key)?;
-            txn.put(new_main_key.as_ref(), &main_value)?;
-            txn.delete(&idx_key)?;
         }
-
-        // If no items were found, return a nil lease and empty polled items. TODO: is this to golangy (:
-        if polled_items.is_empty() {
-            return Ok((Uuid::nil().into_bytes(), Vec::new()));
-        }
-
-        // Build the lease entry.
-        let lease_entry = build_lease_entry_message(lease_validity_secs, &polled_items)?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
-        serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
-
-        // Write the lease entry and its expiry index
-        txn.put(lease_key.as_ref(), &lease_entry_bs)?;
-        txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
-
-        txn.commit()?;
-
-        tracing::debug!(
-            "handed out lease: {:?} with {} items: {:?}",
-            Uuid::from_bytes(lease),
-            polled_items.len(),
-            polled_items
-                .iter()
-                .map(|i| Uuid::from_slice(i.get().unwrap().get_id().unwrap()).unwrap_or_default())
-                .collect::<Vec<_>>()
-        );
-
-        Ok((lease, polled_items))
+        Err(Error::assertion_failed("poll commit busy too many times"))
     }
 
     /// Remove an in-progress item if the provided lease currently owns it.
@@ -281,19 +271,18 @@ impl Storage {
             return Ok(false);
         };
 
-        // Parse lease entry and verify it contains the id.
-        // TODO: make the keys inside sorted so we can binary search for the id.
+        // Parse lease entry and verify it contains the id using binary search.
         let lease_msg = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
             message::ReaderOptions::new(),
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let keys = lease_entry_reader.get_keys()?;
-        let Some((found_idx, _)) = keys
-            .iter()
-            .enumerate()
-            .find(|(_, k)| k.as_ref().ok() == Some(&id))
-        else {
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(keys.len() as usize);
+        for i in 0..keys.len() {
+            slices.push(keys.get(i)?);
+        }
+        let Ok(found_idx) = slices.binary_search_by(|probe| (*probe).cmp(id)) else {
             return Ok(false);
         };
 
@@ -311,9 +300,12 @@ impl Storage {
             let builder = msg.init_root::<protocol::lease_entry::Builder>();
             let mut out_keys = builder.init_keys(keys.len() as u32 - 1);
             let mut new_idx = 0;
-            #[allow(clippy::explicit_counter_loop)] // TODO: clean this up
-            for (_, k) in keys.iter().enumerate().filter(|(i, _)| *i != found_idx) {
-                let k = k?;
+            // Copy all keys except the one at found_idx; maintains sorted order.
+            for i in 0..keys.len() {
+                if (i as usize) == found_idx {
+                    continue;
+                }
+                let k = keys.get(i)?;
                 out_keys.set(new_idx as u32, k);
                 new_idx += 1;
             }
@@ -468,6 +460,7 @@ impl Storage {
             serialize::write_message(&mut buf, &out)?;
             txn.put(lease_key.as_ref(), &buf)?;
         }
+        txn.commit()?;
         Ok(true)
     }
 }
@@ -487,10 +480,18 @@ fn build_lease_entry_message(
     let mut lease_entry = message::Builder::new_default();
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(lease_validity_secs);
-    let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
-    for (i, typed_item) in polled_items.iter().enumerate() {
+
+    // Collect ids and sort them to allow binary search.
+    let mut ids: Vec<&[u8]> = Vec::with_capacity(polled_items.len());
+    for typed_item in polled_items.iter() {
         let item_reader: protocol::polled_item::Reader = typed_item.get()?;
-        lease_entry_keys.set(i as u32, item_reader.get_id()?);
+        ids.push(item_reader.get_id()?);
+    }
+    ids.sort_unstable();
+
+    let mut lease_entry_keys = lease_entry_builder.init_keys(ids.len() as u32);
+    for (i, id) in ids.iter().enumerate() {
+        lease_entry_keys.set(i as u32, id);
     }
     Ok(lease_entry)
 }
@@ -503,6 +504,48 @@ mod tests {
     use crate::protocol;
     use capnp::message::{Builder, HeapAllocator};
     use uuid::Uuid;
+
+    #[test]
+    fn lease_entry_keys_are_sorted() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_sorted_keys";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // Insert items with out-of-order ids
+        for id in [b"c".as_slice(), b"a".as_slice(), b"b".as_slice()].iter() {
+            let mut msg = Builder::new_default();
+            let item = make_item(&mut msg);
+            storage.add_available_item((*id, item))?;
+        }
+
+        let (lease, items) = storage.get_next_available_entries(3)?;
+        assert_eq!(items.len(), 3);
+
+        // Read lease entry and assert keys are sorted
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage
+            .db
+            .get(lease_key.as_ref())?
+            .ok_or("lease not found")?;
+        let msg = serialize::read_message_from_flat_slice(
+            &mut &lease_value[..],
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = msg.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        let mut collected: Vec<Vec<u8>> = Vec::new();
+        for i in 0..keys.len() {
+            collected.push(keys.get(i)?.to_vec());
+        }
+        let mut sorted = collected.clone();
+        sorted.sort();
+        assert_eq!(collected, sorted);
+        Ok(())
+    }
 
     #[test]
     fn e2e_test() -> std::result::Result<(), Box<dyn std::error::Error>> {

@@ -35,6 +35,6 @@
 - [ ] (minor) use a mockable clock when generating uuidv7s
 - [ ] (minor) use a mockable clock when generating uuidv7s
 - [ ] (perf) reduce unnecessary allocs, such as when copying data or allocating buffers. some is called out in code comments
-- [ ] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
+- [X] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
 - [ ] (major) ensure `extend` doesnt create multiple index entries for the same lease.
 - [ ] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending
