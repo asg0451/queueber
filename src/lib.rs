@@ -8,4 +8,5 @@ pub mod server;
 pub mod storage;
 
 // Re-export commonly used types
+pub use crate::storage::RetriedStorage;
 pub use crate::storage::Storage;

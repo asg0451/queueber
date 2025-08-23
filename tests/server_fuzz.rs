@@ -3,7 +3,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use proptest::strategy::Strategy;
 
-use queueber::Storage;
+use queueber::{RetriedStorage, Storage};
 
 // This is a randomized, concurrent integration test that attempts to find
 // race conditions around add -> poll -> remove flows. It generates a mix of
@@ -49,7 +49,8 @@ proptest! {
     #[test]
     fn randomized_concurrent_ops(op_sequences in proptest::collection::vec(proptest::collection::vec(arb_op(), 25..60), 3..6)) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(Storage::new(tmp.path()).expect("storage"));
+        let storage = Storage::new(tmp.path()).expect("storage");
+        let storage = Arc::new(RetriedStorage::new(storage));
 
         // Spawn one thread per sequence; each sequence is a list of operations
         // this thread will perform against the shared storage.
