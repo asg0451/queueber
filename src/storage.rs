@@ -234,6 +234,8 @@ impl Storage {
             // Important: Although the transaction commits atomically, readers without a
             // snapshot may interleave reads (index then main). Deleting the index first
             // ensures concurrent readers don't see an index that points to a deleted main.
+            // NOTE: i dont think this is true lmao and it's still broken in any case.
+            // TODO: use snapshots in txns maybe that will help
             txn.delete(&idx_key)?;
             // Then move the value from available -> in_progress.
             txn.delete(&main_key)?;

@@ -20,8 +20,9 @@
 - [X] (minor) integrate tokio console into queueber
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
 - [ ] (minor) perf analysis on queueber while being stressed
-- [ ] (minor) make sure all storage stuff happens within a spawn_blocking or similar
+- [X] (minor) make sure all storage stuff happens within a spawn_blocking or similar
 - [ ] (minor) rocksdb settings tuning
+- [ ] (test) add extend to fuzz test and stress
 - [ ] (major) server/storage sharding
 - [ ] (major) fix server parallelism -- it's not right currently
 - [ ] (major) make sure there's only one copy of each background task running in the system
@@ -33,8 +34,8 @@
 - [ ] (minor) rename keys to ids in `LeaseEntry`, or actually put keys in there. either way
 - [ ] (minor) make `add_available_item_from_parts` wrap `add_available_items_from_parts`, not the other way around
 - [ ] (minor) use a mockable clock when generating uuidv7s
-- [ ] (minor) use a mockable clock when generating uuidv7s
 - [ ] (perf) reduce unnecessary allocs, such as when copying data or allocating buffers. some is called out in code comments
 - [ ] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
 - [ ] (major) ensure `extend` doesnt create multiple index entries for the same lease.
 - [ ] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending
+- [ ] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency.
