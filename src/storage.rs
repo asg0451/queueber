@@ -9,7 +9,7 @@ use crate::dbkeys::{
 };
 use crate::errors::{Error, Result};
 use crate::protocol;
-use rand::{Rng, thread_rng};
+use rand::Rng;
 
 pub struct Storage {
     db: OptimisticTransactionDB,
