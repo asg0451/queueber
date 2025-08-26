@@ -7,12 +7,22 @@ use futures::AsyncReadExt;
 
 use queueber::protocol::queue;
 use queueber::storage::{RetriedStorage, Storage};
+use tokio::sync::watch;
 
 struct TestServerHandle {
     _data_dir: tempfile::TempDir,
-    thread: Option<std::thread::JoinHandle<()>>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    _thread: Option<std::thread::JoinHandle<()>>,
     addr: SocketAddr,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl Drop for TestServerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self._thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn start_test_server() -> TestServerHandle {
@@ -26,8 +36,8 @@ fn start_test_server() -> TestServerHandle {
     let (ready_tx, ready_rx) = sync_channel::<()>(1);
 
     let data_path = data_dir.path().to_path_buf();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let shutdown_tx_for_thread = shutdown_tx.clone();
+    let (shutdown_tx, _shutdown_rx_unused) = watch::channel(false);
+    let shutdown_tx_for_handle = shutdown_tx.clone();
     let thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -39,16 +49,16 @@ fn start_test_server() -> TestServerHandle {
             use queueber::server::Server;
             use std::sync::Arc;
             use tokio::sync::Notify;
-
+            let mut shutdown_rx = shutdown_tx.subscribe();
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let storage = Arc::new(RetriedStorage::new(Storage::new(&data_path).unwrap()));
             let notify = Arc::new(Notify::new());
             queueber::server::spawn_background_tasks(
                 Arc::clone(&storage),
                 Arc::clone(&notify),
-                shutdown_tx_for_thread.clone(),
+                shutdown_tx.clone(),
             );
-            let server = Server::new(storage, notify, shutdown_tx_for_thread);
+            let server = Server::new(storage, notify, shutdown_tx.clone());
             let queue_client: QueueClient = capnp_rpc::new_client(server);
 
             // Indicate that the server is ready to accept connections
@@ -58,21 +68,26 @@ fn start_test_server() -> TestServerHandle {
                 .run_until(async move {
                     loop {
                         tokio::select! {
-                            _ = async { if *shutdown_rx.borrow() {} else { let _ = shutdown_rx.changed().await; } } => {
-                                break;
-                            }
-                            res = listener.accept() => {
-                                let (stream, _) = res.unwrap();
+                            _ = async {
+                                if *shutdown_rx.borrow() { } else { let _ = shutdown_rx.changed().await; }
+                            } => { break; }
+                            accept_res = listener.accept() => {
+                                let (stream, _) = accept_res.unwrap();
                                 stream.set_nodelay(true).unwrap();
-                                let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+                                let (reader, writer) =
+                                    tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
                                 let network = twoparty::VatNetwork::new(
                                     futures::io::BufReader::new(reader),
                                     futures::io::BufWriter::new(writer),
                                     rpc_twoparty_capnp::Side::Server,
                                     Default::default(),
                                 );
-                                let rpc_system = RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
-                                let _jh = tokio::task::Builder::new().name("rpc_system").spawn_local(rpc_system).unwrap();
+                                let rpc_system =
+                                    RpcSystem::new(Box::new(network), Some(queue_client.clone().client));
+                                let _jh = tokio::task::Builder::new()
+                                    .name("rpc_system")
+                                    .spawn_local(rpc_system)
+                                    .unwrap();
                             }
                         }
                     }
@@ -86,18 +101,9 @@ fn start_test_server() -> TestServerHandle {
 
     TestServerHandle {
         _data_dir: data_dir,
-        thread: Some(thread),
-        shutdown_tx,
+        _thread: Some(thread),
         addr,
-    }
-}
-
-impl Drop for TestServerHandle {
-    fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        shutdown_tx: shutdown_tx_for_handle,
     }
 }
 
