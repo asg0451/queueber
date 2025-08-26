@@ -592,16 +592,15 @@ fn build_lease_entry_message(
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
     lease_entry_builder.set_expiry_ts_index_key(expiry_index_key_bytes);
-    // Index-sort: sort indices by the referenced id without copying id bytes
+    // Write ids unsorted first.
     let n = polled_items.len();
+    // Index-sort without copying id bytes: O(n log n) and stable enough for our use
     let mut idxs: Vec<usize> = (0..n).collect();
     idxs.sort_unstable_by(|&a, &b| {
-        // Safe: polled_items elements are valid readers
         let ar: protocol::polled_item::Reader = polled_items[a].get().expect("reader");
         let br: protocol::polled_item::Reader = polled_items[b].get().expect("reader");
         ar.get_id().expect("id").cmp(br.get_id().expect("id"))
     });
-
     let mut out_ids = lease_entry_builder.init_ids(n as u32);
     for (i, src_idx) in idxs.into_iter().enumerate() {
         let r: protocol::polled_item::Reader = polled_items[src_idx].get()?;
