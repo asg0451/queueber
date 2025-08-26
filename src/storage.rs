@@ -14,6 +14,51 @@ use crate::errors::{Error, Result};
 use crate::protocol;
 use rand::Rng;
 
+#[inline]
+fn binary_search_by_index<'a, F>(len: u32, mut get_at: F, needle: &[u8]) -> Option<usize>
+where
+    F: FnMut(u32) -> Option<&'a [u8]>,
+{
+    if len == 0 {
+        return None;
+    }
+    let mut lo: i32 = 0;
+    let mut hi: i32 = (len as i32) - 1;
+    while lo <= hi {
+        let mid = lo + ((hi - lo) / 2);
+        let mid_id = get_at(mid as u32)?;
+        match mid_id.cmp(needle) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid - 1,
+            std::cmp::Ordering::Equal => return Some(mid as usize),
+        }
+    }
+    None
+}
+
+#[inline]
+fn debug_assert_sorted_by_index<'a, F>(len: u32, mut get_at: F)
+where
+    F: FnMut(u32) -> Option<&'a [u8]>,
+{
+    #[cfg(debug_assertions)]
+    {
+        if len == 0 {
+            return;
+        }
+        let mut prev = get_at(0);
+        let mut i = 1u32;
+        while i < len {
+            let cur = get_at(i);
+            if let (Some(p), Some(c)) = (prev, cur) {
+                debug_assert!(p <= c, "ids not sorted at {}", i);
+            }
+            prev = cur;
+            i += 1;
+        }
+    }
+}
+
 pub struct Storage {
     db: OptimisticTransactionDB,
 }
@@ -319,35 +364,8 @@ impl Storage {
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let ids = lease_entry_reader.get_ids()?;
-        // Debug assert sorted order without allocation
-        #[cfg(debug_assertions)]
-        {
-            let mut prev: Option<&[u8]> = None;
-            for item in ids.iter() {
-                let Ok(cur) = item else { break };
-                if let Some(p) = prev {
-                    debug_assert!(p <= cur, "LeaseEntry ids not sorted");
-                }
-                prev = Some(cur);
-            }
-        }
-        // Zero-allocation binary search over capnp list
-        let mut lo: i32 = 0;
-        let mut hi: i32 = (ids.len() as i32) - 1;
-        let mut found_idx: Option<usize> = None;
-        while lo <= hi {
-            let mid = lo + ((hi - lo) / 2);
-            let mid_id = ids.get(mid as u32)?;
-            match mid_id.cmp(id) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid - 1,
-                std::cmp::Ordering::Equal => {
-                    found_idx = Some(mid as usize);
-                    break;
-                }
-            }
-        }
-        let Some(found_idx) = found_idx else {
+        debug_assert_sorted_by_index(ids.len(), |i| ids.get(i).ok());
+        let Some(found_idx) = binary_search_by_index(ids.len(), |i| ids.get(i).ok(), id) else {
             return Ok(false);
         };
 
@@ -574,17 +592,20 @@ fn build_lease_entry_message(
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
     lease_entry_builder.set_expiry_ts_index_key(expiry_index_key_bytes);
-    // Collect ids as borrowed slices and sort without allocating copies.
-    let mut ids: Vec<&[u8]> = Vec::with_capacity(polled_items.len());
-    for typed_item in polled_items.iter() {
-        let item_reader: protocol::polled_item::Reader = typed_item.get()?;
-        ids.push(item_reader.get_id()?);
-    }
-    ids.sort_unstable();
+    // Index-sort: sort indices by the referenced id without copying id bytes
+    let n = polled_items.len();
+    let mut idxs: Vec<usize> = (0..n).collect();
+    idxs.sort_unstable_by(|&a, &b| {
+        // Safe: polled_items elements are valid readers
+        let ar: protocol::polled_item::Reader = polled_items[a].get().expect("reader");
+        let br: protocol::polled_item::Reader = polled_items[b].get().expect("reader");
+        ar.get_id().expect("id").cmp(br.get_id().expect("id"))
+    });
 
-    let mut out_ids = lease_entry_builder.init_ids(ids.len() as u32);
-    for (i, id) in ids.into_iter().enumerate() {
-        out_ids.set(i as u32, id);
+    let mut out_ids = lease_entry_builder.init_ids(n as u32);
+    for (i, src_idx) in idxs.into_iter().enumerate() {
+        let r: protocol::polled_item::Reader = polled_items[src_idx].get()?;
+        out_ids.set(i as u32, r.get_id()?);
     }
     Ok(lease_entry)
 }
