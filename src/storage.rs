@@ -1,8 +1,8 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize;
 use rocksdb::{
-    Direction, IteratorMode, OptimisticTransactionDB, Options, ReadOptions, SliceTransform,
-    WriteBatchWithTransaction,
+    Direction, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options,
+    ReadOptions, SliceTransform, WriteBatchWithTransaction, WriteOptions,
 };
 use std::path::Path;
 use uuid::Uuid;
@@ -165,17 +165,18 @@ impl Storage {
             LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, &lease);
 
         // Find the next n items that are available and visible.
-        // Use a transaction for consistency, though I don't like paying the cost for it.
-        let txn = self.db.transaction();
-        // Bind all reads/iteration in this poll to a single snapshot
-        let snap = txn.snapshot();
+        // Use a transaction for consistency and bind to a snapshot.
+        let mut txn_opts = OptimisticTransactionOptions::default();
+        txn_opts.set_snapshot(true);
+        let txn = self.db.transaction_opt(&WriteOptions::default(), &txn_opts);
+        // Create read options bound to the txn snapshot for both iterator and gets
+        let snapshot = txn.snapshot();
         let mut ro_iter = ReadOptions::default();
-        ro_iter.set_snapshot(&snap);
+        ro_iter.set_snapshot(&snapshot);
         let mut ro_get = ReadOptions::default();
-        ro_get.set_snapshot(&snap);
-        // Prefix-bounded forward iterator from the prefix start
+        ro_get.set_snapshot(&snapshot);
+        // Prefix-bounded forward iterator from the prefix start using the snapshot-bound ReadOptions
         let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
-        // iterator_opt takes ReadOptions by value; pass ownership of ro_iter here.
         let viz_iter = txn.iterator_opt(mode, ro_iter);
 
         let mut polled_items = Vec::with_capacity(n);
@@ -274,7 +275,7 @@ impl Storage {
         txn.put(lease_key.as_ref(), &lease_entry_bs)?;
         txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
 
-        drop(snap);
+        drop(snapshot);
         txn.commit()?;
 
         tracing::debug!(
@@ -389,15 +390,14 @@ impl Storage {
 
             let lease_key = LeaseKey::from_lease_bytes(lease_bytes);
 
-            // Load the lease entry.
-            let lease_value = txn
-                .get_pinned_for_update(lease_key.as_ref(), true)?
-                .ok_or_else(|| {
-                    Error::assertion_failed(&format!(
-                        "lease entry {:?} not found for expiry index {:?}",
-                        lease_key, idx_key
-                    ))
-                })?;
+            // Load the lease entry. If it's not found, we lost the race with another call and that's fine; move on.
+            let Some(lease_value) = txn.get_pinned_for_update(lease_key.as_ref(), true)? else {
+                tracing::debug!(
+                    "lease entry not found after we scanned it. ignoring. lease: {:?}",
+                    Uuid::from_slice(lease_bytes).unwrap_or_default()
+                );
+                continue;
+            };
 
             // TODO: ensure extend doesnt create multiple index entries for the same lease.
 
@@ -1384,6 +1384,32 @@ mod tests {
             10,
             "Expected exactly 10 items total across all polls"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn expire_due_leases_ignores_orphaned_index_entries() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Create an orphaned expiry index entry in the past that points to a non-existent lease
+        let lease = Uuid::now_v7().into_bytes();
+        let past_secs = (std::time::SystemTime::now() - std::time::Duration::from_secs(2))
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(past_secs, &lease);
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+
+        storage.db.put(idx_key.as_ref(), lease_key.as_ref())?;
+
+        // Should not error and should process zero leases
+        let processed = storage.expire_due_leases()?;
+        assert_eq!(processed, 0);
 
         Ok(())
     }

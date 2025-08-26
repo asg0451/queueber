@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
 
+    std::fs::create_dir_all(&args.data_dir)?;
     if args.wipe {
         std::fs::remove_dir_all(&args.data_dir)?;
     }
@@ -138,6 +139,7 @@ async fn main() -> Result<()> {
                         })
                         .await;
                 });
+                tracing::info!("worker thread {} exiting", i);
             })
             .expect("spawn worker thread");
         worker_handles.push(handle);
@@ -149,6 +151,7 @@ async fn main() -> Result<()> {
         loop {
             tokio::select! {
                 _ = async { if *shutdown_rx.borrow() { } else { let _ = shutdown_rx.changed().await; } } => {
+                    tracing::info!("accept loop shutting down due to shutdown signal");
                     break 'accept Ok(())
                 }
                 accept = listener.accept() => {
@@ -161,11 +164,13 @@ async fn main() -> Result<()> {
             }
         }
     };
+    tracing::info!("accept loop exiting");
 
     drop(senders);
     for handle in worker_handles {
         let _ = handle.join();
     }
+    tracing::info!("workers joined; main loop exiting");
     accept_outcome
 }
 
