@@ -375,15 +375,14 @@ impl Storage {
 
             let lease_key = LeaseKey::from_lease_bytes(lease_bytes);
 
-            // Load the lease entry.
-            let lease_value = txn
-                .get_pinned_for_update(lease_key.as_ref(), true)?
-                .ok_or_else(|| {
-                    Error::assertion_failed(&format!(
-                        "lease entry {:?} not found for expiry index {:?}",
-                        lease_key, idx_key
-                    ))
-                })?;
+            // Load the lease entry. If it's not found, we lost the race with another call and that's fine; move on.
+            let Some(lease_value) = txn.get_pinned_for_update(lease_key.as_ref(), true)? else {
+                tracing::debug!(
+                    "lease entry not found after we scanned it. ignoring. lease: {:?}",
+                    Uuid::from_slice(&lease_bytes[..]).unwrap_or_default()
+                );
+                continue;
+            };
 
             // TODO: ensure extend doesnt create multiple index entries for the same lease.
 
@@ -1216,6 +1215,32 @@ mod tests {
             10,
             "Expected exactly 10 items total across all polls"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn expire_due_leases_ignores_orphaned_index_entries() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Create an orphaned expiry index entry in the past that points to a non-existent lease
+        let lease = Uuid::now_v7().into_bytes();
+        let past_secs = (std::time::SystemTime::now() - std::time::Duration::from_secs(2))
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(past_secs, &lease);
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+
+        storage.db.put(idx_key.as_ref(), lease_key.as_ref())?;
+
+        // Should not error and should process zero leases
+        let processed = storage.expire_due_leases()?;
+        assert_eq!(processed, 0);
 
         Ok(())
     }
