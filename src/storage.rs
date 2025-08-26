@@ -173,6 +173,7 @@ impl Storage {
         let snapshot = txn.snapshot();
         let mut ro_iter = ReadOptions::default();
         ro_iter.set_snapshot(&snapshot);
+        ro_iter.set_prefix_same_as_start(true);
         let mut ro_get = ReadOptions::default();
         ro_get.set_snapshot(&snapshot);
         // Prefix-bounded forward iterator from the prefix start using the snapshot-bound ReadOptions
@@ -212,12 +213,11 @@ impl Storage {
             }
 
             // Fetch and decode the item.
-            let Some(main_value) = txn.get_pinned_for_update_opt(&main_key, true, &ro_get)? else {
-                // Another transaction likely moved/deleted the main value after we scanned
-                // the index. Clean up the stale index entry and continue.
-                txn.delete(&idx_key)?;
-                continue;
-            };
+            let main_value = txn
+                .get_pinned_for_update_opt(&main_key, true, &ro_get)?
+                .ok_or_else(|| {
+                    Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
+                })?;
             let stored_item_message = serialize::read_message_from_flat_slice(
                 &mut &main_value[..],
                 message::ReaderOptions::new(),
@@ -1410,6 +1410,52 @@ mod tests {
         // Should not error and should process zero leases
         let processed = storage.expire_due_leases()?;
         assert_eq!(processed, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn poll_reads_main_with_snapshot_even_if_deleted_after_lock() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Add one immediately visible item
+        let id = b"snaptest";
+        storage.add_available_item_from_parts(id, b"payload", 0)?;
+
+        // Begin a transaction with a snapshot
+        let mut txn_opts = rocksdb::OptimisticTransactionOptions::default();
+        txn_opts.set_snapshot(true);
+        let txn = storage
+            .db
+            .transaction_opt(&rocksdb::WriteOptions::default(), &txn_opts);
+
+        // Iterate visibility index and capture the first entry
+        let mut viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
+        let (idx_key, main_key) = viz_iter
+            .next()
+            .expect("expected at least one visibility index entry")?;
+
+        // Lock the visibility index entry so we simulate the poller owning it
+        let locked = txn.get_pinned_for_update(&idx_key, true)?;
+        assert!(locked.is_some(), "failed to lock visibility index entry");
+
+        // Delete the main key outside the transaction after we've taken the snapshot
+        let main_key_vec = main_key.as_ref().to_vec();
+        storage.db.delete(&main_key_vec)?;
+
+        // Read using the transaction's snapshot; this should still see the value
+        let mut ropts = rocksdb::ReadOptions::default();
+        ropts.set_snapshot(&txn.snapshot());
+        let got = txn.get_pinned_for_update_opt(&main_key_vec, true, &ropts)?;
+        assert!(
+            got.is_some(),
+            "snapshot read should see the main value even if concurrently deleted"
+        );
 
         Ok(())
     }
