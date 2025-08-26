@@ -264,7 +264,11 @@ impl Storage {
         }
 
         // Build the lease entry.
-        let lease_entry = build_lease_entry_message(lease_validity_secs, &polled_items)?;
+        let lease_entry = build_lease_entry_message(
+            expiry_ts_secs,
+            lease_expiry_index_key.as_bytes(),
+            &polled_items,
+        )?;
         let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
         serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
@@ -334,7 +338,15 @@ impl Storage {
             // Rebuild lease entry with remaining keys.
             // TODO: this could be done more efficiently by unifying the above search and this one.
             let mut msg = message::Builder::new_default(); // TODO: reduce allocs
-            let builder = msg.init_root::<protocol::lease_entry::Builder>();
+            let mut builder = msg.init_root::<protocol::lease_entry::Builder>();
+            // Preserve expiry fields from the existing lease entry
+            builder.set_expiry_ts_secs(lease_entry_reader.get_expiry_ts_secs());
+            let prev_idx_key = lease_entry_reader
+                .get_expiry_ts_index_key()
+                .unwrap_or_default();
+            if !prev_idx_key.is_empty() {
+                builder.set_expiry_ts_index_key(prev_idx_key);
+            }
             let mut out_keys = builder.init_ids(ids.len() as u32 - 1);
             let mut new_idx = 0;
             #[allow(clippy::explicit_counter_loop)] // TODO: clean this up
@@ -479,21 +491,8 @@ impl Storage {
         let new_idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, lease);
         txn.put(new_idx_key.as_ref(), lease_key.as_ref())?;
 
-        // Find current expiry index entries for this lease and delete them after iteration
-        // TODO: add this index entry to the lease entry so we can do a point lookup.
-        let mut old_expiry_keys: Vec<Vec<u8>> = Vec::new();
-        for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
-            let (idx_key, _val) = kv?;
-            let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
-            if lbytes == lease && idx_key.as_ref() != new_idx_key.as_ref() {
-                old_expiry_keys.push(idx_key.to_vec());
-            }
-        }
-        for k in old_expiry_keys {
-            txn.delete(&k)?;
-        }
-
-        // Update the lease entry's expiryTsSecs while preserving keys
+        // Update the lease entry: delete old expiry index (if present in entry),
+        // then set the new expiry ts and index key while preserving ids.
         if let Some(lease_value) = txn.get_pinned_for_update(lease_key.as_ref(), true)? {
             let lease_msg = serialize::read_message_from_flat_slice(
                 &mut &lease_value[..],
@@ -501,11 +500,30 @@ impl Storage {
             )?;
             let lease_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
             let keys = lease_reader.get_ids()?;
+            // If the entry contains a previous expiry index key, delete it directly.
+            let prev_idx_key = lease_reader.get_expiry_ts_index_key().unwrap_or_default();
+            if !prev_idx_key.is_empty() && prev_idx_key != new_idx_key.as_bytes() {
+                txn.delete(prev_idx_key)?;
+            } else if prev_idx_key.is_empty() {
+                // Fallback for pre-migration entries: scan and delete other keys for this lease
+                let mut old_expiry_keys: Vec<Vec<u8>> = Vec::new();
+                for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
+                    let (idx_key, _val) = kv?;
+                    let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
+                    if lbytes == lease && idx_key.as_ref() != new_idx_key.as_ref() {
+                        old_expiry_keys.push(idx_key.to_vec());
+                    }
+                }
+                for k in old_expiry_keys {
+                    txn.delete(&k)?;
+                }
+            }
 
             // TODO: do this with set_root or some such / more efficiently.
             let mut out = message::Builder::new_default();
             let mut builder = out.init_root::<protocol::lease_entry::Builder>();
             builder.set_expiry_ts_secs(expiry_ts_secs);
+            builder.set_expiry_ts_index_key(new_idx_key.as_bytes());
             let mut out_keys = builder.reborrow().init_ids(keys.len());
             for i in 0..keys.len() {
                 out_keys.set(i, keys.get(i)?);
@@ -526,14 +544,16 @@ type PolledItemOwnedReader =
     TypedReader<capnp::message::Builder<message::HeapAllocator>, protocol::polled_item::Owned>;
 
 fn build_lease_entry_message(
-    lease_validity_secs: u64,
+    expiry_ts_secs: u64,
+    expiry_index_key_bytes: &[u8],
     polled_items: &[PolledItemOwnedReader],
 ) -> Result<capnp::message::Builder<message::HeapAllocator>> {
     // Build the lease entry. capnp lists aren't dynamically sized so we
     // need to know how many to init before we start writing (?).
     let mut lease_entry = message::Builder::new_default();
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
-    lease_entry_builder.set_expiry_ts_secs(lease_validity_secs);
+    lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
+    lease_entry_builder.set_expiry_ts_index_key(expiry_index_key_bytes);
     let mut lease_entry_keys = lease_entry_builder.init_ids(polled_items.len() as u32);
     for (i, typed_item) in polled_items.iter().enumerate() {
         let item_reader: protocol::polled_item::Reader = typed_item.get()?;
@@ -1162,6 +1182,46 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let n = storage.expire_due_leases()?;
         assert_eq!(n, 0, "lease should not expire after extend");
+
+        Ok(())
+    }
+
+    #[test]
+    fn extend_multiple_times_keeps_single_expiry_index_entry() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_extend_dupes";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // Create one item and poll to create a lease
+        storage.add_available_item_from_parts(Uuid::now_v7().as_bytes(), b"x", 0)?;
+        let (lease, items) = storage.get_next_available_entries_with_lease(1, 1)?;
+        assert_eq!(items.len(), 1);
+
+        // Extend several times
+        assert!(storage.extend_lease(&lease, 2)?);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(storage.extend_lease(&lease, 3)?);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(storage.extend_lease(&lease, 4)?);
+
+        // Count expiry index entries that reference this lease
+        let mut count = 0usize;
+        let txn = storage.db.transaction();
+        for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
+            let (idx_key, _val) = kv?;
+            let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
+            if lbytes == lease {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 1,
+            "should only be one expiry index entry per lease after extends"
+        );
 
         Ok(())
     }

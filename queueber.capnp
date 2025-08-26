@@ -72,4 +72,5 @@ struct StoredItem {
 struct LeaseEntry {
     ids @0 :List(Data);
     expiryTsSecs @1 :UInt64;
+    expiryTsIndexKey @2 :Data;
 }
