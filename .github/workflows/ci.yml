@@ -24,7 +24,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y capnproto libcapnp-dev libclang-dev build-essential pkg-config
+        sudo apt-get install -y capnproto libcapnp-dev libclang-dev build-essential
 
     - name: Install Rust toolchain
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -35,13 +35,13 @@ jobs:
         cache-key: queueber-3
 
     - name: Build
-      run: cargo +nightly build --verbose
+      run: cargo build --verbose
 
     - name: Run tests
-      run: cargo +nightly test --verbose
+      run: cargo test --verbose
 
     - name: Run Clippy
-      run: cargo +nightly clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --all-targets --all-features -- -D warnings
 
     - name: "`map_err` is forbidden!"
       run: |

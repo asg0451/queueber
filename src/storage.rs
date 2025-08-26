@@ -366,6 +366,8 @@ impl Storage {
 
         let txn = self.db.transaction();
         let iter = txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
+        // Avoid deleting keys while iterating; collect expiry index keys to delete later.
+        let mut expiry_index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
         for kv in iter {
             let (idx_key, _lease_key_bytes_val) = kv?;
 
@@ -443,10 +445,14 @@ impl Storage {
                 txn.delete(in_progress_key.as_ref())?;
             }
 
-            // Remove the lease entry and its expiry index
+            // Remove the lease entry immediately; defer deleting the expiry index key
             txn.delete(lease_key.as_ref())?;
-            txn.delete(&idx_key)?;
+            expiry_index_keys_to_delete.push(idx_key.to_vec());
             processed += 1;
+        }
+        // Now delete collected expiry index keys outside of the iterator loop
+        for key in expiry_index_keys_to_delete {
+            txn.delete(&key)?;
         }
         txn.commit()?;
         Ok(processed)
@@ -473,14 +479,18 @@ impl Storage {
         let new_idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, lease);
         txn.put(new_idx_key.as_ref(), lease_key.as_ref())?;
 
-        // Find current expiry index entry for this lease and delete it.
+        // Find current expiry index entries for this lease and delete them after iteration
         // TODO: add this index entry to the lease entry so we can do a point lookup.
+        let mut old_expiry_keys: Vec<Vec<u8>> = Vec::new();
         for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
             let (idx_key, _val) = kv?;
             let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
             if lbytes == lease && idx_key.as_ref() != new_idx_key.as_ref() {
-                txn.delete(&idx_key)?;
+                old_expiry_keys.push(idx_key.to_vec());
             }
+        }
+        for k in old_expiry_keys {
+            txn.delete(&k)?;
         }
 
         // Update the lease entry's expiryTsSecs while preserving keys
