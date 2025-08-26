@@ -25,9 +25,10 @@
 - [ ] (test) add extend to fuzz test and stress
 - [ ] (major) server/storage sharding
 - [ ] (major) fix server parallelism -- it's not right currently
-- [ ] (major) make sure there's only one copy of each background task running in the system
-- [ ] (bugfix) why does the server just shut down under stress after a while with exit code 0 ...
+- [X] (major) make sure there's only one copy of each background task running in the system
+- [X] (bugfix) why does the server just shut down under stress after a while with exit code 0 ...
 - [X] (perf) add `--workers` CLI flag and name RPC worker threads
+- [ ] (perf) improve performance
 - [ ] (perf) improve poll wakeups
 - [ ] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
@@ -38,4 +39,4 @@
 - [ ] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
 - [ ] (major) ensure `extend` doesnt create multiple index entries for the same lease.
 - [ ] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending
-- [ ] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency. even now that we use a snapshotted txn in poll.
+- [X] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency. even now that we use a snapshotted txn in poll.

@@ -14,6 +14,7 @@ alwaysApply: true
 - never, EVER submit a pr that doesnt build. `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings` must all pass before you declare success
 - likewise, make sure all merge conflits are resolved before declaring success. do this by running `git pull --no-rebase origin master` before every `git push`
 - always run `cargo fmt` before committing as well
+- consider running `./stress.sh` to see if any concurrency issues pop up
 
 ## guidelines
 - i can be wrong. if i say something you think is wrong, please push back on it at least once
