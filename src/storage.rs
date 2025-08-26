@@ -59,63 +59,6 @@ where
     }
 }
 
-fn stable_sort_by_try<F>(arr: &mut [usize], mut cmp: F) -> Result<()>
-where
-    F: FnMut(usize, usize) -> Result<std::cmp::Ordering>,
-{
-    fn merge_sort<F>(
-        arr: &mut [usize],
-        buf: &mut [usize],
-        left: usize,
-        right: usize,
-        cmp: &mut F,
-    ) -> Result<()>
-    where
-        F: FnMut(usize, usize) -> Result<std::cmp::Ordering>,
-    {
-        if right - left <= 1 {
-            return Ok(());
-        }
-        let mid = left + (right - left) / 2;
-        merge_sort(arr, buf, left, mid, cmp)?;
-        merge_sort(arr, buf, mid, right, cmp)?;
-        let mut i = left;
-        let mut j = mid;
-        let mut k = left;
-        while i < mid && j < right {
-            let ord = cmp(arr[i], arr[j])?;
-            if ord != std::cmp::Ordering::Greater {
-                buf[k] = arr[i];
-                i += 1;
-            } else {
-                buf[k] = arr[j];
-                j += 1;
-            }
-            k += 1;
-        }
-        while i < mid {
-            buf[k] = arr[i];
-            i += 1;
-            k += 1;
-        }
-        while j < right {
-            buf[k] = arr[j];
-            j += 1;
-            k += 1;
-        }
-        // Copy back
-        arr[left..right].copy_from_slice(&buf[left..right]);
-        Ok(())
-    }
-
-    let len = arr.len();
-    if len <= 1 {
-        return Ok(());
-    }
-    let mut buf: Vec<usize> = vec![0; len];
-    merge_sort(arr, &mut buf, 0, len, &mut cmp)
-}
-
 pub struct Storage {
     db: OptimisticTransactionDB,
 }
@@ -651,17 +594,15 @@ fn build_lease_entry_message(
     lease_entry_builder.set_expiry_ts_index_key(expiry_index_key_bytes);
     // Write ids unsorted first.
     let n = polled_items.len();
-    // Index-sort without copying id bytes: stable and fallible
-    let mut idxs: Vec<usize> = (0..n).collect();
-    stable_sort_by_try(&mut idxs, |a, b| {
-        let ar: protocol::polled_item::Reader = polled_items[a].get()?;
-        let br: protocol::polled_item::Reader = polled_items[b].get()?;
-        Ok(ar.get_id()?.cmp(br.get_id()?))
-    })?;
+    // Stable sort without copying id bytes: collect borrowed slices, sort stably, then write
+    let mut borrowed: Vec<&[u8]> = Vec::with_capacity(n);
+    for item in polled_items.iter() {
+        borrowed.push(item.get()?.get_id()?);
+    }
+    borrowed.sort(); // stable
     let mut out_ids = lease_entry_builder.init_ids(n as u32);
-    for (i, src_idx) in idxs.into_iter().enumerate() {
-        let r: protocol::polled_item::Reader = polled_items[src_idx].get()?;
-        out_ids.set(i as u32, r.get_id()?);
+    for (i, id) in borrowed.into_iter().enumerate() {
+        out_ids.set(i as u32, id);
     }
     Ok(lease_entry)
 }
