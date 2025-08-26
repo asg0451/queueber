@@ -22,7 +22,7 @@
 - [ ] (minor) perf analysis on queueber while being stressed
 - [X] (minor) make sure all storage stuff happens within a spawn_blocking or similar
 - [ ] (minor) rocksdb settings tuning
-- [ ] (test) add extend to fuzz test and stress
+- [X] (test) add extend to fuzz test and stress
 - [ ] (major) server/storage sharding
 - [ ] (major) fix server parallelism -- it's not right currently
 - [ ] (major) make sure there's only one copy of each background task running in the system
