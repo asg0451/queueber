@@ -315,11 +315,23 @@ impl Storage {
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let ids = lease_entry_reader.get_ids()?;
-        let Some((found_idx, _)) = ids
-            .iter()
-            .enumerate()
-            .find(|(_, k)| k.as_ref().ok() == Some(&id))
-        else {
+        // Binary search over sorted ids
+        let mut lo: i32 = 0;
+        let mut hi: i32 = (ids.len() as i32) - 1;
+        let mut found_idx_opt: Option<usize> = None;
+        while lo <= hi {
+            let mid = lo + ((hi - lo) / 2);
+            let mid_id = ids.get(mid as u32)?;
+            match mid_id.cmp(id) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid - 1,
+                std::cmp::Ordering::Equal => {
+                    found_idx_opt = Some(mid as usize);
+                    break;
+                }
+            }
+        }
+        let Some(found_idx) = found_idx_opt else {
             return Ok(false);
         };
 
@@ -534,17 +546,17 @@ fn build_lease_entry_message(
     let mut lease_entry = message::Builder::new_default();
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(lease_validity_secs);
-    // Collect ids into an owned vec for sorting to enable future binary searches.
-    let mut ids: Vec<Vec<u8>> = Vec::with_capacity(polled_items.len());
+    // Collect ids as borrowed slices and sort without allocating copies.
+    let mut ids: Vec<&[u8]> = Vec::with_capacity(polled_items.len());
     for typed_item in polled_items.iter() {
         let item_reader: protocol::polled_item::Reader = typed_item.get()?;
-        ids.push(item_reader.get_id()?.to_vec());
+        ids.push(item_reader.get_id()?);
     }
-    ids.sort();
+    ids.sort_unstable();
 
     let mut out_ids = lease_entry_builder.init_ids(ids.len() as u32);
     for (i, id) in ids.into_iter().enumerate() {
-        out_ids.set(i as u32, &id);
+        out_ids.set(i as u32, id);
     }
     Ok(lease_entry)
 }
