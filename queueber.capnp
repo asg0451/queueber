@@ -70,6 +70,6 @@ struct StoredItem {
 }
 
 struct LeaseEntry {
-    keys @0 :List(Data); # TODO: rename to ids which is what it is rn
+    ids @0 :List(Data);
     expiryTsSecs @1 :UInt64;
 }
