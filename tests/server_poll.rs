@@ -49,7 +49,6 @@ fn start_test_server() -> TestServerHandle {
             use queueber::server::Server;
             use std::sync::Arc;
             use tokio::sync::Notify;
-
             let mut shutdown_rx = shutdown_tx.subscribe();
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let storage = Arc::new(RetriedStorage::new(Storage::new(&data_path).unwrap()));
