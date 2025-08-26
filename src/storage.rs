@@ -315,12 +315,35 @@ impl Storage {
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
         let ids = lease_entry_reader.get_ids()?;
-        // Binary search over sorted ids using stdlib on a temporary slice vector
-        let mut id_slices: Vec<&[u8]> = Vec::with_capacity(ids.len().try_into().unwrap());
-        for i in 0..ids.len() {
-            id_slices.push(ids.get(i)?);
+        // Debug assert sorted order without allocation
+        #[cfg(debug_assertions)]
+        {
+            let mut prev: Option<&[u8]> = None;
+            for item in ids.iter() {
+                let Ok(cur) = item else { break };
+                if let Some(p) = prev {
+                    debug_assert!(p <= cur, "LeaseEntry ids not sorted");
+                }
+                prev = Some(cur);
+            }
         }
-        let Ok(found_idx) = id_slices.binary_search(&id) else {
+        // Zero-allocation binary search over capnp list
+        let mut lo: i32 = 0;
+        let mut hi: i32 = (ids.len() as i32) - 1;
+        let mut found_idx: Option<usize> = None;
+        while lo <= hi {
+            let mid = lo + ((hi - lo) / 2);
+            let mid_id = ids.get(mid as u32)?;
+            match mid_id.cmp(id) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid - 1,
+                std::cmp::Ordering::Equal => {
+                    found_idx = Some(mid as usize);
+                    break;
+                }
+            }
+        }
+        let Some(found_idx) = found_idx else {
             return Ok(false);
         };
 
