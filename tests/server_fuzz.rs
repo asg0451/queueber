@@ -20,6 +20,9 @@ enum Op {
         n: usize,
         lease_secs: u64,
     },
+    Extend {
+        lease_secs: u64,
+    },
     Remove {
         id: Vec<u8>,
     },
@@ -42,7 +45,9 @@ fn arb_op() -> impl Strategy<Value = Op> {
 
     let remove = proptest::collection::vec(any::<u8>(), 1..8).prop_map(|id| Op::Remove { id });
 
-    prop_oneof![add, poll, remove]
+    let extend = (1u64..5u64).prop_map(|lease_secs| Op::Extend { lease_secs });
+
+    prop_oneof![add, poll, extend, remove]
 }
 
 proptest! {
@@ -60,15 +65,28 @@ proptest! {
             handles.push(std::thread::spawn(move || -> queueber::errors::Result<()> {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 rt.block_on(async move {
+                    let mut current_lease: Option<[u8; 16]> = None;
                     for op in seq {
                         match op {
                             Op::Add { id, contents, vis_secs } => {
                                 let _ = st.add_available_item_from_parts(&id, &contents, vis_secs).await;
                             }
                             Op::Poll { n, lease_secs } => {
-                                let _ = st.get_next_available_entries_with_lease(n, lease_secs).await;
+                                let (lease, _items) = st.get_next_available_entries_with_lease(n, lease_secs).await?;
+                                current_lease = Some(lease);
                                 // We do not assert on item counts here because of concurrency; the goal
                                 // is to shake races and ensure no panics or invariants are violated.
+                            }
+                            Op::Extend { lease_secs } => {
+                                if let Some(lease) = current_lease {
+                                    let _ = st.extend_lease(&lease, lease_secs).await;
+                                } else {
+                                    // Exercise negative path occasionally with a random lease
+                                    let fake_lease = uuid::Uuid::now_v7().into_bytes();
+                                    let mut lease: [u8; 16] = [0; 16];
+                                    lease.copy_from_slice(&fake_lease);
+                                    let _ = st.extend_lease(&lease, lease_secs).await;
+                                }
                             }
                             Op::Remove { id } => {
                                 // Try removing under a random/nonexistent lease to exercise paths.

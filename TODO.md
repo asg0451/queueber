@@ -22,7 +22,7 @@
 - [ ] (minor) perf analysis on queueber while being stressed
 - [X] (minor) make sure all storage stuff happens within a spawn_blocking or similar
 - [ ] (minor) rocksdb settings tuning
-- [ ] (test) add extend to fuzz test and stress
+- [X] (test) add extend to fuzz test and stress
 - [ ] (major) server/storage sharding
 - [ ] (major) fix server parallelism -- it's not right currently
 - [X] (major) make sure there's only one copy of each background task running in the system
@@ -33,7 +33,7 @@
 - [ ] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
 - [ ] (minor) rename keys to ids in `LeaseEntry`, or actually put keys in there. either way
-- [ ] (minor) make `add_available_item_from_parts` wrap `add_available_items_from_parts`, not the other way around
+- [X] (minor) make `add_available_item_from_parts` wrap `add_available_items_from_parts`, not the other way around
 - [ ] (minor) use a mockable clock when generating uuidv7s
 - [X] (perf) reduce unnecessary allocs, such as when copying data or allocating buffers. some is called out in code comments
 - [ ] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them

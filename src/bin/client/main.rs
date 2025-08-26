@@ -246,6 +246,7 @@ async fn main() -> Result<()> {
             let add_count = Arc::new(atomic::AtomicU64::new(0));
             let poll_count = Arc::new(atomic::AtomicU64::new(0));
             let remove_count = Arc::new(atomic::AtomicU64::new(0));
+            let extend_count = Arc::new(atomic::AtomicU64::new(0));
 
             // periodic metrics reporter
             tokio::task::Builder::new()
@@ -254,6 +255,7 @@ async fn main() -> Result<()> {
                     let add_count = Arc::clone(&add_count);
                     let poll_count = Arc::clone(&poll_count);
                     let remove_count = Arc::clone(&remove_count);
+                    let extend_count = Arc::clone(&extend_count);
                     async move {
                         let mut last_time = Instant::now();
                         loop {
@@ -262,17 +264,20 @@ async fn main() -> Result<()> {
                             let adds = add_count.swap(0, atomic::Ordering::Relaxed);
                             let polls = poll_count.swap(0, atomic::Ordering::Relaxed);
                             let removes = remove_count.swap(0, atomic::Ordering::Relaxed);
+                            let extends = extend_count.swap(0, atomic::Ordering::Relaxed);
                             let duration = now.duration_since(last_time);
                             last_time = now;
                             let secs = duration.as_secs_f64().max(1.0);
                             println!(
-                                "add: {} ({:.1}/s), poll: {} ({:.1}/s), remove: {} ({:.1}/s)",
+                                "add: {} ({:.1}/s), poll: {} ({:.1}/s), remove: {} ({:.1}/s), extend: {} ({:.1}/s)",
                                 adds,
                                 adds as f64 / secs,
                                 polls,
                                 polls as f64 / secs,
                                 removes,
-                                removes as f64 / secs
+                                removes as f64 / secs,
+                                extends,
+                                extends as f64 / secs
                             );
                         }
                     }
@@ -284,12 +289,15 @@ async fn main() -> Result<()> {
                 for _ in 0..polling_clients {
                     let poll_count = Arc::clone(&poll_count);
                     let remove_count = Arc::clone(&remove_count);
+                    let extend_count = Arc::clone(&extend_count);
                     let handle = Handle::current();
                     s.spawn(move || {
                         handle.block_on(async move {
                             tokio::task::LocalSet::new()
                                 .run_until(async move {
                                     let _ = with_client(addr, |queue_client| async move {
+                                        let mut current_lease: Option<[u8; 16]> = None;
+                                        let mut last_extend = Instant::now();
                                         loop {
                                             let mut request = queue_client.poll_request();
                                             let mut req = request.get().init_req();
@@ -305,6 +313,11 @@ async fn main() -> Result<()> {
                                             );
 
                                             let lease = resp.get_lease().unwrap();
+                                            if lease.len() == 16 {
+                                                let mut lease_arr = [0u8; 16];
+                                                lease_arr.copy_from_slice(lease);
+                                                current_lease = Some(lease_arr);
+                                            }
 
                                             let promises = items.iter().map(|i| {
                                                 let mut request = queue_client.remove_request();
@@ -318,6 +331,20 @@ async fn main() -> Result<()> {
                                                 items.len() as u64,
                                                 atomic::Ordering::Relaxed,
                                             );
+
+                                            // Occasionally extend the current lease to exercise extend under load.
+                                            if last_extend.elapsed() > Duration::from_secs(2) {
+                                                if let Some(lease_arr) = current_lease {
+                                                    let mut request = queue_client.extend_request();
+                                                    let mut req = request.get().init_req();
+                                                    req.set_lease(&lease_arr);
+                                                    req.set_lease_validity_secs(30);
+                                                    let _ = request.send().promise.await;
+                                                    extend_count
+                                                        .fetch_add(1, atomic::Ordering::Relaxed);
+                                                }
+                                                last_extend = Instant::now();
+                                            }
                                         }
                                     })
                                     .await;
