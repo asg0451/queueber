@@ -265,11 +265,10 @@ impl Storage {
 
         // Build the lease entry.
         let lease_entry = build_lease_entry_message(lease_validity_secs, &polled_items)?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
-        serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
-
+        let mut lease_buf = Vec::with_capacity(lease_entry.size_in_words() * 8);
+        serialize::write_message(&mut lease_buf, &lease_entry)?;
         // Write the lease entry and its expiry index
-        txn.put(lease_key.as_ref(), &lease_entry_bs)?;
+        txn.put(lease_key.as_ref(), &lease_buf)?;
         txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
 
         drop(snapshot);
@@ -343,7 +342,7 @@ impl Storage {
                 out_keys.set(new_idx as u32, k);
                 new_idx += 1;
             }
-            let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
+            let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
             serialize::write_message(&mut buf, &msg)?;
             txn.put(lease_key.as_ref(), &buf)?;
         }

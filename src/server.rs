@@ -116,9 +116,9 @@ impl crate::protocol::queue::Server for Server {
 
         // Generate ids upfront and copy request data into owned memory so we can move
         // it into a blocking task (capnp readers are not Send).
-        let ids: Vec<Vec<u8>> = items
+        let ids: Vec<[u8; 16]> = items
             .iter()
-            .map(|_| uuid::Uuid::now_v7().as_bytes().to_vec())
+            .map(|_| uuid::Uuid::now_v7().into_bytes())
             .collect();
 
         let items_owned = items
@@ -135,8 +135,6 @@ impl crate::protocol::queue::Server for Server {
 
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
-        let ids_for_resp = ids.clone();
-
         Promise::from_future(async move {
             // Offload RocksDB work to the blocking thread pool.
             let iter = ids
@@ -150,11 +148,8 @@ impl crate::protocol::queue::Server for Server {
             }
 
             // Build the response on the RPC thread.
-            let mut ids_builder = results
-                .get()
-                .init_resp()
-                .init_ids(ids_for_resp.len() as u32);
-            for (i, id) in ids_for_resp.iter().enumerate() {
+            let mut ids_builder = results.get().init_resp().init_ids(ids.len() as u32);
+            for (i, id) in ids.iter().enumerate() {
                 ids_builder.set(i as u32, id);
             }
             Ok(())
