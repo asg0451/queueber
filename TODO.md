@@ -30,7 +30,7 @@
 - [X] (perf) add `--workers` CLI flag and name RPC worker threads
 - [ ] (perf) improve performance
 - [ ] (perf) improve poll wakeups
-- [ ] (perf) per-worker accept via `SO_REUSEPORT`
+- [X] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
 - [ ] (minor) rename keys to ids in `LeaseEntry`, or actually put keys in there. either way
 - [ ] (minor) make `add_available_item_from_parts` wrap `add_available_items_from_parts`, not the other way around
