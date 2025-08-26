@@ -25,7 +25,7 @@
 - [X] (test) add extend to fuzz test and stress
 - [ ] (major) server/storage sharding
 - [ ] (major) fix server parallelism -- it's not right currently
-- [ ] (major) make sure there's only one copy of each background task running in the system
+- [X] (major) make sure there's only one copy of each background task running in the system
 - [X] (bugfix) why does the server just shut down under stress after a while with exit code 0 ...
 - [X] (perf) add `--workers` CLI flag and name RPC worker threads
 - [ ] (perf) improve performance
