@@ -314,8 +314,8 @@ impl Storage {
             message::ReaderOptions::new(),
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
-        let keys = lease_entry_reader.get_keys()?;
-        let Some((found_idx, _)) = keys
+        let ids = lease_entry_reader.get_ids()?;
+        let Some((found_idx, _)) = ids
             .iter()
             .enumerate()
             .find(|(_, k)| k.as_ref().ok() == Some(&id))
@@ -328,22 +328,20 @@ impl Storage {
 
         // Rewrite the lease entry to exclude the id. If no items remain under this lease,
         // delete the lease entry instead.
-        if keys.len() - 1 == 0 {
+        if ids.len() - 1 == 0 {
             txn.delete(lease_key.as_ref())?;
         } else {
             // Rebuild lease entry with remaining keys.
             // TODO: this could be done more efficiently by unifying the above search and this one.
             let mut msg = message::Builder::new_default(); // TODO: reduce allocs
             let builder = msg.init_root::<protocol::lease_entry::Builder>();
-            // Collect remaining ids, sort them, then write back.
-            let mut remaining: Vec<Vec<u8>> = Vec::with_capacity((keys.len() - 1) as usize);
-            for (_, k) in keys.iter().enumerate().filter(|(i, _)| *i != found_idx) {
-                remaining.push(k?.to_vec());
-            }
-            remaining.sort();
-            let mut out_keys = builder.init_keys(remaining.len() as u32);
-            for (i, id) in remaining.into_iter().enumerate() {
-                out_keys.set(i as u32, &id);
+            let mut out_ids = builder.init_ids(ids.len() as u32 - 1);
+            let mut new_idx = 0;
+            #[allow(clippy::explicit_counter_loop)] // TODO: clean this up
+            for (_, k) in ids.iter().enumerate().filter(|(i, _)| *i != found_idx) {
+                let k = k?;
+                out_ids.set(new_idx as u32, k);
+                new_idx += 1;
             }
             let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
             serialize::write_message(&mut buf, &msg)?;
@@ -408,7 +406,7 @@ impl Storage {
                 message::ReaderOptions::new(),
             )?;
             let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
-            let keys = lease_entry_reader.get_keys()?; // TODO: rename to ids
+            let keys = lease_entry_reader.get_ids()?;
 
             // Move each item back to available.
             for id in keys.iter() {
@@ -502,13 +500,13 @@ impl Storage {
                 message::ReaderOptions::new(),
             )?;
             let lease_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
-            let keys = lease_reader.get_keys()?;
+            let keys = lease_reader.get_ids()?;
 
             // TODO: do this with set_root or some such / more efficiently.
             let mut out = message::Builder::new_default();
             let mut builder = out.init_root::<protocol::lease_entry::Builder>();
             builder.set_expiry_ts_secs(expiry_ts_secs);
-            let mut out_keys = builder.reborrow().init_keys(keys.len());
+            let mut out_keys = builder.reborrow().init_ids(keys.len());
             for i in 0..keys.len() {
                 out_keys.set(i, keys.get(i)?);
             }
@@ -544,9 +542,9 @@ fn build_lease_entry_message(
     }
     ids.sort();
 
-    let mut lease_entry_keys = lease_entry_builder.init_keys(ids.len() as u32);
+    let mut out_ids = lease_entry_builder.init_ids(ids.len() as u32);
     for (i, id) in ids.into_iter().enumerate() {
-        lease_entry_keys.set(i as u32, &id);
+        out_ids.set(i as u32, &id);
     }
     Ok(lease_entry)
 }
@@ -945,9 +943,9 @@ mod tests {
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
-        let keys = lease_entry.get_keys()?;
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys.get(0)?, b"42");
+        let ids = lease_entry.get_ids()?;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0)?, b"42");
 
         Ok(())
     }
@@ -1019,8 +1017,8 @@ mod tests {
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
-        let keys = lease_entry.get_keys()?;
-        assert!(keys.len() >= 2);
+        let ids = lease_entry.get_ids()?;
+        assert!(ids.len() >= 2);
 
         Ok(())
     }
@@ -1067,9 +1065,9 @@ mod tests {
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
-        let keys = lease_entry.get_keys()?;
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys.get(0)?, b"id2");
+        let ids = lease_entry.get_ids()?;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0)?, b"id2");
 
         Ok(())
     }
@@ -1141,9 +1139,9 @@ mod tests {
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
-        let keys = lease_entry.get_keys()?;
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys.get(0)?, b"only");
+        let ids = lease_entry.get_ids()?;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0)?, b"only");
 
         Ok(())
     }
@@ -1509,7 +1507,7 @@ mod tests {
             message::ReaderOptions::new(),
         )?;
         let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
-        let keys = lease_entry.get_keys()?;
+        let keys = lease_entry.get_ids()?;
         assert_eq!(keys.len(), 3);
         let k0 = keys.get(0)?;
         let k1 = keys.get(1)?;
