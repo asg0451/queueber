@@ -56,7 +56,8 @@ pub fn spawn_background_tasks(
                             bg_notify.notify_one();
                         }
                     }
-                    Err(_e) => {
+                    Err(e) => {
+                        tracing::error!("expire_due_leases: {}", e);
                         let _ = lease_expiry_shutdown.send(true);
                         break;
                     }
