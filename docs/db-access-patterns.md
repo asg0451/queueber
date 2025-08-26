@@ -13,7 +13,7 @@ This document describes how the RocksDB storage layer is organized and the acces
 
 - `in_progress/<id>`: Main record for an item that has been polled and is currently leased. Value is the same `stored_item` payload as in `available` (including the original `visibility_ts_index_key`).
 
-- `leases/<lease_bytes>`: A lease entry. Value is a Cap'n Proto `lease_entry` with a list of item ids (`keys`) currently owned by the lease.
+- `leases/<lease_bytes>`: A lease entry. Value is a Cap'n Proto `lease_entry` with a list of item ids (`ids`) currently owned by the lease.
 
 - `lease_expiry/<u64:expiry_ts_be>/<lease_bytes>`: Index from expiry timestamp to `leases/<lease_bytes>` key for the sweeper.
 
@@ -37,7 +37,7 @@ Key helpers and parsers are in `src/dbkeys.rs`. Timestamps are encoded as 8-byte
       - If the index entry (`idx_key`) is already gone, skip.
       - Otherwise treat it as a stale/orphaned index and self-heal by deleting `idx_key` within the same transaction and commit; skip the item.
   - Accumulate up to `n` items. If any were claimed, write a lease entry:
-    - `put leases/<lease> -> lease_entry(keys=[ids...])`
+    - `put leases/<lease> -> lease_entry(ids=[ids...])`
     - `put lease_expiry/<expiry>/<lease> -> leases/<lease>`
   - If zero items were claimed, no lease is written.
 
