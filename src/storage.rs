@@ -14,6 +14,10 @@ use crate::errors::{Error, Result};
 use crate::protocol;
 use rand::Rng;
 
+thread_local! {
+    static SERIALIZE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub struct Storage {
     db: OptimisticTransactionDB,
 }
@@ -89,14 +93,20 @@ impl Storage {
         stored_item.set_contents(contents);
         stored_item.set_id(id);
         stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
-        let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
-        serialize::write_message(&mut stored_contents, &simsg)?;
 
-        // Atomically insert the item and visibility index entry
-        let mut batch = WriteBatchWithTransaction::<true>::default();
-        batch.put(main_key.as_ref(), &stored_contents);
-        batch.put(visibility_index_key.as_ref(), main_key.as_ref());
-        self.db.write(batch)?;
+        SERIALIZE_SCRATCH.with(|cell| -> Result<()> {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.reserve(simsg.size_in_words() * 8);
+            serialize::write_message(&mut *buf, &simsg)?;
+
+            // Atomically insert the item and visibility index entry
+            let mut batch = WriteBatchWithTransaction::<true>::default();
+            batch.put(main_key.as_ref(), &*buf);
+            batch.put(visibility_index_key.as_ref(), main_key.as_ref());
+            self.db.write(batch)?;
+            Ok(())
+        })?;
 
         tracing::debug!(
             "inserted item (from parts): ({}: <contents len: {}>), (viz/{}: avail/{})",
@@ -268,12 +278,17 @@ impl Storage {
 
         // Build the lease entry.
         let lease_entry = build_lease_entry_message(lease_validity_secs, &polled_items)?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
-        serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
+        SERIALIZE_SCRATCH.with(|cell| -> Result<()> {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.reserve(lease_entry.size_in_words() * 8);
+            serialize::write_message(&mut *buf, &lease_entry)?;
 
-        // Write the lease entry and its expiry index
-        txn.put(lease_key.as_ref(), &lease_entry_bs)?;
-        txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
+            // Write the lease entry and its expiry index
+            txn.put(lease_key.as_ref(), &*buf)?;
+            txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
+            Ok(())
+        })?;
 
         drop(snapshot);
         txn.commit()?;
@@ -346,9 +361,14 @@ impl Storage {
                 out_keys.set(new_idx as u32, k);
                 new_idx += 1;
             }
-            let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
-            serialize::write_message(&mut buf, &msg)?;
-            txn.put(lease_key.as_ref(), &buf)?;
+            SERIALIZE_SCRATCH.with(|cell| -> Result<()> {
+                let mut buf = cell.borrow_mut();
+                buf.clear();
+                buf.reserve(msg.size_in_words() * 8);
+                serialize::write_message(&mut *buf, &msg)?;
+                txn.put(lease_key.as_ref(), &*buf)?;
+                Ok(())
+            })?;
         }
         drop(lease_value);
 
@@ -439,9 +459,14 @@ impl Storage {
                     let mut stored_item = builder.get_root::<protocol::stored_item::Builder>()?;
                     stored_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
                 }
-                let mut updated = Vec::with_capacity(builder.size_in_words() * 8);
-                serialize::write_message(&mut updated, &builder)?;
-                txn.put(avail_key.as_ref(), &updated)?;
+                SERIALIZE_SCRATCH.with(|cell| -> Result<()> {
+                    let mut updated = cell.borrow_mut();
+                    updated.clear();
+                    updated.reserve(builder.size_in_words() * 8);
+                    serialize::write_message(&mut *updated, &builder)?;
+                    txn.put(avail_key.as_ref(), &*updated)?;
+                    Ok(())
+                })?;
                 txn.put(vis_idx_now.as_ref(), avail_key.as_ref())?;
                 txn.delete(in_progress_key.as_ref())?;
             }
@@ -503,9 +528,14 @@ impl Storage {
             for i in 0..keys.len() {
                 out_keys.set(i, keys.get(i)?);
             }
-            let mut buf = Vec::with_capacity(out.size_in_words() * 8);
-            serialize::write_message(&mut buf, &out)?;
-            txn.put(lease_key.as_ref(), &buf)?;
+            SERIALIZE_SCRATCH.with(|cell| -> Result<()> {
+                let mut buf = cell.borrow_mut();
+                buf.clear();
+                buf.reserve(out.size_in_words() * 8);
+                serialize::write_message(&mut *buf, &out)?;
+                txn.put(lease_key.as_ref(), &*buf)?;
+                Ok(())
+            })?;
         }
         txn.commit()?;
         Ok(true)
