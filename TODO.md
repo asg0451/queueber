@@ -36,7 +36,7 @@
 - [ ] (minor) make `add_available_item_from_parts` wrap `add_available_items_from_parts`, not the other way around
 - [ ] (minor) use a mockable clock when generating uuidv7s
 - [ ] (perf) reduce unnecessary allocs, such as when copying data or allocating buffers. some is called out in code comments
-- [ ] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
+- [X] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
 - [ ] (major) ensure `extend` doesnt create multiple index entries for the same lease.
 - [ ] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending
 - [X] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency. even now that we use a snapshotted txn in poll.

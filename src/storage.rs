@@ -338,13 +338,15 @@ impl Storage {
             // TODO: this could be done more efficiently by unifying the above search and this one.
             let mut msg = message::Builder::new_default(); // TODO: reduce allocs
             let builder = msg.init_root::<protocol::lease_entry::Builder>();
-            let mut out_keys = builder.init_keys(keys.len() as u32 - 1);
-            let mut new_idx = 0;
-            #[allow(clippy::explicit_counter_loop)] // TODO: clean this up
+            // Collect remaining ids, sort them, then write back.
+            let mut remaining: Vec<Vec<u8>> = Vec::with_capacity((keys.len() - 1) as usize);
             for (_, k) in keys.iter().enumerate().filter(|(i, _)| *i != found_idx) {
-                let k = k?;
-                out_keys.set(new_idx as u32, k);
-                new_idx += 1;
+                remaining.push(k?.to_vec());
+            }
+            remaining.sort();
+            let mut out_keys = builder.init_keys(remaining.len() as u32);
+            for (i, id) in remaining.into_iter().enumerate() {
+                out_keys.set(i as u32, &id);
             }
             let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
             serialize::write_message(&mut buf, &msg)?;
@@ -370,7 +372,7 @@ impl Storage {
         let txn = self.db.transaction();
         let iter = txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
         for kv in iter {
-            let (idx_key, _lease_key_bytes_val) = kv?;
+            let (idx_key, _) = kv?;
 
             debug_assert_eq!(
                 &idx_key[..LeaseExpiryIndexKey::PREFIX.len()],
@@ -527,10 +529,17 @@ fn build_lease_entry_message(
     let mut lease_entry = message::Builder::new_default();
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(lease_validity_secs);
-    let mut lease_entry_keys = lease_entry_builder.init_keys(polled_items.len() as u32);
-    for (i, typed_item) in polled_items.iter().enumerate() {
+    // Collect ids into an owned vec for sorting to enable future binary searches.
+    let mut ids: Vec<Vec<u8>> = Vec::with_capacity(polled_items.len());
+    for typed_item in polled_items.iter() {
         let item_reader: protocol::polled_item::Reader = typed_item.get()?;
-        lease_entry_keys.set(i as u32, item_reader.get_id()?);
+        ids.push(item_reader.get_id()?.to_vec());
+    }
+    ids.sort();
+
+    let mut lease_entry_keys = lease_entry_builder.init_keys(ids.len() as u32);
+    for (i, id) in ids.into_iter().enumerate() {
+        lease_entry_keys.set(i as u32, &id);
     }
     Ok(lease_entry)
 }
@@ -1456,6 +1465,49 @@ mod tests {
             got.is_some(),
             "snapshot read should see the main value even if concurrently deleted"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn lease_entry_keys_are_sorted_after_poll()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let db_path = "/tmp/queueber_test_db_sorted_keys";
+        let storage = Storage::new(Path::new(db_path)).unwrap();
+        scopeguard::defer!(std::fs::remove_dir_all(db_path).unwrap());
+
+        // add items with out-of-order ids
+        for id in [b"c", b"a", b"b"] {
+            let mut msg = Builder::new_default();
+            let item = make_item(&mut msg);
+            storage.add_available_item((id.as_slice(), item))?;
+        }
+
+        // poll three items into one lease
+        let (lease, entries) = storage.get_next_available_entries(3)?;
+        assert_eq!(entries.len(), 3);
+
+        // read lease entry directly
+        let lease_key = LeaseKey::from_lease_bytes(&lease);
+        let lease_value = storage
+            .db
+            .get(lease_key.as_ref())?
+            .ok_or("lease not found")?;
+        let lease_entry = serialize::read_message_from_flat_slice(
+            &mut &lease_value[..],
+            message::ReaderOptions::new(),
+        )?;
+        let lease_entry = lease_entry.get_root::<protocol::lease_entry::Reader>()?;
+        let keys = lease_entry.get_keys()?;
+        assert_eq!(keys.len(), 3);
+        let k0 = keys.get(0)?;
+        let k1 = keys.get(1)?;
+        let k2 = keys.get(2)?;
+        assert!(k0 <= k1 && k1 <= k2, "lease keys not sorted");
 
         Ok(())
     }
