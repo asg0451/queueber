@@ -72,4 +72,7 @@ struct StoredItem {
 struct LeaseEntry {
     ids @0 :List(Data);
     expiryTsSecs @1 :UInt64;
+    # exact lease-expiry index key bytes for this lease's current expiry
+    # used to delete/update the index without scanning on extend
+    expiryIndexKey @2 :Data;
 }

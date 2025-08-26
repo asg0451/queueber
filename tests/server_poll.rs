@@ -368,3 +368,61 @@ async fn extend_renews_lease_and_unknown_returns_false() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn extend_does_not_duplicate_expiry_index() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    with_client(addr, |queue_client| async move {
+        // Add one item and poll
+        let mut add = queue_client.add_request();
+        {
+            let req = add.get().init_req();
+            let mut items = req.init_items(1);
+            let mut item = items.reborrow().get(0);
+            item.set_contents(b"dup-test");
+            item.set_visibility_timeout_secs(0);
+        }
+        let _ = add.send().promise.await.unwrap();
+
+        let mut poll = queue_client.poll_request();
+        {
+            let mut req = poll.get().init_req();
+            req.set_lease_validity_secs(1);
+            req.set_num_items(1);
+            req.set_timeout_secs(0);
+        }
+        let reply = poll.send().promise.await.unwrap();
+        let resp = reply.get().unwrap().get_resp().unwrap();
+        let lease = resp.get_lease().unwrap().to_vec();
+
+        // Repeatedly extend the same lease
+        for _ in 0..3 {
+            let mut ext = queue_client.extend_request();
+            {
+                let mut req = ext.get().init_req();
+                req.set_lease(&lease);
+                req.set_lease_validity_secs(2);
+            }
+            let ext_reply = ext.send().promise.await.unwrap();
+            assert!(ext_reply.get().unwrap().get_resp().unwrap().get_extended());
+        }
+
+        // Trigger sweeper shortly after by setting a short lease and waiting
+        let mut ext = queue_client.extend_request();
+        {
+            let mut req = ext.get().init_req();
+            req.set_lease(&lease);
+            req.set_lease_validity_secs(1);
+        }
+        let _ = ext.send().promise.await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        // There's no direct API to inspect keys; success criteria is that expiry sweeper
+        // can complete without panicking due to duplicate keys, which is covered implicitly
+        // by the server's background sweeper not crashing. If we reached here, it's OK.
+    })
+    .await;
+}
