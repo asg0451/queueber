@@ -500,23 +500,14 @@ impl Storage {
             )?;
             let lease_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
             let keys = lease_reader.get_ids()?;
-            // If the entry contains a previous expiry index key, delete it directly.
-            let prev_idx_key = lease_reader.get_expiry_ts_index_key().unwrap_or_default();
-            if !prev_idx_key.is_empty() && prev_idx_key != new_idx_key.as_bytes() {
+            // Delete the previous expiry index key referenced by the lease entry.
+            let prev_idx_key = lease_reader.get_expiry_ts_index_key()?;
+            debug_assert!(
+                !prev_idx_key.is_empty(),
+                "expiryTsIndexKey must be present after full cutover"
+            );
+            if prev_idx_key != new_idx_key.as_bytes() {
                 txn.delete(prev_idx_key)?;
-            } else if prev_idx_key.is_empty() {
-                // Fallback for pre-migration entries: scan and delete other keys for this lease
-                let mut old_expiry_keys: Vec<Vec<u8>> = Vec::new();
-                for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
-                    let (idx_key, _val) = kv?;
-                    let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
-                    if lbytes == lease && idx_key.as_ref() != new_idx_key.as_ref() {
-                        old_expiry_keys.push(idx_key.to_vec());
-                    }
-                }
-                for k in old_expiry_keys {
-                    txn.delete(&k)?;
-                }
             }
 
             // TODO: do this with set_root or some such / more efficiently.
