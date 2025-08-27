@@ -98,16 +98,27 @@ impl Storage {
         // Note: newer rust-rocksdb exposes set_opt/optimize APIs on Options directly for simplicity
         {
             use rocksdb::BlockBasedOptions;
+            use rocksdb::Cache;
             let mut bopts = BlockBasedOptions::default();
             // 10 bits per key is a good latency/false-positive tradeoff
             bopts.set_bloom_filter(10.0, false);
             bopts.set_whole_key_filtering(true);
-            // Reasonable block size; many values are small
-            bopts.set_block_size(32 * 1024);
+            // Smaller block size helps random point lookups typical in poll
+            bopts.set_block_size(8 * 1024);
             // Cache index+filter blocks to reduce I/O under scan/prefix iterator
             bopts.set_cache_index_and_filter_blocks(true);
+            // Avoid partitioned filters; increases CPU on small/index-centric workloads
+            bopts.set_partition_filters(false);
+            // Provide a shared LRU cache for blocks (tune size as needed)
+            let cache = Cache::new_lru_cache(256usize << 20);
+            bopts.set_block_cache(&cache);
+            // Keep L0 metadata hot
+            bopts.set_pin_l0_filter_and_index_blocks_in_cache(true);
             opts.set_block_based_table_factory(&bopts);
         }
+
+        // Heuristic tuning for point lookups; helps poll read path
+        opts.optimize_for_point_lookup(u64::try_from(256usize).unwrap() << 20);
 
         // Compaction strategy and write path improvements
         opts.set_level_compaction_dynamic_level_bytes(true);
@@ -121,6 +132,8 @@ impl Storage {
 
         // Compression: favor speed with Snappy; keeps space reasonable without high CPU
         opts.set_compression_type(rocksdb::DBCompressionType::Snappy);
+
+        // Keep file sizing/compaction thresholds at defaults to avoid read regressions
 
         opts.create_if_missing(true);
         let db = OptimisticTransactionDB::open(&opts, path)?;
