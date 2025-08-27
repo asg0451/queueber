@@ -9,6 +9,7 @@ use queueber::storage::{RetriedStorage, Storage};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, atomic};
 use std::thread::JoinHandle;
 
 fn bench_add_messages(c: &mut Criterion) {
@@ -348,11 +349,147 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_e2e_stress_like(c: &mut Criterion) {
+    let mut group = c.benchmark_group("e2e_rpc");
+    // Parameters inspired by stress.sh defaults but with bounded total work per iteration.
+    let adding_clients: u32 = 2;
+    let polling_clients: u32 = 2;
+    let total_items: u32 = 200;
+    let batch_size: u32 = 10;
+
+    let handle = ensure_server_started();
+    let addr = handle.addr;
+
+    group.bench_function(
+        format!(
+            "rpc_stress_like_p{}_a{}_items_{}",
+            polling_clients, adding_clients, total_items
+        ),
+        |b| {
+            b.iter(|| {
+                // Work counters
+                let remaining_to_add = Arc::new(atomic::AtomicU32::new(total_items));
+                let removed_count = Arc::new(atomic::AtomicU32::new(0));
+
+                std::thread::scope(|s| {
+                    // Spawn polling clients
+                    for _ in 0..polling_clients {
+                        let removed_count = Arc::clone(&removed_count);
+                        s.spawn(move || {
+                            with_client(addr, |queue_client| async move {
+                                // Keep polling/removing until we've removed all items for this run
+                                let mut current_lease: Option<[u8; 16]> = None;
+                                let mut last_extend = std::time::Instant::now();
+                                loop {
+                                    let done = removed_count.load(atomic::Ordering::Relaxed)
+                                        >= total_items;
+                                    if done {
+                                        break;
+                                    }
+
+                                    let mut request = queue_client.poll_request();
+                                    let mut req = request.get().init_req();
+                                    req.set_lease_validity_secs(30);
+                                    req.set_num_items(batch_size);
+                                    req.set_timeout_secs(1);
+                                    let reply = request.send().promise.await.unwrap();
+                                    let resp = reply.get().unwrap().get_resp().unwrap();
+                                    let items = resp.get_items().unwrap();
+                                    let lease = resp.get_lease().unwrap();
+                                    if lease.len() == 16 {
+                                        let mut lease_arr = [0u8; 16];
+                                        lease_arr.copy_from_slice(lease);
+                                        current_lease = Some(lease_arr);
+                                    }
+
+                                    if items.is_empty() {
+                                        continue;
+                                    }
+
+                                    let promises = items.iter().map(|i| {
+                                        let mut request = queue_client.remove_request();
+                                        let mut r = request.get().init_req();
+                                        r.set_id(i.get_id().unwrap());
+                                        r.set_lease(lease);
+                                        request.send().promise
+                                    });
+                                    let _ = futures::future::join_all(promises).await;
+                                    removed_count.fetch_add(items.len(), atomic::Ordering::Relaxed);
+
+                                    // Occasionally extend the current lease to exercise extend path
+                                    if last_extend.elapsed() > std::time::Duration::from_secs(2) {
+                                        if let Some(lease_arr) = current_lease {
+                                            let mut xreq = queue_client.extend_request();
+                                            let mut xr = xreq.get().init_req();
+                                            xr.set_lease(&lease_arr);
+                                            xr.set_lease_validity_secs(30);
+                                            let _ = xreq.send().promise.await;
+                                        }
+                                        last_extend = std::time::Instant::now();
+                                    }
+                                }
+                            });
+                        });
+                    }
+
+                    // Spawn adding clients
+                    for _ in 0..adding_clients {
+                        let remaining_to_add = Arc::clone(&remaining_to_add);
+                        s.spawn(move || {
+                            with_client(addr, |queue_client| async move {
+                                loop {
+                                    // Reserve a batch to add
+                                    let batch = loop {
+                                        let prev = remaining_to_add.load(atomic::Ordering::Relaxed);
+                                        if prev == 0 {
+                                            break 0;
+                                        }
+                                        let take = prev.min(batch_size);
+                                        if remaining_to_add
+                                            .compare_exchange(
+                                                prev,
+                                                prev - take,
+                                                atomic::Ordering::Relaxed,
+                                                atomic::Ordering::Relaxed,
+                                            )
+                                            .is_ok()
+                                        {
+                                            break take;
+                                        }
+                                    };
+
+                                    if batch == 0 {
+                                        break;
+                                    }
+
+                                    let mut request = queue_client.add_request();
+                                    let req = request.get().init_req();
+                                    let mut items = req.init_items(batch);
+                                    for i in 0..batch as usize {
+                                        let mut item = items.reborrow().get(i as u32);
+                                        // Small payload, immediately visible
+                                        item.set_contents(b"p");
+                                        item.set_visibility_timeout_secs(0);
+                                    }
+                                    let _ = request.send().promise.await.unwrap();
+                                }
+                            });
+                        });
+                    }
+                });
+            })
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_add_messages,
     bench_remove_messages,
     bench_poll_messages_storage,
-    bench_e2e_add_poll_remove
+    bench_e2e_add_poll_remove,
+    bench_e2e_stress_like
 );
 criterion_main!(benches);
