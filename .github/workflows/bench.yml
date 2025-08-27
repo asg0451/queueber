@@ -59,6 +59,13 @@ jobs:
           # Run all benches; Criterion outputs to target/criterion
           cargo bench --all
 
+      - name: Debug list Criterion outputs
+        run: |
+          echo 'Criterion estimates files:'
+          find target/criterion -type f -name estimates.json -print 2>/dev/null || true
+          echo 'Directory summary:'
+          du -sh target/criterion || true
+
       - name: Summarize Criterion results -> JSON (ms, smaller is better)
         shell: bash
         run: |
@@ -67,12 +74,20 @@ jobs:
           echo '[]' > "$RESULTS"
           shopt -s globstar nullglob
           declare -A picked
-          files=(target/criterion/**/new/estimates.json target/criterion/**/estimates.json)
+          files=(
+            target/criterion/**/new/estimates.json
+            target/criterion/**/estimates.json
+            target/criterion/**/base/estimates.json
+          )
           for f in "${files[@]}"; do
             [[ -f "$f" ]] || continue
-            benchdir=$(sed -E 's#^target/criterion/([^/]+)/.*#\1#' <<<"$f")
-            # Prefer 'new' over root estimates if both exist
-            if [[ -n "${picked[$benchdir]:-}" && "$f" != */new/* ]]; then
+            # Extract full bench id between target/criterion/ and (new|base|estimates.json)
+            id=${f#target/criterion/}
+            id=${id%/estimates.json}
+            id=${id%/new/estimates.json}
+            id=${id%/base/estimates.json}
+            # Prefer earlier entries in files[] ordering
+            if [[ -n "${picked[$id]:-}" ]]; then
               continue
             fi
             mean_sec=$(jq -r '.Mean.point_estimate' "$f")
@@ -83,12 +98,17 @@ jobs:
             # Convert seconds to milliseconds for readability
             ms=$(awk -v s="$mean_sec" 'BEGIN{printf "%.3f", s*1000}')
             tmp=$(mktemp)
-            jq --arg name "$benchdir" --argjson value "$ms" '. + [{"name":$name,"value":$value}]' "$RESULTS" > "$tmp"
+            jq --arg name "$id" --argjson value "$ms" '. + [{"name":$name,"value":$value}]' "$RESULTS" > "$tmp"
             mv "$tmp" "$RESULTS"
-            picked[$benchdir]=1
+            picked[$id]=1
           done
           echo 'Generated summary:'
           cat "$RESULTS"
+          # Fail clearly if empty to aid debugging
+          if [[ "$(jq 'length' "$RESULTS")" -eq 0 ]]; then
+            echo 'No Criterion estimates were found. See previous debug step for files present.'
+            exit 1
+          fi
 
       - name: Store benchmark result (github-action-benchmark)
         uses: benchmark-action/github-action-benchmark@v1
