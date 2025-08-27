@@ -124,12 +124,13 @@ jobs:
       - name: Download latest master benchmark artifact
         if: github.event_name == 'pull_request'
         uses: dawidd6/action-download-artifact@v3
+        continue-on-error: true
         with:
           workflow: bench.yml
           branch: master
           name: criterion-output
           path: master-artifacts
-          if_no_artifacts_found: ignore
+          if_no_artifact_found: ignore
 
       - name: Compute benchmark delta (PR vs master)
         if: github.event_name == 'pull_request'
