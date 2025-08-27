@@ -21,7 +21,7 @@
 - [X] (bugfix) stress test found this error with num workers = 4: `database integrity violated: main key not found`. fix it.
 - [ ] (minor) perf analysis on queueber while being stressed
 - [X] (minor) make sure all storage stuff happens within a spawn_blocking or similar
-- [ ] (minor) rocksdb settings tuning
+- [X] (minor) rocksdb settings tuning
 - [X] (test) add extend to fuzz test and stress
 - [ ] (major) server/storage sharding
 - [ ] (major) fix server parallelism -- it's not right currently
