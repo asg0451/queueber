@@ -37,6 +37,7 @@
   - evaluate pessimistic transactions under contention; compare retries vs lock waits
   - reduce redundant copies (to_vec, id conversions); prefer borrowing/Arc reuse across async boundaries
   - pre-size vectors/lists based on `n` to avoid reallocs in poll and lease building
+  - (likely win) split RocksDB namespaces into column families; see `docs/rocksdb-column-families.md`
 - [ ] (perf) improve poll wakeups
 - [X] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
@@ -48,6 +49,6 @@
 - [X] (major) ensure `extend` doesnt create multiple index entries for the same lease.
 - [X] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending
 - [X] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency. even now that we use a snapshotted txn in poll.
-<<<<<<< HEAD
 - [X] (perf) implement poll request coalescing to reduce contention - when multiple clients are polling simultaneously, batch their requests to reduce database contention and improve throughput ([sketch](docs/poll_coalescing_sketch.md))
 - [ ] (ci/perf) compare PR benchmark summary vs latest master artifact and post delta table in PR
+- [ ] add lightweight prometheus metrics for key SLIs and rocksdb stuff
