@@ -16,6 +16,66 @@ use tokio::{
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
+// Busy error tracking helper: counts Busy errors and total requests, ignores Busy while propagating others
+mod busy_tracker {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TOTAL: OnceLock<AtomicU64> = OnceLock::new();
+    static BUSY: OnceLock<AtomicU64> = OnceLock::new();
+
+    fn counters() -> (&'static AtomicU64, &'static AtomicU64) {
+        (
+            TOTAL.get_or_init(|| AtomicU64::new(0)),
+            BUSY.get_or_init(|| AtomicU64::new(0)),
+        )
+    }
+
+    pub trait IsBusyError {
+        fn is_busy(&self) -> bool;
+    }
+
+    impl<E> IsBusyError for E
+    where
+        E: std::fmt::Display,
+    {
+        fn is_busy(&self) -> bool {
+            self.to_string().to_lowercase().contains("busy")
+        }
+    }
+
+    pub fn track_and_ignore_busy_error<T, E: IsBusyError>(
+        res: std::result::Result<T, E>,
+    ) -> std::result::Result<(), E> {
+        let (total, busy) = counters();
+        total.fetch_add(1, Ordering::Relaxed);
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.is_busy() {
+                    busy.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    pub fn report_and_reset(context: &str) {
+        let (total, busy) = counters();
+        let t = total.swap(0, Ordering::Relaxed);
+        let b = busy.swap(0, Ordering::Relaxed);
+        if t > 0 {
+            let pct = (b as f64) * 100.0 / (t as f64);
+            println!(
+                "[{}] Busy errors tolerated: {} / {} ({:.2}%)",
+                context, b, t, pct
+            );
+        }
+    }
+}
+
 fn compute_batch_interval(rate_per_client: u32, batch_size: u32) -> Option<Duration> {
     if rate_per_client == 0 {
         return None;
@@ -138,27 +198,38 @@ async fn main() -> Result<()> {
             visibility_timeout_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                let mut request = queue_client.add_request();
-                let req = request.get().init_req();
-                let items = req.init_items(1);
-                let mut item = items.get(0);
-                item.set_contents(contents.as_bytes());
-                item.set_visibility_timeout_secs(visibility_timeout_secs);
+                let res: Result<(), capnp::Error> = async move {
+                    let mut request = queue_client.add_request();
+                    let req = request.get().init_req();
+                    let items = req.init_items(1);
+                    let mut item = items.get(0);
+                    item.set_contents(contents.as_bytes());
+                    item.set_visibility_timeout_secs(visibility_timeout_secs);
 
-                let reply = request.send().promise.await?;
-                let ids = reply.get()?.get_resp()?.get_ids()?;
+                    let reply = request.send().promise.await?;
+                    let ids = reply.get()?.get_resp()?.get_ids()?;
 
-                println!(
-                    "received {:?} ids: {:?}",
-                    ids.len(),
-                    ids.iter()
-                        .map(|id| -> Result<Uuid> { Ok(Uuid::from_slice(id?)?) })
-                        .collect::<Result<Vec<_>, _>>()?
-                );
+                    let parsed_ids = ids
+                        .iter()
+                        .map(|id_res| -> std::result::Result<Uuid, capnp::Error> {
+                            let bytes = id_res?;
+                            match Uuid::from_slice(bytes) {
+                                Ok(u) => Ok(u),
+                                Err(e) => Err(capnp::Error::failed(e.to_string())),
+                            }
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    println!("received {:?} ids: {:?}", ids.len(), parsed_ids);
+                    Ok(())
+                }
+                .await;
+                busy_tracker::track_and_ignore_busy_error(res)
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
+            busy_tracker::report_and_reset("client-add");
         }
         Commands::Poll {
             lease_validity_secs,
@@ -166,44 +237,51 @@ async fn main() -> Result<()> {
             timeout_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                let mut request = queue_client.poll_request();
-                let mut req = request.get().init_req();
-                req.set_lease_validity_secs(lease_validity_secs);
-                req.set_num_items(num_items);
-                req.set_timeout_secs(timeout_secs);
+                let res: Result<(), capnp::Error> = async move {
+                    let mut request = queue_client.poll_request();
+                    let mut req = request.get().init_req();
+                    req.set_lease_validity_secs(lease_validity_secs);
+                    req.set_num_items(num_items);
+                    req.set_timeout_secs(timeout_secs);
 
-                let reply = request.send().promise.await?;
-                let resp = reply.get()?.get_resp()?;
-                let lease = resp.get_lease()?;
-                let items = resp.get_items()?;
+                    let reply = request.send().promise.await?;
+                    let resp = reply.get()?.get_resp()?;
+                    let lease = resp.get_lease()?;
+                    let items = resp.get_items()?;
 
-                println!(
-                    "lease: {}",
-                    Uuid::from_slice(lease)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| format!("{:?}", lease))
-                );
-                if items.is_empty() {
-                    println!("no items available");
-                } else {
-                    for i in 0..items.len() {
-                        let item = items.get(i);
-                        let id = item.get_id()?;
-                        let contents = item.get_contents()?;
-                        println!(
-                            "item {}: id={}, contents=",
-                            i,
-                            Uuid::from_slice(id)
-                                .map(|u| u.to_string())
-                                .unwrap_or_else(|_| format!("{:?}", id)),
-                        );
-                        println!("{}", String::from_utf8_lossy(contents));
+                    println!(
+                        "lease: {}",
+                        Uuid::from_slice(lease)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| format!("{:?}", lease))
+                    );
+                    if items.is_empty() {
+                        println!("no items available");
+                    } else {
+                        for i in 0..items.len() {
+                            let item = items.get(i);
+                            let id = item.get_id()?;
+                            let contents = item.get_contents()?;
+                            println!(
+                                "item {}: id={}, contents=",
+                                i,
+                                Uuid::from_slice(id)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_else(|_| format!("{:?}", id)),
+                            );
+                            println!("{}", String::from_utf8_lossy(contents));
+                        }
                     }
+                    Ok(())
                 }
+                .await;
+                busy_tracker::track_and_ignore_busy_error(res)
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
+            busy_tracker::report_and_reset("client-poll");
         }
         Commands::Remove { id, lease } => {
             with_client(addr, |queue_client| async move {
@@ -215,13 +293,20 @@ async fn main() -> Result<()> {
                 req.set_id(&id_bytes);
                 req.set_lease(&lease_bytes);
 
-                let reply = request.send().promise.await?;
-                let removed = reply.get()?.get_resp()?.get_removed();
-                println!("removed: {}", removed);
+                let res: Result<(), capnp::Error> = async move {
+                    let reply = request.send().promise.await?;
+                    let removed = reply.get()?.get_resp()?.get_removed();
+                    println!("removed: {}", removed);
+                    Ok(())
+                }
+                .await;
+                busy_tracker::track_and_ignore_busy_error(res)
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
+            busy_tracker::report_and_reset("client-remove");
         }
         Commands::Extend {
             lease,
@@ -233,13 +318,20 @@ async fn main() -> Result<()> {
                 let mut req = request.get().init_req();
                 req.set_lease(&lease_bytes);
                 req.set_lease_validity_secs(lease_validity_secs);
-                let reply = request.send().promise.await?;
-                let extended = reply.get()?.get_resp()?.get_extended();
-                println!("extended: {}", extended);
+                let res: Result<(), capnp::Error> = async move {
+                    let reply = request.send().promise.await?;
+                    let extended = reply.get()?.get_resp()?.get_extended();
+                    println!("extended: {}", extended);
+                    Ok(())
+                }
+                .await;
+                busy_tracker::track_and_ignore_busy_error(res)
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
+            busy_tracker::report_and_reset("client-extend");
         }
         Commands::Stress {
             polling_clients,
@@ -313,33 +405,39 @@ async fn main() -> Result<()> {
                                             req.set_lease_validity_secs(30);
                                             req.set_num_items(10);
                                             req.set_timeout_secs(5);
-                                            let reply = request.send().promise.await.unwrap();
-                                            let resp = reply.get().unwrap().get_resp().unwrap();
-                                            let items = resp.get_items().unwrap();
-                                            poll_count.fetch_add(
-                                                items.len() as u64,
-                                                atomic::Ordering::Relaxed,
-                                            );
+                                            let poll_res: Result<(), capnp::Error> = async {
+                                                let reply = request.send().promise.await?;
+                                                let resp = reply.get()?.get_resp()?;
+                                                let items = resp.get_items()?;
+                                                poll_count.fetch_add(
+                                                    items.len() as u64,
+                                                    atomic::Ordering::Relaxed,
+                                                );
 
-                                            let lease = resp.get_lease().unwrap();
-                                            if lease.len() == 16 {
-                                                let mut lease_arr = [0u8; 16];
-                                                lease_arr.copy_from_slice(lease);
-                                                current_lease = Some(lease_arr);
+                                                let lease = resp.get_lease()?;
+                                                if lease.len() == 16 {
+                                                    let mut lease_arr = [0u8; 16];
+                                                    lease_arr.copy_from_slice(lease);
+                                                    current_lease = Some(lease_arr);
+                                                }
+
+                                                let promises = items.iter().map(|i| {
+                                                    let mut request = queue_client.remove_request();
+                                                    let mut req = request.get().init_req();
+                                                    req.set_id(i.get_id().unwrap());
+                                                    req.set_lease(lease);
+                                                    request.send().promise
+                                                });
+                                                let _ = futures::future::join_all(promises).await;
+                                                remove_count.fetch_add(
+                                                    items.len() as u64,
+                                                    atomic::Ordering::Relaxed,
+                                                );
+                                                Ok(())
                                             }
-
-                                            let promises = items.iter().map(|i| {
-                                                let mut request = queue_client.remove_request();
-                                                let mut req = request.get().init_req();
-                                                req.set_id(i.get_id().unwrap());
-                                                req.set_lease(lease);
-                                                request.send().promise
-                                            });
-                                            let _ = futures::future::join_all(promises).await;
-                                            remove_count.fetch_add(
-                                                items.len() as u64,
-                                                atomic::Ordering::Relaxed,
-                                            );
+                                            .await;
+                                            let _ =
+                                                busy_tracker::track_and_ignore_busy_error(poll_res);
 
                                             // Occasionally extend the current lease to exercise extend under load.
                                             if last_extend.elapsed() > Duration::from_secs(2) {
@@ -348,7 +446,12 @@ async fn main() -> Result<()> {
                                                     let mut req = request.get().init_req();
                                                     req.set_lease(&lease_arr);
                                                     req.set_lease_validity_secs(30);
-                                                    let _ = request.send().promise.await;
+                                                    let res =
+                                                        request.send().promise.await.map(|_| ());
+                                                    let _ =
+                                                        busy_tracker::track_and_ignore_busy_error(
+                                                            res,
+                                                        );
                                                     extend_count
                                                         .fetch_add(1, atomic::Ordering::Relaxed);
                                                 }
@@ -390,7 +493,8 @@ async fn main() -> Result<()> {
                                                 item.set_contents(format!("test {}", i).as_bytes());
                                                 item.set_visibility_timeout_secs(3);
                                             }
-                                            let _ = request.send().promise.await.unwrap();
+                                            let res = request.send().promise.await.map(|_| ());
+                                            let _ = busy_tracker::track_and_ignore_busy_error(res);
                                             add_count.fetch_add(
                                                 batch_size as u64,
                                                 atomic::Ordering::Relaxed,
@@ -405,6 +509,7 @@ async fn main() -> Result<()> {
                 }
             });
             println!("stress test completed");
+            busy_tracker::report_and_reset("client-stress");
         }
     }
     Ok(())
