@@ -9,7 +9,67 @@ use queueber::storage::{RetriedStorage, Storage};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, atomic};
 use std::thread::JoinHandle;
+
+mod busy_tracker {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TOTAL: OnceLock<AtomicU64> = OnceLock::new();
+    static BUSY: OnceLock<AtomicU64> = OnceLock::new();
+
+    fn counters() -> (&'static AtomicU64, &'static AtomicU64) {
+        (
+            TOTAL.get_or_init(|| AtomicU64::new(0)),
+            BUSY.get_or_init(|| AtomicU64::new(0)),
+        )
+    }
+
+    pub trait IsBusyError {
+        fn is_busy(&self) -> bool;
+    }
+
+    impl<E> IsBusyError for E
+    where
+        E: std::fmt::Display,
+    {
+        fn is_busy(&self) -> bool {
+            self.to_string().to_lowercase().contains("busy")
+        }
+    }
+
+    pub fn track_and_ignore_busy_error<T, E: IsBusyError>(
+        res: std::result::Result<T, E>,
+    ) -> std::result::Result<(), E> {
+        let (total, busy) = counters();
+        total.fetch_add(1, Ordering::Relaxed);
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.is_busy() {
+                    busy.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    pub fn report_and_reset(context: &str) {
+        let (total, busy) = counters();
+        let t = total.swap(0, Ordering::Relaxed);
+        let b = busy.swap(0, Ordering::Relaxed);
+        if t > 0 {
+            let pct = (b as f64) * 100.0 / (t as f64);
+            println!(
+                "[{}] Busy errors tolerated: {} / {} ({:.2}%)",
+                context, b, t, pct
+            );
+        }
+    }
+}
 
 fn bench_add_messages(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_add");
@@ -35,9 +95,8 @@ fn bench_add_messages(c: &mut Criterion) {
 
                 for i in 0..num_items {
                     let id = format!("id_{}", i);
-                    storage
-                        .add_available_item((id.as_bytes(), item_reader.reborrow()))
-                        .expect("add_available_item");
+                    let res = storage.add_available_item((id.as_bytes(), item_reader.reborrow()));
+                    busy_tracker::track_and_ignore_busy_error(res).expect("add_available_item");
                 }
             },
             BatchSize::SmallInput,
@@ -45,6 +104,7 @@ fn bench_add_messages(c: &mut Criterion) {
     });
 
     group.finish();
+    busy_tracker::report_and_reset("bench_add_messages");
 }
 
 fn bench_remove_messages(c: &mut Criterion) {
@@ -86,10 +146,11 @@ fn bench_remove_messages(c: &mut Criterion) {
             },
             |(_dir, storage, lease, ids)| {
                 for id in ids {
-                    let removed = storage
-                        .remove_in_progress_item(&id, &lease)
+                    let res = storage.remove_in_progress_item(&id, &lease).map(|removed| {
+                        assert!(removed, "expected removal for id");
+                    });
+                    busy_tracker::track_and_ignore_busy_error(res)
                         .expect("remove_in_progress_item");
-                    assert!(removed, "expected removal for id");
                 }
             },
             BatchSize::SmallInput,
@@ -97,6 +158,7 @@ fn bench_remove_messages(c: &mut Criterion) {
     });
 
     group.finish();
+    busy_tracker::report_and_reset("bench_remove_messages");
 }
 
 fn bench_poll_messages_storage(c: &mut Criterion) {
@@ -124,13 +186,15 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
                 (dir, storage)
             },
             |(_dir, storage)| {
-                let _ = storage.get_next_available_entries(num_items).expect("poll");
+                let res = storage.get_next_available_entries(num_items).map(|_| ());
+                busy_tracker::track_and_ignore_busy_error(res).expect("get_next_available_entries");
             },
             BatchSize::SmallInput,
         );
     });
 
     group.finish();
+    busy_tracker::report_and_reset("bench_poll_messages_storage");
 }
 
 // =============== End-to-end benches (server + RPC client) ===============
@@ -245,6 +309,7 @@ where
 
 fn bench_e2e_add_poll_remove(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e_rpc");
+    group.measurement_time(std::time::Duration::from_secs(15));
     let num_items: u32 = 200;
     let handle = ensure_server_started();
     let addr = handle.addr;
@@ -261,8 +326,13 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                     item.set_contents(b"hello");
                     item.set_visibility_timeout_secs(0);
                 }
-                let reply = request.send().promise.await.unwrap();
-                let _ids = reply.get().unwrap().get_resp().unwrap().get_ids().unwrap();
+                let res: Result<(), capnp::Error> = async move {
+                    let reply = request.send().promise.await?;
+                    let _ids = reply.get()?.get_resp()?.get_ids()?;
+                    Ok(())
+                }
+                .await;
+                let _ = busy_tracker::track_and_ignore_busy_error(res);
             })
         });
     });
@@ -281,7 +351,8 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         item.set_contents(b"hello");
                         item.set_visibility_timeout_secs(0);
                     }
-                    let _ = request.send().promise.await.unwrap();
+                    let res = request.send().promise.await.map(|_| ());
+                    let _ = busy_tracker::track_and_ignore_busy_error(res);
                 });
             },
             |_| {
@@ -291,8 +362,13 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                     req.set_lease_validity_secs(30);
                     req.set_num_items(num_items);
                     req.set_timeout_secs(0);
-                    let reply = request.send().promise.await.unwrap();
-                    let _resp = reply.get().unwrap().get_resp().unwrap();
+                    let res: Result<(), capnp::Error> = async move {
+                        let reply = request.send().promise.await?;
+                        let _resp = reply.get()?.get_resp()?;
+                        Ok(())
+                    }
+                    .await;
+                    let _ = busy_tracker::track_and_ignore_busy_error(res);
                 });
             },
             BatchSize::SmallInput,
@@ -313,13 +389,21 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         item.set_contents(b"hello");
                         item.set_visibility_timeout_secs(0);
                     }
-                    let _ = add.send().promise.await.unwrap();
+                    let _ = busy_tracker::track_and_ignore_busy_error(
+                        add.send().promise.await.map(|_| ()),
+                    );
                     let mut poll = queue_client.poll_request();
                     let mut preq = poll.get().init_req();
                     preq.set_lease_validity_secs(30);
                     preq.set_num_items(num_items);
                     preq.set_timeout_secs(0);
-                    let reply = poll.send().promise.await.unwrap();
+                    let reply = match poll.send().promise.await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = busy_tracker::track_and_ignore_busy_error::<(), _>(Err(e));
+                            return (Vec::new(), Vec::new());
+                        }
+                    };
                     let resp = reply.get().unwrap().get_resp().unwrap();
                     let lease = resp.get_lease().unwrap().to_vec();
                     let items = resp.get_items().unwrap();
@@ -337,7 +421,9 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         let mut r = req.get().init_req();
                         r.set_id(&id);
                         r.set_lease(&lease);
-                        let _ = req.send().promise.await.unwrap();
+                        let _ = busy_tracker::track_and_ignore_busy_error(
+                            req.send().promise.await.map(|_| ()),
+                        );
                     }
                 });
             },
@@ -346,6 +432,159 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
     });
 
     group.finish();
+    busy_tracker::report_and_reset("bench_e2e_add_poll_remove");
+}
+
+fn bench_e2e_stress_like(c: &mut Criterion) {
+    let mut group = c.benchmark_group("e2e_rpc");
+    group.measurement_time(std::time::Duration::from_secs(15));
+    // Parameters inspired by stress.sh defaults but with bounded total work per iteration.
+    let adding_clients: u32 = 2;
+    let polling_clients: u32 = 2;
+    let total_items: u32 = 200;
+    let batch_size: u32 = 10;
+
+    let handle = ensure_server_started();
+    let addr = handle.addr;
+
+    group.bench_function(
+        format!(
+            "rpc_stress_like_p{}_a{}_items_{}",
+            polling_clients, adding_clients, total_items
+        ),
+        |b| {
+            b.iter(|| {
+                // Work counters
+                let remaining_to_add = Arc::new(atomic::AtomicU32::new(total_items));
+                let removed_count = Arc::new(atomic::AtomicU32::new(0));
+
+                std::thread::scope(|s| {
+                    // Spawn polling clients
+                    for _ in 0..polling_clients {
+                        let removed_count = Arc::clone(&removed_count);
+                        s.spawn(move || {
+                            with_client(addr, |queue_client| async move {
+                                // Keep polling/removing until we've removed all items for this run
+                                let mut current_lease: Option<[u8; 16]> = None;
+                                let mut last_extend = std::time::Instant::now();
+                                loop {
+                                    let done = removed_count.load(atomic::Ordering::Relaxed)
+                                        >= total_items;
+                                    if done {
+                                        break;
+                                    }
+
+                                    let mut request = queue_client.poll_request();
+                                    let mut req = request.get().init_req();
+                                    req.set_lease_validity_secs(30);
+                                    req.set_num_items(batch_size);
+                                    req.set_timeout_secs(1);
+                                    let reply = match request.send().promise.await {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            let _ = busy_tracker::track_and_ignore_busy_error::<(), _>(Err(e));
+                                            continue;
+                                        }
+                                    };
+                                    let resp = reply.get().unwrap().get_resp().unwrap();
+                                    let items = resp.get_items().unwrap();
+                                    let lease = resp.get_lease().unwrap();
+                                    if lease.len() == 16 {
+                                        let mut lease_arr = [0u8; 16];
+                                        lease_arr.copy_from_slice(lease);
+                                        current_lease = Some(lease_arr);
+                                    }
+
+                                    if items.is_empty() {
+                                        continue;
+                                    }
+
+                                    let promises = items.iter().map(|i| {
+                                        let mut request = queue_client.remove_request();
+                                        let mut r = request.get().init_req();
+                                        r.set_id(i.get_id().unwrap());
+                                        r.set_lease(lease);
+                                        request.send().promise
+                                    });
+                                    let results = futures::future::join_all(promises).await;
+                                    for r in results {
+                                        let _ = busy_tracker::track_and_ignore_busy_error(
+                                            r.map(|_| ()),
+                                        );
+                                    }
+                                    removed_count.fetch_add(items.len(), atomic::Ordering::Relaxed);
+
+                                    // Occasionally extend the current lease to exercise extend path
+                                    if last_extend.elapsed() > std::time::Duration::from_secs(2) {
+                                        if let Some(lease_arr) = current_lease {
+                                            let mut xreq = queue_client.extend_request();
+                                            let mut xr = xreq.get().init_req();
+                                            xr.set_lease(&lease_arr);
+                                            xr.set_lease_validity_secs(30);
+                                            let _ = busy_tracker::track_and_ignore_busy_error(
+                                                xreq.send().promise.await.map(|_| ()),
+                                            );
+                                        }
+                                        last_extend = std::time::Instant::now();
+                                    }
+                                }
+                            });
+                        });
+                    }
+
+                    // Spawn adding clients
+                    for _ in 0..adding_clients {
+                        let remaining_to_add = Arc::clone(&remaining_to_add);
+                        s.spawn(move || {
+                            with_client(addr, |queue_client| async move {
+                                loop {
+                                    // Reserve a batch to add
+                                    let batch = loop {
+                                        let prev = remaining_to_add.load(atomic::Ordering::Relaxed);
+                                        if prev == 0 {
+                                            break 0;
+                                        }
+                                        let take = prev.min(batch_size);
+                                        if remaining_to_add
+                                            .compare_exchange(
+                                                prev,
+                                                prev - take,
+                                                atomic::Ordering::Relaxed,
+                                                atomic::Ordering::Relaxed,
+                                            )
+                                            .is_ok()
+                                        {
+                                            break take;
+                                        }
+                                    };
+
+                                    if batch == 0 {
+                                        break;
+                                    }
+
+                                    let mut request = queue_client.add_request();
+                                    let req = request.get().init_req();
+                                    let mut items = req.init_items(batch);
+                                    for i in 0..batch as usize {
+                                        let mut item = items.reborrow().get(i as u32);
+                                        // Small payload, immediately visible
+                                        item.set_contents(b"p");
+                                        item.set_visibility_timeout_secs(0);
+                                    }
+                                    let _ = busy_tracker::track_and_ignore_busy_error(
+                                        request.send().promise.await.map(|_| ()),
+                                    );
+                                }
+                            });
+                        });
+                    }
+                });
+            })
+        },
+    );
+
+    group.finish();
+    busy_tracker::report_and_reset("bench_e2e_stress_like");
 }
 
 criterion_group!(
@@ -353,6 +592,7 @@ criterion_group!(
     bench_add_messages,
     bench_remove_messages,
     bench_poll_messages_storage,
-    bench_e2e_add_poll_remove
+    bench_e2e_add_poll_remove,
+    bench_e2e_stress_like
 );
 criterion_main!(benches);

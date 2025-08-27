@@ -29,6 +29,14 @@
 - [X] (bugfix) why does the server just shut down under stress after a while with exit code 0 ...
 - [X] (perf) add `--workers` CLI flag and name RPC worker threads
 - [ ] (perf) improve performance
+  - (likely win) add iterator upper bounds to time-ordered scans (`visibility_index`, `lease_expiry_index`) to stop at now [implemented]
+  - (likely win) batch main value reads via `multi_get` in poll; batch writes where feasible
+  - [X] (likely win) reuse Cap'n Proto builders and byte buffers to cut allocations on hot paths
+  - (likely win) avoid reserializing `stored_item` during expiry; update index only or decouple index key from value
+  - guard expensive debug logging/UUID formatting behind level checks; sample logs under load
+  - evaluate pessimistic transactions under contention; compare retries vs lock waits
+  - reduce redundant copies (to_vec, id conversions); prefer borrowing/Arc reuse across async boundaries
+  - pre-size vectors/lists based on `n` to avoid reallocs in poll and lease building
 - [ ] (perf) improve poll wakeups
 - [X] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
@@ -37,7 +45,9 @@
 - [ ] (minor) use a mockable clock when generating uuidv7s
 - [ ] (perf) reduce unnecessary allocs, such as when copying data or allocating buffers. some is called out in code comments
 - [X] (perf) sort the keys in `LeaseEntry` so we can do bsearch on them
-- [ ] (major) ensure `extend` doesnt create multiple index entries for the same lease.
+- [X] (major) ensure `extend` doesnt create multiple index entries for the same lease.
 - [X] (perf) add lease expiry index key to `LeaseEntry` so we don't have to do scans to find it when extending
 - [X] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency. even now that we use a snapshotted txn in poll.
+<<<<<<< HEAD
 - [X] (perf) implement poll request coalescing to reduce contention - when multiple clients are polling simultaneously, batch their requests to reduce database contention and improve throughput ([sketch](docs/poll_coalescing_sketch.md))
+- [ ] (ci/perf) compare PR benchmark summary vs latest master artifact and post delta table in PR

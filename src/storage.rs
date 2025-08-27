@@ -131,6 +131,8 @@ impl Storage {
         I: IntoIterator<Item = (&'a [u8], (&'a [u8], u64))>,
     {
         let mut batch = WriteBatchWithTransaction::<true>::default();
+        // Reuse a byte buffer for capnp serialization across items to avoid repeated allocations.
+        let mut stored_contents: Vec<u8> = Vec::new();
         for (id, (contents, visibility_timeout_secs)) in items.into_iter() {
             let main_key = AvailableKey::from_id(id);
             let now = std::time::SystemTime::now();
@@ -145,7 +147,12 @@ impl Storage {
             stored_item.set_contents(contents);
             stored_item.set_id(id);
             stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
-            let mut stored_contents = Vec::with_capacity(simsg.size_in_words() * 8);
+            // Ensure buffer has enough capacity, then clear and reuse it
+            let needed = simsg.size_in_words() * 8;
+            if stored_contents.capacity() < needed {
+                stored_contents.reserve(needed - stored_contents.capacity());
+            }
+            stored_contents.clear();
             serialize::write_message(&mut stored_contents, &simsg)?;
 
             batch.put(main_key.as_ref(), &stored_contents);
@@ -217,6 +224,12 @@ impl Storage {
         let mut ro_iter = ReadOptions::default();
         ro_iter.set_snapshot(&snapshot);
         ro_iter.set_prefix_same_as_start(true);
+        // Upper bound: include all visibility_index entries with timestamp <= now_secs
+        // by setting an exclusive upper bound at (now_secs + 1).
+        let mut viz_upper_bound: Vec<u8> = Vec::with_capacity(VisibilityIndexKey::PREFIX.len() + 8);
+        viz_upper_bound.extend_from_slice(VisibilityIndexKey::PREFIX);
+        viz_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
+        ro_iter.set_iterate_upper_bound(viz_upper_bound.clone());
         let mut ro_get = ReadOptions::default();
         ro_get.set_snapshot(&snapshot);
         // Prefix-bounded forward iterator from the prefix start using the snapshot-bound ReadOptions
@@ -425,7 +438,17 @@ impl Storage {
         let mut processed = 0usize;
 
         let txn = self.db.transaction();
-        let iter = txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
+        // Restrict iterator to only keys with expiry_ts <= now by setting an
+        // exclusive upper bound at (now + 1).
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let mut expiry_upper_bound: Vec<u8> =
+            Vec::with_capacity(LeaseExpiryIndexKey::PREFIX.len() + 8);
+        expiry_upper_bound.extend_from_slice(LeaseExpiryIndexKey::PREFIX);
+        expiry_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
+        ro.set_iterate_upper_bound(expiry_upper_bound.clone());
+        let mode = IteratorMode::From(LeaseExpiryIndexKey::PREFIX, Direction::Forward);
+        let iter = txn.iterator_opt(mode, ro);
         // Avoid deleting keys while iterating; collect expiry index keys to delete later.
         let mut expiry_index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
         for kv in iter {
@@ -468,6 +491,10 @@ impl Storage {
             let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
             let keys = lease_entry_reader.get_ids()?;
 
+            // Reuse capnp builder and output buffer across items to reduce allocations.
+            let mut builder = capnp::message::Builder::new_default();
+            let mut updated: Vec<u8> = Vec::new();
+
             // Move each item back to available.
             for id in keys.iter() {
                 let id = id?;
@@ -485,7 +512,6 @@ impl Storage {
                     &mut &item_value[..],
                     message::ReaderOptions::new(),
                 )?;
-                let mut builder = capnp::message::Builder::new_default();
                 {
                     let item_reader = stored_msg.get_root::<protocol::stored_item::Reader>()?;
                     let mut stored_item = builder.init_root::<protocol::stored_item::Builder>();
@@ -498,7 +524,12 @@ impl Storage {
                     let mut stored_item = builder.get_root::<protocol::stored_item::Builder>()?;
                     stored_item.set_visibility_ts_index_key(vis_idx_now.as_bytes());
                 }
-                let mut updated = Vec::with_capacity(builder.size_in_words() * 8);
+                // Reuse buffer for serialization
+                let need = builder.size_in_words() * 8;
+                if updated.capacity() < need {
+                    updated.reserve(need - updated.capacity());
+                }
+                updated.clear();
                 serialize::write_message(&mut updated, &builder)?;
                 txn.put(avail_key.as_ref(), &updated)?;
                 txn.put(vis_idx_now.as_ref(), avail_key.as_ref())?;

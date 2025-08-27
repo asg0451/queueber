@@ -1,0 +1,133 @@
+name: Benchmarks (Criterion)
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  criterion:
+    name: Run Criterion benchmarks and track over time
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto jq libclang-19-dev
+
+      - name: Set up Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Show rustc version
+        run: rustc -Vv && cargo -V
+
+      - name: Build benches
+        run: cargo build --benches --locked
+
+      - name: Run tests (sanity)
+        run: |
+          cargo test --all --locked --no-fail-fast
+          cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Criterion benches
+        run: |
+          # Run all benches; Criterion outputs to target/criterion
+          cargo bench --all
+
+      - name: Debug list Criterion outputs
+        run: |
+          echo 'Criterion estimates files:'
+          find target/criterion -type f -name estimates.json -print 2>/dev/null || true
+          echo 'Directory summary:'
+          du -sh target/criterion || true
+
+      - name: Summarize Criterion results -> JSON (ms, smaller is better)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULTS=criterion-summary.json
+          echo '[]' > "$RESULTS"
+          shopt -s globstar nullglob
+          declare -A picked
+          files=(
+            target/criterion/**/new/estimates.json
+            target/criterion/**/estimates.json
+            target/criterion/**/base/estimates.json
+          )
+          for f in "${files[@]}"; do
+            [[ -f "$f" ]] || continue
+            # Build normalized bench id: strip prefix, strip estimates.json, drop trailing /new or /base
+            id=${f#target/criterion/}
+            id=${id%/estimates.json}
+            id=${id%/new}
+            id=${id%/base}
+            # Prefer earlier entries in files[] ordering
+            if [[ -n "${picked[$id]:-}" ]]; then
+              continue
+            fi
+            # Criterion stores time in nanoseconds in estimates.json
+            mean_ns=$(jq -r '.mean.point_estimate // .Mean.point_estimate // empty' "$f")
+            # Skip invalid/empty values
+            if [[ -z "$mean_ns" ]]; then
+              continue
+            fi
+            # Convert nanoseconds to milliseconds
+            ms=$(awk -v ns="$mean_ns" 'BEGIN{printf "%.3f", ns/1000000.0}')
+            tmp=$(mktemp)
+            jq --arg name "$id" --argjson value "$ms" '. + [{"name":$name,"value":$value}]' "$RESULTS" > "$tmp"
+            mv "$tmp" "$RESULTS"
+            picked[$id]=1
+          done
+          echo 'Generated summary:'
+          cat "$RESULTS"
+          # Fail clearly if empty to aid debugging
+          if [[ "$(jq 'length' "$RESULTS")" -eq 0 ]]; then
+            echo 'No Criterion estimates were summarized. See previous debug step for files present.'
+            exit 1
+          fi
+
+      - name: Upload Criterion raw output (artifact)
+        id: upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-output
+          path: |
+            target/criterion/**
+            criterion-summary.json
+          if-no-files-found: warn
+
+      - name: Comment PR with artifact link
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          header: benchmark-artifact
+          message: |
+            Benchmark artifacts uploaded: criterion-output
+            • Artifacts page: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            • Summary JSON: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -16,6 +16,7 @@ if [ $# -eq 0 ]; then
         -p 2
         -a 2
         -r0
+        -d 10
     )
 else
     args=("$@")
@@ -26,10 +27,17 @@ echo "Running client with args: ${args[*]}"
 ./target/release/client stress "${args[@]}" &
 client_pid=$!
 
-wait $server_pid
-server_exit_code=$?
 wait $client_pid
 client_exit_code=$?
+
+echo "Waiting for server to exit..."
+(
+    sleep 10
+    kill -9 $server_pid
+) &
+wait $server_pid
+server_exit_code=$?
+
 
 echo "Server exited with code $server_exit_code"
 echo "Client exited with code $client_exit_code"
