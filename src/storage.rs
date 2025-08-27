@@ -282,8 +282,18 @@ impl Storage {
                 stored_item.get_contents()?.len()
             );
 
-            // Build the polled item.
-            let mut builder = message::Builder::new_default(); // TODO: reduce allocs
+            // Build the polled item with a pre-sized first segment to avoid reallocations.
+            // Estimate words from contents and id sizes with a small overhead for struct/list headers.
+            let contents_len = stored_item.get_contents()?.len();
+            let id_len = stored_item.get_id()?.len();
+            let estimated_bytes = contents_len.saturating_add(id_len).saturating_add(32); // header + safety margin
+            let estimated_words: u32 = estimated_bytes
+                .div_ceil(8)
+                .try_into()
+                .unwrap_or(u32::MAX);
+            let mut builder = message::Builder::new(
+                message::HeapAllocator::new().first_segment_words(estimated_words),
+            );
             let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
             polled_item.set_contents(stored_item.get_contents()?);
             polled_item.set_id(stored_item.get_id()?);
@@ -589,7 +599,22 @@ fn build_lease_entry_message(
 ) -> Result<capnp::message::Builder<message::HeapAllocator>> {
     // Build the lease entry. capnp lists aren't dynamically sized so we
     // need to know how many to init before we start writing (?).
-    let mut lease_entry = message::Builder::new_default();
+    // Pre-size the first segment for the lease entry based on number of ids and their sizes
+    // to reduce allocator growth during writes.
+    let mut total_id_bytes: usize = 0;
+    for item in polled_items.iter() {
+        total_id_bytes = total_id_bytes.saturating_add(item.get()?.get_id()?.len());
+    }
+    // Rough estimate: ids data + per-element/list overhead + fields
+    let estimated_bytes = total_id_bytes
+        .saturating_add(polled_items.len().saturating_mul(16))
+        .saturating_add(64);
+    let estimated_words: u32 = estimated_bytes
+        .div_ceil(8)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let mut lease_entry =
+        message::Builder::new(message::HeapAllocator::new().first_segment_words(estimated_words));
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
     lease_entry_builder.set_expiry_ts_index_key(expiry_index_key_bytes);
