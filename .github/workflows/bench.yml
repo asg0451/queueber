@@ -11,6 +11,7 @@ permissions:
   contents: write
   actions: read
   checks: write
+  pull-requests: write
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -75,6 +76,10 @@ jobs:
               continue
             fi
             mean_sec=$(jq -r '.Mean.point_estimate' "$f")
+            # Skip invalid/empty values
+            if [[ -z "$mean_sec" || "$mean_sec" == "null" || "$mean_sec" == "" ]]; then
+              continue
+            fi
             # Convert seconds to milliseconds for readability
             ms=$(awk -v s="$mean_sec" 'BEGIN{printf "%.3f", s*1000}')
             tmp=$(mktemp)
@@ -101,6 +106,7 @@ jobs:
           fail-on-alert: false
 
       - name: Upload Criterion raw output (artifact)
+        id: upload_artifacts
         uses: actions/upload-artifact@v4
         with:
           name: criterion-output
@@ -108,3 +114,14 @@ jobs:
             target/criterion/**
             criterion-summary.json
           if-no-files-found: warn
+
+      - name: Comment PR with artifact link
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          header: benchmark-artifact
+          message: |
+            Benchmark artifacts uploaded: criterion-output
+            • Artifacts page: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            • Summary JSON: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
