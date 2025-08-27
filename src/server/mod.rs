@@ -119,35 +119,49 @@ impl crate::protocol::queue::Server for Server {
         let req = req.get_req()?;
         let items = req.get_items()?;
 
-        // Generate ids upfront and copy request data into owned memory so we can move
-        // it into a blocking task (capnp readers are not Send).
-        // Store ids inline as [u8;16] to avoid per-id heap allocations.
+        // Generate ids upfront. Store ids inline as [u8;16] to avoid per-id heap allocations.
         let ids: Vec<[u8; 16]> = items
             .iter()
             .map(|_| uuid::Uuid::now_v7().into_bytes())
             .collect();
 
-        let items_owned = items
-            .iter()
-            .map(|item| -> Result<_> {
-                let contents = item.get_contents()?.to_vec();
-                let vis = item.get_visibility_timeout_secs();
-                Ok((contents, vis))
-            })
-            .collect::<Result<Vec<_>>>()
-            .map_err(Into::<capnp::Error>::into)?;
+        // Minimize allocations by packing all contents into a single buffer and
+        // referencing slices into it, instead of allocating a Vec per item.
+        let num_items = items.len() as usize;
+        let mut total_contents_len: usize = 0;
+        let mut visibilities: Vec<u64> = Vec::with_capacity(num_items);
+        let mut any_immediately_visible = false;
+        for item in items.iter() {
+            let contents = item.get_contents()?;
+            total_contents_len = total_contents_len.saturating_add(contents.len());
+            let vis = item.get_visibility_timeout_secs();
+            if vis == 0 {
+                any_immediately_visible = true;
+            }
+            visibilities.push(vis);
+        }
 
-        let any_immediately_visible = items_owned.iter().any(|(_, vis)| *vis == 0);
+        let mut packed_contents: Vec<u8> = Vec::with_capacity(total_contents_len);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_items);
+        for item in items.iter() {
+            let contents = item.get_contents()?;
+            let start = packed_contents.len();
+            packed_contents.extend_from_slice(contents);
+            let len = contents.len();
+            ranges.push((start, len));
+        }
 
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
 
         Promise::from_future(async move {
             // Offload RocksDB work to the blocking thread pool.
-            let iter = ids
-                .iter()
-                .map(|id| id.as_slice())
-                .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+            let iter = ids.iter().map(|id| id.as_slice()).zip(
+                ranges
+                    .iter()
+                    .zip(visibilities.iter())
+                    .map(|((start, len), v)| (&packed_contents[*start..*start + *len], *v)),
+            );
             storage.add_available_items_from_parts(iter).await?;
 
             if any_immediately_visible {
