@@ -73,8 +73,8 @@ impl Storage {
             .unwrap_or(2);
         // Increase parallelism also sets max_background_jobs if larger in RocksDB
         opts.increase_parallelism(cpus);
-        // Keep background jobs roughly equal to CPU count to avoid contention
-        opts.set_max_background_jobs(cpus);
+        // Allow more background jobs for compaction/flush to reduce write stalls
+        opts.set_max_background_jobs(cpus.saturating_mul(2));
 
         // Enable prefix extractor for our namespace scheme (before creating bloom)
         // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
@@ -103,8 +103,8 @@ impl Storage {
             // 10 bits per key is a good latency/false-positive tradeoff
             bopts.set_bloom_filter(10.0, false);
             bopts.set_whole_key_filtering(true);
-            // Smaller block size helps random point lookups typical in poll
-            bopts.set_block_size(8 * 1024);
+            // 32 KiB block size balances CPU and I/O
+            bopts.set_block_size(32 * 1024);
             // Cache index+filter blocks to reduce I/O under scan/prefix iterator
             bopts.set_cache_index_and_filter_blocks(true);
             // Avoid partitioned filters; increases CPU on small/index-centric workloads

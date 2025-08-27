@@ -1,0 +1,60 @@
+
+running 15 tests
+iiiiiiiiiiiiiii
+test result: ok. 0 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+ii
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+iii
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+storage_add/add_available_500
+                        time:   [7.1581 ms 7.3818 ms 7.6308 ms]
+                        change: [+7.4683% +10.743% +15.614%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 16 outliers among 100 measurements (16.00%)
+  10 (10.00%) high mild
+  6 (6.00%) high severe
+
+storage_remove/remove_in_progress_500
+                        time:   [14.432 ms 14.715 ms 15.034 ms]
+                        change: [+4.0189% +5.9532% +8.1366%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+
+storage_poll/get_next_available_entries_500
+                        time:   [9.1169 ms 9.3460 ms 9.5942 ms]
+                        change: [+2.9014% +5.2808% +8.2718%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 16 outliers among 100 measurements (16.00%)
+  9 (9.00%) high mild
+  7 (7.00%) high severe
+
+e2e_rpc/rpc_add_batch_200
+                        time:   [501.12 µs 507.65 µs 514.94 µs]
+                        change: [+3.1384% +5.3169% +7.4291%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+e2e_rpc/rpc_poll_batch_200
+                        time:   [36.257 ms 38.757 ms 41.264 ms]
+                        change: [-7.5339% +0.4694% +9.2683%] (p = 0.91 > 0.05)
+                        No change in performance detected.
+e2e_rpc/rpc_remove_each_200
+                        time:   [10.503 ms 10.749 ms 11.040 ms]
+                        change: [-3.6378% -0.6125% +2.6352%] (p = 0.71 > 0.05)
+                        No change in performance detected.
+Found 12 outliers among 100 measurements (12.00%)
+  8 (8.00%) high mild
+  4 (4.00%) high severe
+
+
