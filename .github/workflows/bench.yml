@@ -81,22 +81,23 @@ jobs:
           )
           for f in "${files[@]}"; do
             [[ -f "$f" ]] || continue
-            # Extract full bench id between target/criterion/ and (new|base|estimates.json)
+            # Build normalized bench id: strip prefix, strip estimates.json, drop trailing /new or /base
             id=${f#target/criterion/}
             id=${id%/estimates.json}
-            id=${id%/new/estimates.json}
-            id=${id%/base/estimates.json}
+            id=${id%/new}
+            id=${id%/base}
             # Prefer earlier entries in files[] ordering
             if [[ -n "${picked[$id]:-}" ]]; then
               continue
             fi
-            mean_sec=$(jq -r '.Mean.point_estimate' "$f")
+            # Criterion stores time in nanoseconds in estimates.json
+            mean_ns=$(jq -r '.mean.point_estimate // .Mean.point_estimate // empty' "$f")
             # Skip invalid/empty values
-            if [[ -z "$mean_sec" || "$mean_sec" == "null" || "$mean_sec" == "" ]]; then
+            if [[ -z "$mean_ns" ]]; then
               continue
             fi
-            # Convert seconds to milliseconds for readability
-            ms=$(awk -v s="$mean_sec" 'BEGIN{printf "%.3f", s*1000}')
+            # Convert nanoseconds to milliseconds
+            ms=$(awk -v ns="$mean_ns" 'BEGIN{printf "%.3f", ns/1000000.0}')
             tmp=$(mktemp)
             jq --arg name "$id" --argjson value "$ms" '. + [{"name":$name,"value":$value}]' "$RESULTS" > "$tmp"
             mv "$tmp" "$RESULTS"
@@ -106,7 +107,7 @@ jobs:
           cat "$RESULTS"
           # Fail clearly if empty to aid debugging
           if [[ "$(jq 'length' "$RESULTS")" -eq 0 ]]; then
-            echo 'No Criterion estimates were found. See previous debug step for files present.'
+            echo 'No Criterion estimates were summarized. See previous debug step for files present.'
             exit 1
           fi
 
