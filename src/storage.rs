@@ -217,6 +217,12 @@ impl Storage {
         let mut ro_iter = ReadOptions::default();
         ro_iter.set_snapshot(&snapshot);
         ro_iter.set_prefix_same_as_start(true);
+        // Upper bound: include all visibility_index entries with timestamp <= now_secs
+        // by setting an exclusive upper bound at (now_secs + 1).
+        let mut viz_upper_bound: Vec<u8> = Vec::with_capacity(VisibilityIndexKey::PREFIX.len() + 8);
+        viz_upper_bound.extend_from_slice(VisibilityIndexKey::PREFIX);
+        viz_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
+        ro_iter.set_iterate_upper_bound(viz_upper_bound.clone());
         let mut ro_get = ReadOptions::default();
         ro_get.set_snapshot(&snapshot);
         // Prefix-bounded forward iterator from the prefix start using the snapshot-bound ReadOptions
@@ -425,7 +431,17 @@ impl Storage {
         let mut processed = 0usize;
 
         let txn = self.db.transaction();
-        let iter = txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX);
+        // Restrict iterator to only keys with expiry_ts <= now by setting an
+        // exclusive upper bound at (now + 1).
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let mut expiry_upper_bound: Vec<u8> =
+            Vec::with_capacity(LeaseExpiryIndexKey::PREFIX.len() + 8);
+        expiry_upper_bound.extend_from_slice(LeaseExpiryIndexKey::PREFIX);
+        expiry_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
+        ro.set_iterate_upper_bound(expiry_upper_bound.clone());
+        let mode = IteratorMode::From(LeaseExpiryIndexKey::PREFIX, Direction::Forward);
+        let iter = txn.iterator_opt(mode, ro);
         // Avoid deleting keys while iterating; collect expiry index keys to delete later.
         let mut expiry_index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
         for kv in iter {
