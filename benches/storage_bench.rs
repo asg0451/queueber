@@ -284,7 +284,8 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         item.set_contents(b"hello");
                         item.set_visibility_timeout_secs(0);
                     }
-                    let _ = request.send().promise.await;
+                    let _ =
+                        track_capnp_and_ignore_busy(request.send().promise.await, "rpc_add_batch");
                 });
             },
             |_| {
@@ -294,7 +295,8 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                     req.set_lease_validity_secs(30);
                     req.set_num_items(num_items);
                     req.set_timeout_secs(0);
-                    let _ = request.send().promise.await;
+                    let _ =
+                        track_capnp_and_ignore_busy(request.send().promise.await, "rpc_poll_batch");
                 });
             },
             BatchSize::SmallInput,
@@ -315,7 +317,10 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         item.set_contents(b"hello");
                         item.set_visibility_timeout_secs(0);
                     }
-                    let _ = add.send().promise.await;
+                    let _ = track_capnp_and_ignore_busy(
+                        add.send().promise.await,
+                        "rpc_remove_setup_add",
+                    );
 
                     let mut poll = queue_client.poll_request();
                     let mut preq = poll.get().init_req();
@@ -343,7 +348,10 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                         let mut r = req.get().init_req();
                         r.set_id(&id);
                         r.set_lease(&lease);
-                        let _ = req.send().promise.await;
+                        let _ = track_capnp_and_ignore_busy(
+                            req.send().promise.await,
+                            "rpc_remove_each",
+                        );
                     }
                 });
             },
@@ -448,7 +456,10 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                             let mut xr = xreq.get().init_req();
                                             xr.set_lease(&lease_arr);
                                             xr.set_lease_validity_secs(30);
-                                            let _ = xreq.send().promise.await;
+                                            let _ = track_capnp_and_ignore_busy(
+                                                xreq.send().promise.await,
+                                                "rpc_stress_extend",
+                                            );
                                         }
                                         last_extend = std::time::Instant::now();
                                     }
@@ -496,7 +507,10 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                         item.set_contents(b"p");
                                         item.set_visibility_timeout_secs(0);
                                     }
-                                    let _ = request.send().promise.await;
+                                    let _ = track_capnp_and_ignore_busy(
+                                        request.send().promise.await,
+                                        "rpc_stress_add",
+                                    );
                                 }
                             });
                         });
@@ -534,6 +548,21 @@ fn track_and_ignore_busy_error<T>(
                 Ok(None)
             } else {
                 Err(e)
+            }
+        }
+    }
+}
+
+fn track_capnp_and_ignore_busy<T>(res: Result<T, capnp::Error>, label: &str) -> Option<T> {
+    match res {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("Busy") || msg.contains("busy") || msg.contains("resource busy") {
+                eprintln!("{}: busy (ignored)", label);
+                None
+            } else {
+                panic!("{}", e);
             }
         }
     }
