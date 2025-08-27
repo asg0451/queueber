@@ -478,7 +478,7 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                     let mut req = request.get().init_req();
                                     req.set_lease_validity_secs(30);
                                     req.set_num_items(batch_size);
-                                    req.set_timeout_secs(1);
+                                    req.set_timeout_secs(5);
                                     let reply = match request.send().promise.await {
                                         Ok(r) => r,
                                         Err(e) => {
@@ -570,9 +570,9 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                     let mut items = req.init_items(batch);
                                     for i in 0..batch as usize {
                                         let mut item = items.reborrow().get(i as u32);
-                                        // Small payload, immediately visible
+                                        // Small payload, delayed visibility to mimic stress client
                                         item.set_contents(b"p");
-                                        item.set_visibility_timeout_secs(0);
+                                        item.set_visibility_timeout_secs(3);
                                     }
                                     let _ = busy_tracker::track_and_ignore_busy_error(
                                         request.send().promise.await.map(|_| ()),
