@@ -27,7 +27,7 @@ fn bench_add_messages(c: &mut Criterion) {
                 // Keep dir alive with storage by returning it as part of the state
                 (dir, storage)
             },
-            |(_dir, storage)| {
+            |(_dir, storage)| -> Result<(), queueber::errors::Error> {
                 // Build the item once and reuse it; only IDs change per insert
                 let mut msg = CapnpBuilder::new_default();
                 let mut item = msg.init_root::<protocol::item::Builder>();
@@ -35,31 +35,13 @@ fn bench_add_messages(c: &mut Criterion) {
                 item.set_visibility_timeout_secs(0);
                 let item_reader = item.into_reader();
 
-                let mut total_reqs: u64 = 0;
-                let mut busy_reqs: u64 = 0;
                 for i in 0..num_items {
                     let id = format!("id_{}", i);
-                    total_reqs += 1;
-                    match storage.add_available_item((id.as_bytes(), item_reader.reborrow())) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            if let queueber::errors::Error::Rocksdb { ref source, .. } = e
-                                && source.kind() == rocksdb::ErrorKind::Busy
-                            {
-                                busy_reqs += 1;
-                                continue;
-                            }
-                            panic!("{}", e);
-                        }
-                    }
+                    track_and_ignore_busy_error(
+                        storage.add_available_item((id.as_bytes(), item_reader.reborrow())),
+                    )?;
                 }
-                if total_reqs > 0 {
-                    let pct = (busy_reqs as f64 / total_reqs as f64) * 100.0;
-                    eprintln!(
-                        "bench storage_add: busy {:.1}% ({} / {})",
-                        pct, busy_reqs, total_reqs
-                    );
-                }
+                Ok(())
             },
             BatchSize::SmallInput,
         );
@@ -105,31 +87,11 @@ fn bench_remove_messages(c: &mut Criterion) {
 
                 (dir, storage, lease, ids)
             },
-            |(_dir, storage, lease, ids)| {
-                let mut total_reqs: u64 = 0;
-                let mut busy_reqs: u64 = 0;
+            |(_dir, storage, lease, ids)| -> Result<(), queueber::errors::Error> {
                 for id in ids {
-                    total_reqs += 1;
-                    match storage.remove_in_progress_item(&id, &lease) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            if let queueber::errors::Error::Rocksdb { ref source, .. } = e
-                                && source.kind() == rocksdb::ErrorKind::Busy
-                            {
-                                busy_reqs += 1;
-                                continue;
-                            }
-                            panic!("{}", e);
-                        }
-                    }
+                    track_and_ignore_busy_error(storage.remove_in_progress_item(&id, &lease))?;
                 }
-                if total_reqs > 0 {
-                    let pct = (busy_reqs as f64 / total_reqs as f64) * 100.0;
-                    eprintln!(
-                        "bench storage_remove: busy {:.1}% ({} / {})",
-                        pct, busy_reqs, total_reqs
-                    );
-                }
+                Ok(())
             },
             BatchSize::SmallInput,
         );
@@ -162,31 +124,9 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
                 }
                 (dir, storage)
             },
-            |(_dir, storage)| {
-                let mut total_reqs: u64 = 0;
-                let mut busy_reqs: u64 = 0;
-                total_reqs += 1;
-                match storage.get_next_available_entries(num_items) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if let queueber::errors::Error::Rocksdb { ref source, .. } = e {
-                            if source.kind() == rocksdb::ErrorKind::Busy {
-                                busy_reqs += 1;
-                            } else {
-                                panic!("{}", e);
-                            }
-                        } else {
-                            panic!("{}", e);
-                        }
-                    }
-                }
-                if total_reqs > 0 {
-                    let pct = (busy_reqs as f64 / total_reqs as f64) * 100.0;
-                    eprintln!(
-                        "bench storage_poll: busy {:.1}% ({} / {})",
-                        pct, busy_reqs, total_reqs
-                    );
-                }
+            |(_dir, storage)| -> Result<(), queueber::errors::Error> {
+                let _ = track_and_ignore_busy_error(storage.get_next_available_entries(num_items))?;
+                Ok(())
             },
             BatchSize::SmallInput,
         );
@@ -646,6 +586,24 @@ where
                 };
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                 attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn track_and_ignore_busy_error<T>(
+    res: Result<T, queueber::errors::Error>,
+) -> Result<Option<T>, queueber::errors::Error> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            if let queueber::errors::Error::Rocksdb { ref source, .. } = e
+                && source.kind() == rocksdb::ErrorKind::Busy
+            {
+                eprintln!("busy (ignored)");
+                Ok(None)
+            } else {
+                Err(e)
             }
         }
     }
