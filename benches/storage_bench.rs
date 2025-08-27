@@ -6,6 +6,7 @@ use futures::AsyncReadExt;
 use queueber::protocol;
 use queueber::protocol::queue;
 use queueber::storage::{RetriedStorage, Storage};
+use rand::Rng;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
@@ -36,9 +37,10 @@ fn bench_add_messages(c: &mut Criterion) {
 
                 for i in 0..num_items {
                     let id = format!("id_{}", i);
-                    storage
-                        .add_available_item((id.as_bytes(), item_reader.reborrow()))
-                        .expect("add_available_item");
+                    retry_rocksdb_busy_sync("bench_add_available_item", || {
+                        storage.add_available_item((id.as_bytes(), item_reader.reborrow()))
+                    })
+                    .expect("add_available_item");
                 }
             },
             BatchSize::SmallInput,
@@ -87,9 +89,10 @@ fn bench_remove_messages(c: &mut Criterion) {
             },
             |(_dir, storage, lease, ids)| {
                 for id in ids {
-                    let removed = storage
-                        .remove_in_progress_item(&id, &lease)
-                        .expect("remove_in_progress_item");
+                    let removed = retry_rocksdb_busy_sync("bench_remove_in_progress_item", || {
+                        storage.remove_in_progress_item(&id, &lease)
+                    })
+                    .expect("remove_in_progress_item");
                     assert!(removed, "expected removal for id");
                 }
             },
@@ -125,7 +128,10 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
                 (dir, storage)
             },
             |(_dir, storage)| {
-                let _ = storage.get_next_available_entries(num_items).expect("poll");
+                let _ = retry_rocksdb_busy_sync("bench_get_next_available_entries", || {
+                    storage.get_next_available_entries(num_items)
+                })
+                .expect("poll");
             },
             BatchSize::SmallInput,
         );
@@ -275,26 +281,36 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
             || {
                 // preload N items
                 with_client(addr, |queue_client| async move {
-                    let mut request = queue_client.add_request();
-                    let req = request.get().init_req();
-                    let mut items = req.init_items(num_items);
-                    for i in 0..num_items {
-                        let mut item = items.reborrow().get(i);
-                        item.set_contents(b"hello");
-                        item.set_visibility_timeout_secs(0);
-                    }
-                    let _ = request.send().promise.await.unwrap();
+                    retry_capnp_busy("bench_rpc_add_batch", || async {
+                        let mut request = queue_client.add_request();
+                        let req = request.get().init_req();
+                        let mut items = req.init_items(num_items);
+                        for i in 0..num_items {
+                            let mut item = items.reborrow().get(i);
+                            item.set_contents(b"hello");
+                            item.set_visibility_timeout_secs(0);
+                        }
+                        let _ = request.send().promise.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
                 });
             },
             |_| {
                 with_client(addr, |queue_client| async move {
-                    let mut request = queue_client.poll_request();
-                    let mut req = request.get().init_req();
-                    req.set_lease_validity_secs(30);
-                    req.set_num_items(num_items);
-                    req.set_timeout_secs(0);
-                    let reply = request.send().promise.await.unwrap();
-                    let _resp = reply.get().unwrap().get_resp().unwrap();
+                    retry_capnp_busy("bench_rpc_poll_batch", || async {
+                        let mut request = queue_client.poll_request();
+                        let mut req = request.get().init_req();
+                        req.set_lease_validity_secs(30);
+                        req.set_num_items(num_items);
+                        req.set_timeout_secs(0);
+                        let reply = request.send().promise.await.unwrap();
+                        let _resp = reply.get().unwrap().get_resp().unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -307,39 +323,56 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
             || {
                 // Preload and poll to get lease and ids
                 with_client(addr, |queue_client| async move {
-                    let mut add = queue_client.add_request();
-                    let req = add.get().init_req();
-                    let mut items = req.init_items(num_items);
-                    for i in 0..num_items {
-                        let mut item = items.reborrow().get(i);
-                        item.set_contents(b"hello");
-                        item.set_visibility_timeout_secs(0);
-                    }
-                    let _ = add.send().promise.await.unwrap();
-                    let mut poll = queue_client.poll_request();
-                    let mut preq = poll.get().init_req();
-                    preq.set_lease_validity_secs(30);
-                    preq.set_num_items(num_items);
-                    preq.set_timeout_secs(0);
-                    let reply = poll.send().promise.await.unwrap();
-                    let resp = reply.get().unwrap().get_resp().unwrap();
-                    let lease = resp.get_lease().unwrap().to_vec();
-                    let items = resp.get_items().unwrap();
-                    let mut ids: Vec<Vec<u8>> = Vec::with_capacity(items.len() as usize);
-                    for i in 0..items.len() {
-                        ids.push(items.get(i).get_id().unwrap().to_vec());
-                    }
+                    retry_capnp_busy("bench_rpc_add_then_poll_setup", || async {
+                        let mut add = queue_client.add_request();
+                        let req = add.get().init_req();
+                        let mut items = req.init_items(num_items);
+                        for i in 0..num_items {
+                            let mut item = items.reborrow().get(i);
+                            item.set_contents(b"hello");
+                            item.set_visibility_timeout_secs(0);
+                        }
+                        let _ = add.send().promise.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+
+                    let (lease, ids) =
+                        retry_capnp_busy("bench_rpc_poll_after_add_setup", || async {
+                            let mut poll = queue_client.poll_request();
+                            let mut preq = poll.get().init_req();
+                            preq.set_lease_validity_secs(30);
+                            preq.set_num_items(num_items);
+                            preq.set_timeout_secs(0);
+                            let reply = poll.send().promise.await.unwrap();
+                            let resp = reply.get().unwrap().get_resp().unwrap();
+                            let lease = resp.get_lease().unwrap().to_vec();
+                            let items = resp.get_items().unwrap();
+                            let mut ids: Vec<Vec<u8>> = Vec::with_capacity(items.len() as usize);
+                            for i in 0..items.len() {
+                                ids.push(items.get(i).get_id().unwrap().to_vec());
+                            }
+                            Ok::<_, capnp::Error>((lease, ids))
+                        })
+                        .await
+                        .unwrap();
                     (lease, ids)
                 })
             },
             |(lease, ids)| {
                 with_client(addr, |queue_client| async move {
                     for id in ids {
-                        let mut req = queue_client.remove_request();
-                        let mut r = req.get().init_req();
-                        r.set_id(&id);
-                        r.set_lease(&lease);
-                        let _ = req.send().promise.await.unwrap();
+                        retry_capnp_busy("bench_rpc_remove_each", || async {
+                            let mut req = queue_client.remove_request();
+                            let mut r = req.get().init_req();
+                            r.set_id(&id);
+                            r.set_lease(&lease);
+                            let _ = req.send().promise.await.unwrap();
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
                     }
                 });
             },
@@ -389,43 +422,75 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                         break;
                                     }
 
-                                    let mut request = queue_client.poll_request();
-                                    let mut req = request.get().init_req();
-                                    req.set_lease_validity_secs(30);
-                                    req.set_num_items(batch_size);
-                                    req.set_timeout_secs(1);
-                                    let reply = request.send().promise.await.unwrap();
-                                    let resp = reply.get().unwrap().get_resp().unwrap();
-                                    let items = resp.get_items().unwrap();
-                                    let lease = resp.get_lease().unwrap();
+                                    let (items_len, lease_vec) =
+                                        retry_capnp_busy("bench_rpc_stress_like_poll", || async {
+                                            let mut request = queue_client.poll_request();
+                                            let mut req = request.get().init_req();
+                                            req.set_lease_validity_secs(30);
+                                            req.set_num_items(batch_size);
+                                            req.set_timeout_secs(1);
+                                            let reply = request.send().promise.await.unwrap();
+                                            let resp = reply.get().unwrap().get_resp().unwrap();
+                                            let items = resp.get_items().unwrap();
+                                            let lease = resp.get_lease().unwrap();
+                                            Ok::<_, capnp::Error>((items.len(), lease.to_vec()))
+                                        })
+                                        .await
+                                        .unwrap();
+                                    let lease = &lease_vec;
                                     if lease.len() == 16 {
                                         let mut lease_arr = [0u8; 16];
                                         lease_arr.copy_from_slice(lease);
                                         current_lease = Some(lease_arr);
                                     }
 
-                                    if items.is_empty() {
+                                    if items_len == 0 {
                                         continue;
                                     }
 
-                                    let promises = items.iter().map(|i| {
-                                        let mut request = queue_client.remove_request();
-                                        let mut r = request.get().init_req();
-                                        r.set_id(i.get_id().unwrap());
-                                        r.set_lease(lease);
-                                        request.send().promise
-                                    });
-                                    let _ = futures::future::join_all(promises).await;
-                                    removed_count.fetch_add(items.len(), atomic::Ordering::Relaxed);
+                                    retry_capnp_busy("bench_rpc_stress_like_remove", || async {
+                                        // Remove up to batch_size items by issuing batch_size remove calls.
+                                        // We don't have the ids from the fast path above, so poll again immediately with num_items=batch_size
+                                        let mut preq = queue_client.poll_request();
+                                        let mut pr = preq.get().init_req();
+                                        pr.set_lease_validity_secs(30);
+                                        pr.set_num_items(batch_size);
+                                        pr.set_timeout_secs(0);
+                                        let reply = preq.send().promise.await.unwrap();
+                                        let resp = reply.get().unwrap().get_resp().unwrap();
+                                        let items = resp.get_items().unwrap();
+                                        let lease2 = resp.get_lease().unwrap();
+                                        let promises = items.iter().map(|i| {
+                                            let mut request = queue_client.remove_request();
+                                            let mut r = request.get().init_req();
+                                            r.set_id(i.get_id().unwrap());
+                                            r.set_lease(lease2);
+                                            request.send().promise
+                                        });
+                                        let _ = futures::future::join_all(promises).await;
+                                        removed_count
+                                            .fetch_add(items.len(), atomic::Ordering::Relaxed);
+                                        Ok(())
+                                    })
+                                    .await
+                                    .unwrap();
 
                                     // Occasionally extend the current lease to exercise extend path
                                     if last_extend.elapsed() > std::time::Duration::from_secs(2) {
                                         if let Some(lease_arr) = current_lease {
-                                            let mut xreq = queue_client.extend_request();
-                                            let mut xr = xreq.get().init_req();
-                                            xr.set_lease(&lease_arr);
-                                            xr.set_lease_validity_secs(30);
-                                            let _ = xreq.send().promise.await;
+                                            retry_capnp_busy(
+                                                "bench_rpc_stress_like_extend",
+                                                || async {
+                                                    let mut xreq = queue_client.extend_request();
+                                                    let mut xr = xreq.get().init_req();
+                                                    xr.set_lease(&lease_arr);
+                                                    xr.set_lease_validity_secs(30);
+                                                    let _ = xreq.send().promise.await;
+                                                    Ok(())
+                                                },
+                                            )
+                                            .await
+                                            .unwrap();
                                         }
                                         last_extend = std::time::Instant::now();
                                     }
@@ -464,16 +529,21 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                         break;
                                     }
 
-                                    let mut request = queue_client.add_request();
-                                    let req = request.get().init_req();
-                                    let mut items = req.init_items(batch);
-                                    for i in 0..batch as usize {
-                                        let mut item = items.reborrow().get(i as u32);
-                                        // Small payload, immediately visible
-                                        item.set_contents(b"p");
-                                        item.set_visibility_timeout_secs(0);
-                                    }
-                                    let _ = request.send().promise.await.unwrap();
+                                    retry_capnp_busy("bench_rpc_stress_like_add", || async {
+                                        let mut request = queue_client.add_request();
+                                        let req = request.get().init_req();
+                                        let mut items = req.init_items(batch);
+                                        for i in 0..batch as usize {
+                                            let mut item = items.reborrow().get(i as u32);
+                                            // Small payload, immediately visible
+                                            item.set_contents(b"p");
+                                            item.set_visibility_timeout_secs(0);
+                                        }
+                                        let _ = request.send().promise.await.unwrap();
+                                        Ok(())
+                                    })
+                                    .await
+                                    .unwrap();
                                 }
                             });
                         });
@@ -495,3 +565,85 @@ criterion_group!(
     bench_e2e_stress_like
 );
 criterion_main!(benches);
+
+fn retry_rocksdb_busy_sync<T, F>(name: &str, mut f: F) -> Result<T, queueber::errors::Error>
+where
+    F: FnMut() -> Result<T, queueber::errors::Error>,
+{
+    const MAX_RETRIES: u32 = 8;
+    const BASE_DELAY_MS: u64 = 10;
+    const MAX_DELAY_MS: u64 = 1000;
+    let mut attempt: u32 = 0;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let is_busy = matches!(
+                    e,
+                    queueber::errors::Error::Rocksdb { ref source, .. }
+                        if source.kind() == rocksdb::ErrorKind::Busy
+                );
+                if !is_busy {
+                    return Err(e);
+                }
+                if attempt >= MAX_RETRIES {
+                    eprintln!(
+                        "RocksDB Busy (bench:{name}): giving up after {} attempts",
+                        attempt + 1
+                    );
+                    return Err(e);
+                }
+                let exp: u64 = 1u64 << attempt.min(20);
+                let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
+                let jitter_ms = if ceiling == 0 {
+                    0
+                } else {
+                    rand::thread_rng().gen_range(0..=ceiling)
+                };
+                std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+async fn retry_capnp_busy<T, Fut, F>(name: &str, mut f: F) -> std::result::Result<T, capnp::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, capnp::Error>>,
+{
+    const MAX_RETRIES: u32 = 8;
+    const BASE_DELAY_MS: u64 = 10;
+    const MAX_DELAY_MS: u64 = 1000;
+
+    let mut attempt: u32 = 0;
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                let is_busy =
+                    msg.contains("Busy") || msg.contains("busy") || msg.contains("resource busy");
+                if !is_busy {
+                    return Err(e);
+                }
+                if attempt >= MAX_RETRIES {
+                    eprintln!(
+                        "RocksDB Busy via RPC (bench:{name}): giving up after {} attempts",
+                        attempt + 1
+                    );
+                    return Err(e);
+                }
+                let exp: u64 = 1u64 << attempt.min(20);
+                let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
+                let jitter_ms = if ceiling == 0 {
+                    0
+                } else {
+                    rand::thread_rng().gen_range(0..=ceiling)
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}

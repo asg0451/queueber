@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::protocol::queue;
+use rand::Rng;
 use std::{
     net::SocketAddr,
     str::FromStr,
@@ -138,24 +139,35 @@ async fn main() -> Result<()> {
             visibility_timeout_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                let mut request = queue_client.add_request();
-                let req = request.get().init_req();
-                let items = req.init_items(1);
-                let mut item = items.get(0);
-                item.set_contents(contents.as_bytes());
-                item.set_visibility_timeout_secs(visibility_timeout_secs);
+                retry_capnp_busy("add", || async {
+                    let mut request = queue_client.add_request();
+                    let req = request.get().init_req();
+                    let items = req.init_items(1);
+                    let mut item = items.get(0);
+                    item.set_contents(contents.as_bytes());
+                    item.set_visibility_timeout_secs(visibility_timeout_secs);
 
-                let reply = request.send().promise.await?;
-                let ids = reply.get()?.get_resp()?.get_ids()?;
+                    let reply = request.send().promise.await?;
+                    let ids = reply.get()?.get_resp()?.get_ids()?;
 
-                println!(
-                    "received {:?} ids: {:?}",
-                    ids.len(),
-                    ids.iter()
-                        .map(|id| -> Result<Uuid> { Ok(Uuid::from_slice(id?)?) })
-                        .collect::<Result<Vec<_>, _>>()?
-                );
-                Ok::<(), Box<dyn std::error::Error>>(())
+                    let id_strs: Vec<String> = (0..ids.len())
+                        .map(|i| {
+                            let bytes = ids
+                                .get(i)
+                                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                            Ok::<String, capnp::Error>(
+                                Uuid::from_slice(bytes)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_else(|_| format!("{:?}", bytes)),
+                            )
+                        })
+                        .collect::<Result<_, _>>()?;
+
+                    println!("received {:?} ids: {:?}", ids.len(), id_strs);
+                    Ok(())
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
             })
             .await?
             .unwrap();
@@ -166,59 +178,71 @@ async fn main() -> Result<()> {
             timeout_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                let mut request = queue_client.poll_request();
-                let mut req = request.get().init_req();
-                req.set_lease_validity_secs(lease_validity_secs);
-                req.set_num_items(num_items);
-                req.set_timeout_secs(timeout_secs);
+                retry_capnp_busy("poll", || async {
+                    let mut request = queue_client.poll_request();
+                    let mut req = request.get().init_req();
+                    req.set_lease_validity_secs(lease_validity_secs);
+                    req.set_num_items(num_items);
+                    req.set_timeout_secs(timeout_secs);
 
-                let reply = request.send().promise.await?;
-                let resp = reply.get()?.get_resp()?;
-                let lease = resp.get_lease()?;
-                let items = resp.get_items()?;
+                    let reply = request.send().promise.await?;
+                    let resp = reply.get()?.get_resp()?;
+                    let lease = resp.get_lease()?;
+                    let items = resp.get_items()?;
 
-                println!(
-                    "lease: {}",
-                    Uuid::from_slice(lease)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| format!("{:?}", lease))
-                );
-                if items.is_empty() {
-                    println!("no items available");
-                } else {
-                    for i in 0..items.len() {
-                        let item = items.get(i);
-                        let id = item.get_id()?;
-                        let contents = item.get_contents()?;
-                        println!(
-                            "item {}: id={}, contents=",
-                            i,
-                            Uuid::from_slice(id)
-                                .map(|u| u.to_string())
-                                .unwrap_or_else(|_| format!("{:?}", id)),
-                        );
-                        println!("{}", String::from_utf8_lossy(contents));
+                    println!(
+                        "lease: {}",
+                        Uuid::from_slice(lease)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| format!("{:?}", lease))
+                    );
+                    if items.is_empty() {
+                        println!("no items available");
+                    } else {
+                        for i in 0..items.len() {
+                            let item = items.get(i);
+                            let id = item.get_id()?;
+                            let contents = item.get_contents()?;
+                            println!(
+                                "item {}: id={}, contents=",
+                                i,
+                                Uuid::from_slice(id)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_else(|_| format!("{:?}", id)),
+                            );
+                            println!("{}", String::from_utf8_lossy(contents));
+                        }
                     }
-                }
-                Ok::<(), Box<dyn std::error::Error>>(())
+                    Ok(())
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
             })
             .await?
             .unwrap();
         }
         Commands::Remove { id, lease } => {
             with_client(addr, |queue_client| async move {
-                let id_bytes = uuid::Uuid::parse_str(&id)?.into_bytes();
-                let lease_bytes = uuid::Uuid::parse_str(&lease)?.into_bytes();
+                retry_capnp_busy("remove", || async {
+                    let id_bytes = uuid::Uuid::parse_str(&id)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .into_bytes();
+                    let lease_bytes = uuid::Uuid::parse_str(&lease)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .into_bytes();
 
-                let mut request = queue_client.remove_request();
-                let mut req = request.get().init_req();
-                req.set_id(&id_bytes);
-                req.set_lease(&lease_bytes);
+                    let mut request = queue_client.remove_request();
+                    let mut req = request.get().init_req();
+                    req.set_id(&id_bytes);
+                    req.set_lease(&lease_bytes);
 
-                let reply = request.send().promise.await?;
-                let removed = reply.get()?.get_resp()?.get_removed();
-                println!("removed: {}", removed);
-                Ok::<(), Box<dyn std::error::Error>>(())
+                    let reply = request.send().promise.await?;
+                    let removed = reply.get()?.get_resp()?.get_removed();
+                    println!("removed: {}", removed);
+                    Ok(())
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
             })
             .await?
             .unwrap();
@@ -228,15 +252,21 @@ async fn main() -> Result<()> {
             lease_validity_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                let lease_bytes = uuid::Uuid::parse_str(&lease)?.into_bytes();
-                let mut request = queue_client.extend_request();
-                let mut req = request.get().init_req();
-                req.set_lease(&lease_bytes);
-                req.set_lease_validity_secs(lease_validity_secs);
-                let reply = request.send().promise.await?;
-                let extended = reply.get()?.get_resp()?.get_extended();
-                println!("extended: {}", extended);
-                Ok::<(), Box<dyn std::error::Error>>(())
+                retry_capnp_busy("extend", || async {
+                    let lease_bytes = uuid::Uuid::parse_str(&lease)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .into_bytes();
+                    let mut request = queue_client.extend_request();
+                    let mut req = request.get().init_req();
+                    req.set_lease(&lease_bytes);
+                    req.set_lease_validity_secs(lease_validity_secs);
+                    let reply = request.send().promise.await?;
+                    let extended = reply.get()?.get_resp()?.get_extended();
+                    println!("extended: {}", extended);
+                    Ok(())
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
             })
             .await?
             .unwrap();
@@ -434,4 +464,43 @@ where
             f(queue_client).await
         })
         .await)
+}
+
+async fn retry_capnp_busy<T, Fut, F>(name: &str, mut f: F) -> std::result::Result<T, capnp::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, capnp::Error>>,
+{
+    const MAX_RETRIES: u32 = 8;
+    const BASE_DELAY_MS: u64 = 10;
+    const MAX_DELAY_MS: u64 = 1000;
+
+    let mut attempt: u32 = 0;
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                let is_busy =
+                    msg.contains("Busy") || msg.contains("busy") || msg.contains("resource busy");
+                if !is_busy {
+                    return Err(e);
+                }
+                if attempt >= MAX_RETRIES {
+                    tracing::warn!(operation = %name, attempts = attempt + 1, "RocksDB Busy (via RPC): giving up after max retries");
+                    return Err(e);
+                }
+                let exp: u64 = 1u64 << attempt.min(20);
+                let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
+                let jitter_ms = if ceiling == 0 {
+                    0
+                } else {
+                    rand::thread_rng().gen_range(0..=ceiling)
+                };
+                tracing::debug!(operation = %name, attempt = attempt + 1, delay_ms = jitter_ms, "RocksDB Busy (via RPC): backing off with jitter");
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
 }
