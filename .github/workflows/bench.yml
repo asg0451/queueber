@@ -28,7 +28,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y capnproto jq
+          sudo apt-get install -y capnproto jq libclang-19-dev
 
       - name: Set up Rust toolchain (nightly)
         uses: dtolnay/rust-toolchain@nightly
