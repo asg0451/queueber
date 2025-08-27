@@ -36,7 +36,7 @@
   - guard expensive debug logging/UUID formatting behind level checks; sample logs under load
   - evaluate pessimistic transactions under contention; compare retries vs lock waits
   - reduce redundant copies (to_vec, id conversions); prefer borrowing/Arc reuse across async boundaries
-  - pre-size vectors/lists based on `n` to avoid reallocs in poll and lease building
+  - [X] pre-size vectors/lists based on `n` to avoid reallocs in poll and lease building
 - [ ] (perf) improve poll wakeups
 - [X] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
