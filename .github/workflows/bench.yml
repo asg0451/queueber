@@ -121,13 +121,32 @@ jobs:
             criterion-summary.json
           if-no-files-found: warn
 
-      - name: Comment PR with artifact link
+      - name: Download latest master benchmark artifact
+        if: github.event_name == 'pull_request'
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: bench.yml
+          branch: master
+          name: criterion-output
+          path: master-artifacts
+          if_no_artifacts_found: ignore
+
+      - name: Compute benchmark delta (PR vs master)
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 .github/scripts/bench_delta.py \
+            --current criterion-summary.json \
+            --baseline master-artifacts/criterion-summary.json \
+            --out bench_delta.md
+
+      - name: Comment PR with artifact link and delta table
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          header: benchmark-artifact
+          header: benchmark-artifact-and-delta
           message: |
             Benchmark artifacts uploaded: criterion-output
             • Artifacts page: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
             • Summary JSON: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          path: bench_delta.md
