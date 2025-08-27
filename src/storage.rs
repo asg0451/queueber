@@ -2,7 +2,8 @@ use capnp::message::{self, TypedReader};
 use capnp::serialize;
 use rocksdb::{
     Direction, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options,
-    ReadOptions, SliceTransform, WriteBatchWithTransaction, WriteOptions,
+    ReadOptions, SliceTransform, TransactionDB, TransactionOptions, WriteBatchWithTransaction,
+    WriteOptions,
 };
 use std::path::Path;
 use uuid::Uuid;
@@ -60,12 +61,118 @@ where
     }
 }
 
+pub enum TxMode {
+    Optimistic,
+    Pessimistic,
+}
+
+enum DbEngine {
+    Optimistic(OptimisticTransactionDB),
+    Pessimistic(TransactionDB),
+}
+
 pub struct Storage {
-    db: OptimisticTransactionDB,
+    db: DbEngine,
 }
 
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
+        Self::new_with_mode(path, TxMode::Optimistic)
+    }
+
+    // Test and tooling helpers
+    #[allow(dead_code)]
+    fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match &self.db {
+            DbEngine::Optimistic(db) => Ok(db.get(key)?),
+            DbEngine::Pessimistic(db) => Ok(db.get(key)?),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn put_raw(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        match &self.db {
+            DbEngine::Optimistic(db) => db.put(key, value)?,
+            DbEngine::Pessimistic(db) => db.put(key, value)?,
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn count_expiry_index_entries_for_lease(&self, lease: &[u8; 16]) -> Result<usize> {
+        let txn = match &self.db {
+            DbEngine::Optimistic(db) => db.transaction(),
+            DbEngine::Pessimistic(db) => db.transaction(),
+        };
+        let mut count = 0usize;
+        for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
+            let (idx_key, _val) = kv?;
+            let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
+            if &lbytes == lease {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    #[allow(dead_code)]
+    fn assert_snapshot_reads_main_even_if_deleted_after_lock(&self) -> Result<()> {
+        // Begin a transaction with a snapshot
+        match &self.db {
+            DbEngine::Optimistic(db) => {
+                let mut txn_opts = OptimisticTransactionOptions::default();
+                txn_opts.set_snapshot(true);
+                let txn = db.transaction_opt(&WriteOptions::default(), &txn_opts);
+                // Iterate visibility index and capture the first entry
+                let mut viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
+                let (idx_key, main_key) = viz_iter
+                    .next()
+                    .expect("expected at least one visibility index entry")?;
+                // Lock the visibility index entry so we simulate the poller owning it
+                let locked = txn.get_pinned_for_update(&idx_key, true)?;
+                assert!(locked.is_some(), "failed to lock visibility index entry");
+                // Delete the main key outside the transaction after we've taken the snapshot
+                let main_key_vec = main_key.as_ref().to_vec();
+                match &self.db {
+                    DbEngine::Optimistic(db) => db.delete(&main_key_vec)?,
+                    DbEngine::Pessimistic(db) => db.delete(&main_key_vec)?,
+                }
+                // Read using the transaction's snapshot; this should still see the value
+                let mut ropts = rocksdb::ReadOptions::default();
+                ropts.set_snapshot(&txn.snapshot());
+                let got = txn.get_pinned_for_update_opt(&main_key_vec, true, &ropts)?;
+                assert!(
+                    got.is_some(),
+                    "snapshot read should see the main value even if concurrently deleted"
+                );
+            }
+            DbEngine::Pessimistic(db) => {
+                let mut txn_opts = TransactionOptions::default();
+                txn_opts.set_set_snapshot(true);
+                let txn = db.transaction_opt(&WriteOptions::default(), &txn_opts);
+                let mut viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
+                let (idx_key, main_key) = viz_iter
+                    .next()
+                    .expect("expected at least one visibility index entry")?;
+                let locked = txn.get_pinned_for_update(&idx_key, true)?;
+                assert!(locked.is_some(), "failed to lock visibility index entry");
+                let main_key_vec = main_key.as_ref().to_vec();
+                match &self.db {
+                    DbEngine::Optimistic(db) => db.delete(&main_key_vec)?,
+                    DbEngine::Pessimistic(db) => db.delete(&main_key_vec)?,
+                }
+                let mut ropts = rocksdb::ReadOptions::default();
+                ropts.set_snapshot(&txn.snapshot());
+                let got = txn.get_pinned_for_update_opt(&main_key_vec, true, &ropts)?;
+                assert!(
+                    got.is_some(),
+                    "snapshot read should see the main value even if concurrently deleted"
+                );
+            }
+        }
+        Ok(())
+    }
+    pub fn new_with_mode(path: &Path, mode: TxMode) -> Result<Self> {
         let mut opts = Options::default();
         // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
         // Extract the namespace prefix up to and including the first '/'.
@@ -84,7 +191,16 @@ impl Storage {
         );
         opts.set_prefix_extractor(ns_prefix);
         opts.create_if_missing(true);
-        let db = OptimisticTransactionDB::open(&opts, path)?;
+        let db = match mode {
+            TxMode::Optimistic => {
+                let db = OptimisticTransactionDB::open(&opts, path)?;
+                DbEngine::Optimistic(db)
+            }
+            TxMode::Pessimistic => {
+                let db = TransactionDB::open(&opts, path)?;
+                DbEngine::Pessimistic(db)
+            }
+        };
         Ok(Self { db })
     }
 
@@ -165,7 +281,10 @@ impl Storage {
                     .unwrap_or_default()
             );
         }
-        self.db.write(batch)?;
+        match &self.db {
+            DbEngine::Optimistic(db) => db.write(batch)?,
+            DbEngine::Pessimistic(db) => db.write(batch)?,
+        }
         Ok(())
     }
 
@@ -173,7 +292,10 @@ impl Storage {
     /// visibility index, if any. This is determined by reading the first key in
     /// the `visibility_index/` namespace which is ordered by big-endian timestamp.
     pub fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
-        let mut iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
+        let mut iter = match &self.db {
+            DbEngine::Optimistic(db) => db.prefix_iterator(VisibilityIndexKey::PREFIX),
+            DbEngine::Pessimistic(db) => db.prefix_iterator(VisibilityIndexKey::PREFIX),
+        };
         if let Some(kv) = iter.next() {
             let (idx_key, _) = kv?;
             Ok(Some(VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?))
@@ -209,121 +331,165 @@ impl Storage {
 
         // Find the next n items that are available and visible.
         // Use a transaction for consistency and bind to a snapshot.
-        let mut txn_opts = OptimisticTransactionOptions::default();
-        txn_opts.set_snapshot(true);
-        let txn = self.db.transaction_opt(&WriteOptions::default(), &txn_opts);
-        // Create read options bound to the txn snapshot for both iterator and gets
-        let snapshot = txn.snapshot();
-        let mut ro_iter = ReadOptions::default();
-        ro_iter.set_snapshot(&snapshot);
-        ro_iter.set_prefix_same_as_start(true);
-        let mut ro_get = ReadOptions::default();
-        ro_get.set_snapshot(&snapshot);
-        // Prefix-bounded forward iterator from the prefix start using the snapshot-bound ReadOptions
-        let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
-        let viz_iter = txn.iterator_opt(mode, ro_iter);
-
         let mut polled_items = Vec::with_capacity(n);
+        match &self.db {
+            DbEngine::Optimistic(db) => {
+                let mut txn_opts = OptimisticTransactionOptions::default();
+                txn_opts.set_snapshot(true);
+                let txn = db.transaction_opt(&WriteOptions::default(), &txn_opts);
+                let snapshot = txn.snapshot();
+                let mut ro_iter = ReadOptions::default();
+                ro_iter.set_snapshot(&snapshot);
+                ro_iter.set_prefix_same_as_start(true);
+                let mut ro_get = ReadOptions::default();
+                ro_get.set_snapshot(&snapshot);
+                let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
+                let viz_iter = txn.iterator_opt(mode, ro_iter);
 
-        for kv in viz_iter {
-            if polled_items.len() >= n {
-                break;
+                for kv in viz_iter {
+                    if polled_items.len() >= n {
+                        break;
+                    }
+                    let (idx_key, main_key) = kv?;
+                    let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
+                    if visible_at_secs > now_secs {
+                        break;
+                    }
+                    if txn
+                        .get_pinned_for_update_opt(&idx_key, true, &ro_get)?
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let main_value = txn
+                        .get_pinned_for_update_opt(&main_key, true, &ro_get)?
+                        .ok_or_else(|| {
+                            Error::assertion_failed(&format!(
+                                "main key not found: {:?}",
+                                main_key.as_ref()
+                            ))
+                        })?;
+                    let stored_item_message = serialize::read_message_from_flat_slice(
+                        &mut &main_value[..],
+                        message::ReaderOptions::new(),
+                    )?;
+                    let stored_item =
+                        stored_item_message.get_root::<protocol::stored_item::Reader>()?;
+                    debug_assert!(!stored_item.get_id()?.is_empty());
+                    debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
+                    debug_assert_eq!(
+                        stored_item.get_id()?,
+                        AvailableKey::id_suffix_from_key_bytes(&main_key)
+                    );
+
+                    let mut builder = message::Builder::new_default();
+                    let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
+                    polled_item.set_contents(stored_item.get_contents()?);
+                    polled_item.set_id(stored_item.get_id()?);
+                    let polled_item = builder.into_typed().into_reader();
+                    polled_items.push(polled_item);
+
+                    let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
+                    txn.delete(&idx_key)?;
+                    txn.delete(&main_key)?;
+                    txn.put(new_main_key.as_ref(), &main_value)?;
+                }
+
+                if polled_items.is_empty() {
+                    return Ok((Uuid::nil().into_bytes(), Vec::new()));
+                }
+                let lease_entry = build_lease_entry_message(
+                    expiry_ts_secs,
+                    lease_expiry_index_key.as_bytes(),
+                    &polled_items,
+                )?;
+                let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
+                serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
+                txn.put(lease_key.as_ref(), &lease_entry_bs)?;
+                txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
+                drop(snapshot);
+                txn.commit()?;
             }
+            DbEngine::Pessimistic(db) => {
+                let mut txn_opts = TransactionOptions::default();
+                txn_opts.set_set_snapshot(true);
+                // Prefer waiting for locks rather than busy errors
+                txn_opts.set_lock_timeout(10_000); // 10s
+                let txn = db.transaction_opt(&WriteOptions::default(), &txn_opts);
+                let snapshot = txn.snapshot();
+                let mut ro_iter = ReadOptions::default();
+                ro_iter.set_snapshot(&snapshot);
+                ro_iter.set_prefix_same_as_start(true);
+                let mut ro_get = ReadOptions::default();
+                ro_get.set_snapshot(&snapshot);
+                let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
+                let viz_iter = txn.iterator_opt(mode, ro_iter);
 
-            let (idx_key, main_key) = kv?;
+                for kv in viz_iter {
+                    if polled_items.len() >= n {
+                        break;
+                    }
+                    let (idx_key, main_key) = kv?;
+                    let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
+                    if visible_at_secs > now_secs {
+                        break;
+                    }
+                    if txn
+                        .get_pinned_for_update_opt(&idx_key, true, &ro_get)?
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let main_value = txn
+                        .get_pinned_for_update_opt(&main_key, true, &ro_get)?
+                        .ok_or_else(|| {
+                            Error::assertion_failed(&format!(
+                                "main key not found: {:?}",
+                                main_key.as_ref()
+                            ))
+                        })?;
+                    let stored_item_message = serialize::read_message_from_flat_slice(
+                        &mut &main_value[..],
+                        message::ReaderOptions::new(),
+                    )?;
+                    let stored_item =
+                        stored_item_message.get_root::<protocol::stored_item::Reader>()?;
+                    debug_assert!(!stored_item.get_id()?.is_empty());
+                    debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
+                    debug_assert_eq!(
+                        stored_item.get_id()?,
+                        AvailableKey::id_suffix_from_key_bytes(&main_key)
+                    );
 
-            let visible_at_secs = VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?;
-            if visible_at_secs > now_secs {
-                // Because keys are ordered by timestamp, we can stop scanning.
-                break;
+                    let mut builder = message::Builder::new_default();
+                    let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
+                    polled_item.set_contents(stored_item.get_contents()?);
+                    polled_item.set_id(stored_item.get_id()?);
+                    let polled_item = builder.into_typed().into_reader();
+                    polled_items.push(polled_item);
+
+                    let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
+                    txn.delete(&idx_key)?;
+                    txn.delete(&main_key)?;
+                    txn.put(new_main_key.as_ref(), &main_value)?;
+                }
+
+                if polled_items.is_empty() {
+                    return Ok((Uuid::nil().into_bytes(), Vec::new()));
+                }
+                let lease_entry = build_lease_entry_message(
+                    expiry_ts_secs,
+                    lease_expiry_index_key.as_bytes(),
+                    &polled_items,
+                )?;
+                let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
+                serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
+                txn.put(lease_key.as_ref(), &lease_entry_bs)?;
+                txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
+                drop(snapshot);
+                txn.commit()?;
             }
-
-            tracing::debug!(
-                "got visibility index entry: (viz/{}: avail/{})",
-                Uuid::from_slice(VisibilityIndexKey::split_ts_and_id(&idx_key).unwrap().1)
-                    .unwrap_or_default(),
-                Uuid::from_slice(AvailableKey::id_suffix_from_key_bytes(&main_key))
-                    .unwrap_or_default()
-            );
-
-            // Attempt to lock the index entry so we know it's ours.
-            if txn
-                .get_pinned_for_update_opt(&idx_key, true, &ro_get)?
-                .is_none()
-            {
-                // We lost the race on this one, try another.
-                continue;
-            }
-
-            // Fetch and decode the item.
-            let main_value = txn
-                .get_pinned_for_update_opt(&main_key, true, &ro_get)?
-                .ok_or_else(|| {
-                    Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
-                })?;
-            let stored_item_message = serialize::read_message_from_flat_slice(
-                &mut &main_value[..],
-                message::ReaderOptions::new(),
-            )?;
-            let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
-
-            debug_assert!(!stored_item.get_id()?.is_empty());
-            // contents may be empty; only assert structural invariants
-            // debug_assert!(!stored_item.get_contents()?.is_empty());
-            debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
-            debug_assert_eq!(
-                stored_item.get_id()?,
-                AvailableKey::id_suffix_from_key_bytes(&main_key)
-            );
-
-            tracing::debug!(
-                "got stored item: (id: {}, contents: <contents len: {}>)",
-                Uuid::from_slice(stored_item.get_id()?).unwrap_or_default(),
-                stored_item.get_contents()?.len()
-            );
-
-            // Build the polled item.
-            let mut builder = message::Builder::new_default(); // TODO: reduce allocs
-            let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
-            polled_item.set_contents(stored_item.get_contents()?);
-            polled_item.set_id(stored_item.get_id()?);
-            let polled_item = builder.into_typed().into_reader();
-            polled_items.push(polled_item);
-
-            // Move the item to in progress and delete the index entry.
-            let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
-            // First remove the visibility index so others won't see it.
-            // Important: Although the transaction commits atomically, readers without a
-            // snapshot may interleave reads (index then main). Deleting the index first
-            // ensures concurrent readers don't see an index that points to a deleted main.
-            // NOTE: i dont think this is true lmao and it's still broken in any case.
-            // TODO: use snapshots in txns maybe that will help
-            txn.delete(&idx_key)?;
-            // Then move the value from available -> in_progress.
-            txn.delete(&main_key)?;
-            txn.put(new_main_key.as_ref(), &main_value)?;
         }
-
-        // If no items were found, return a nil lease and empty polled items. TODO: is this to golangy (:
-        if polled_items.is_empty() {
-            return Ok((Uuid::nil().into_bytes(), Vec::new()));
-        }
-
-        // Build the lease entry.
-        let lease_entry = build_lease_entry_message(
-            expiry_ts_secs,
-            lease_expiry_index_key.as_bytes(),
-            &polled_items,
-        )?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
-        serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
-
-        // Write the lease entry and its expiry index
-        txn.put(lease_key.as_ref(), &lease_entry_bs)?;
-        txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
-
-        drop(snapshot);
-        txn.commit()?;
 
         tracing::debug!(
             "handed out lease: {:?} with {} items: {:?}",
@@ -345,7 +511,10 @@ impl Storage {
         let in_progress_key = InProgressKey::from_id(id);
         let lease_key = LeaseKey::from_lease_bytes(lease);
 
-        let txn = self.db.transaction();
+        let txn = match &self.db {
+            DbEngine::Optimistic(db) => db.transaction(),
+            DbEngine::Pessimistic(db) => db.transaction(),
+        };
         // Validate item exists in in_progress
         if txn.get_pinned_for_update(&in_progress_key, true)?.is_none() {
             return Ok(false);
@@ -521,7 +690,10 @@ impl Storage {
     /// Extend an existing lease's validity by resetting its expiry to now + lease_validity_secs.
     /// Returns false if the lease does not exist.
     pub fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
-        let txn = self.db.transaction();
+        let txn = match &self.db {
+            DbEngine::Optimistic(db) => db.transaction(),
+            DbEngine::Pessimistic(db) => db.transaction(),
+        };
         // Validate lease exists; if not, do nothing
         let lease_key = LeaseKey::from_lease_bytes(lease);
         if txn
@@ -994,8 +1166,7 @@ mod tests {
         // check lease
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage
-            .db
-            .get(lease_key.as_ref())?
+            .get_raw(lease_key.as_ref())?
             .ok_or("lease not found")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
@@ -1045,8 +1216,7 @@ mod tests {
         for id in [&b"id1"[..], &b"id2"[..]] {
             let in_progress_key = InProgressKey::from_id(id);
             let value = storage
-                .db
-                .get(in_progress_key.as_ref())?
+                .get_raw(in_progress_key.as_ref())?
                 .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
@@ -1058,18 +1228,17 @@ mod tests {
 
             // available entry must be gone
             let avail_key = AvailableKey::from_id(id);
-            assert!(storage.db.get(avail_key.as_ref())?.is_none());
+            assert!(storage.get_raw(avail_key.as_ref())?.is_none());
 
             // visibility index entry must be gone
             let idx_key = stored_item.get_visibility_ts_index_key()?;
-            assert!(storage.db.get(idx_key)?.is_none());
+            assert!(storage.get_raw(idx_key)?.is_none());
         }
 
         // lease entry exists and has keys (at least the ones we set)
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage
-            .db
-            .get(lease_key.as_ref())?
+            .get_raw(lease_key.as_ref())?
             .ok_or("lease not found")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
@@ -1111,14 +1280,16 @@ mod tests {
 
         // id1 gone from in_progress, id2 remains
         let inprog_id1 = InProgressKey::from_id(b"id1");
-        assert!(storage.db.get(inprog_id1.as_ref())?.is_none());
+        assert!(storage.get_raw(inprog_id1.as_ref())?.is_none());
 
         let inprog_id2 = InProgressKey::from_id(b"id2");
-        assert!(storage.db.get(inprog_id2.as_ref())?.is_some());
+        assert!(storage.get_raw(inprog_id2.as_ref())?.is_some());
 
         // lease entry should contain only id2
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
+        let lease_value = storage
+            .get_raw(lease_key.as_ref())?
+            .ok_or("lease missing")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
             message::ReaderOptions::new(),
@@ -1154,11 +1325,11 @@ mod tests {
 
         // in_progress entry gone
         let inprog = InProgressKey::from_id(b"only");
-        assert!(storage.db.get(inprog.as_ref())?.is_none());
+        assert!(storage.get_raw(inprog.as_ref())?.is_none());
 
         // lease entry deleted
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        assert!(storage.db.get(lease_key.as_ref())?.is_none());
+        assert!(storage.get_raw(lease_key.as_ref())?.is_none());
 
         Ok(())
     }
@@ -1188,11 +1359,13 @@ mod tests {
 
         // in_progress still exists
         let inprog = InProgressKey::from_id(b"only");
-        assert!(storage.db.get(inprog.as_ref())?.is_some());
+        assert!(storage.get_raw(inprog.as_ref())?.is_some());
 
         // original lease entry still exists and contains the id
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
+        let lease_value = storage
+            .get_raw(lease_key.as_ref())?
+            .ok_or("lease missing")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
             message::ReaderOptions::new(),
@@ -1255,15 +1428,7 @@ mod tests {
         assert!(storage.extend_lease(&lease, 4)?);
 
         // Count expiry index entries that reference this lease
-        let mut count = 0usize;
-        let txn = storage.db.transaction();
-        for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
-            let (idx_key, _val) = kv?;
-            let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
-            if lbytes == lease {
-                count += 1;
-            }
-        }
+        let count = storage.count_expiry_index_entries_for_lease(&lease)?;
         assert_eq!(
             count, 1,
             "should only be one expiry index entry per lease after extends"
@@ -1518,7 +1683,7 @@ mod tests {
         let idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(past_secs, &lease);
         let lease_key = LeaseKey::from_lease_bytes(&lease);
 
-        storage.db.put(idx_key.as_ref(), lease_key.as_ref())?;
+        storage.put_raw(idx_key.as_ref(), lease_key.as_ref())?;
 
         // Should not error and should process zero leases
         let processed = storage.expire_due_leases()?;
@@ -1540,35 +1705,8 @@ mod tests {
         let id = b"snaptest";
         storage.add_available_item_from_parts(id, b"payload", 0)?;
 
-        // Begin a transaction with a snapshot
-        let mut txn_opts = rocksdb::OptimisticTransactionOptions::default();
-        txn_opts.set_snapshot(true);
-        let txn = storage
-            .db
-            .transaction_opt(&rocksdb::WriteOptions::default(), &txn_opts);
-
-        // Iterate visibility index and capture the first entry
-        let mut viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
-        let (idx_key, main_key) = viz_iter
-            .next()
-            .expect("expected at least one visibility index entry")?;
-
-        // Lock the visibility index entry so we simulate the poller owning it
-        let locked = txn.get_pinned_for_update(&idx_key, true)?;
-        assert!(locked.is_some(), "failed to lock visibility index entry");
-
-        // Delete the main key outside the transaction after we've taken the snapshot
-        let main_key_vec = main_key.as_ref().to_vec();
-        storage.db.delete(&main_key_vec)?;
-
-        // Read using the transaction's snapshot; this should still see the value
-        let mut ropts = rocksdb::ReadOptions::default();
-        ropts.set_snapshot(&txn.snapshot());
-        let got = txn.get_pinned_for_update_opt(&main_key_vec, true, &ropts)?;
-        assert!(
-            got.is_some(),
-            "snapshot read should see the main value even if concurrently deleted"
-        );
+        // Validate snapshot behavior via helper that works across both engines
+        storage.assert_snapshot_reads_main_even_if_deleted_after_lock()?;
 
         Ok(())
     }
@@ -1598,8 +1736,7 @@ mod tests {
         // read lease entry directly
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage
-            .db
-            .get(lease_key.as_ref())?
+            .get_raw(lease_key.as_ref())?
             .ok_or("lease not found")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],

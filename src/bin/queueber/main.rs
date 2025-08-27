@@ -4,12 +4,12 @@ use std::{
 };
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{
     server::Server,
-    storage::{RetriedStorage, Storage},
+    storage::{RetriedStorage, Storage, TxMode},
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::Arc;
@@ -37,6 +37,24 @@ struct Args {
     /// Number of RPC worker threads. Defaults to available_parallelism.
     #[arg(long = "workers")]
     workers: Option<usize>,
+
+    /// Transaction mode: optimistic (default) or pessimistic
+    #[arg(long = "tx-mode", value_enum, default_value_t = TxModeArg::Optimistic)]
+    tx_mode: TxModeArg,
+}
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum TxModeArg {
+    Optimistic,
+    Pessimistic,
+}
+
+impl From<TxModeArg> for TxMode {
+    fn from(v: TxModeArg) -> Self {
+        match v {
+            TxModeArg::Optimistic => TxMode::Optimistic,
+            TxModeArg::Pessimistic => TxMode::Pessimistic,
+        }
+    }
 }
 
 // NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
@@ -71,7 +89,10 @@ async fn main() -> Result<()> {
         std::fs::remove_dir_all(&args.data_dir)?;
     }
 
-    let storage = Arc::new(RetriedStorage::new(Storage::new(&args.data_dir)?));
+    let storage = Arc::new(RetriedStorage::new(Storage::new_with_mode(
+        &args.data_dir,
+        args.tx_mode.into(),
+    )?));
     let notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 

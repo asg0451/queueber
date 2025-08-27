@@ -6,7 +6,8 @@ trap 'kill -9 $(jobs -p)' EXIT SIGINT SIGTERM
 
 export RUST_BACKTRACE=1
 
-./target/release/queueber --wipe &
+SERVER_ARGS=${SERVER_ARGS:-}
+./target/release/queueber --wipe $SERVER_ARGS &
 server_pid=$!
 
 sleep 1
