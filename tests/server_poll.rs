@@ -367,3 +367,73 @@ async fn extend_renews_lease_and_unknown_returns_false() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn coalesced_concurrent_polls_distribute_items() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    with_client(addr, |queue_client| async move {
+        // Add 6 immediately visible items
+        let mut add = queue_client.add_request();
+        {
+            let req = add.get().init_req();
+            let mut items = req.init_items(6);
+            for i in 0..6 {
+                let mut item = items.reborrow().get(i as u32);
+                item.set_contents(format!("item-{i}").as_bytes());
+                item.set_visibility_timeout_secs(0);
+            }
+        }
+        let _ = add.send().promise.await.unwrap();
+
+        // Spawn 3 concurrent polls asking for 2 items each
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let client = queue_client.clone();
+            handles.push(tokio::task::spawn_local(async move {
+                let mut poll = client.poll_request();
+                {
+                    let mut req = poll.get().init_req();
+                    req.set_lease_validity_secs(30);
+                    req.set_num_items(2);
+                    req.set_timeout_secs(1);
+                }
+                let reply = poll.send().promise.await.unwrap();
+                let resp = reply.get().unwrap().get_resp().unwrap();
+                let lease = resp.get_lease().unwrap().to_vec();
+                let items = resp.get_items().unwrap();
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                for i in 0..items.len() {
+                    let id = items.get(i).get_id().unwrap().to_vec();
+                    out.push(id);
+                }
+                (lease, out)
+            }));
+        }
+
+        // Gather results
+        let mut all_ids: Vec<Vec<u8>> = Vec::new();
+        let mut leases: Vec<Vec<u8>> = Vec::new();
+        for h in handles {
+            let (lease, ids) = h.await.unwrap();
+            if !ids.is_empty() {
+                leases.push(lease);
+            }
+            all_ids.extend(ids);
+        }
+
+        // Expect exactly 6 unique ids distributed across polls
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(
+            all_ids.len(),
+            6,
+            "expected 6 unique items across coalesced polls"
+        );
+
+        // It's okay if leases are shared; at least one non-empty lease must be present
+        assert!(!leases.is_empty(), "at least one poll should receive items");
+    })
+    .await;
+}
