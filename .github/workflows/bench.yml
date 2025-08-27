@@ -111,21 +111,6 @@ jobs:
             exit 1
           fi
 
-      - name: Store benchmark result (github-action-benchmark)
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: Criterion
-          tool: "customSmallerIsBetter"
-          output-file-path: criterion-summary.json
-          gh-repository: ${{ github.repository }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: benchmark-data
-          comment-always: true
-          alert-threshold: '200%'
-          fail-on-alert: false
-
       - name: Upload Criterion raw output (artifact)
         id: upload_artifacts
         uses: actions/upload-artifact@v4
