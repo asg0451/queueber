@@ -21,3 +21,4 @@ alwaysApply: true
 - read CLAUDE.md for more guidelines
 - always add or modify tests for each change
 - if you were asked to do a todo in TODO.md, make sure the check it off in the PR
+- important: think very hard and if you're not 95% sure about an assumption, clarify it with me first.
