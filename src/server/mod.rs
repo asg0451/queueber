@@ -6,15 +6,12 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 
 use crate::errors::Result;
-
 use crate::protocol::queue::{
     AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
 use crate::storage::{RetriedStorage, Storage};
 mod coalescer;
 use coalescer::PollCoalescer;
-
-// moved to server/coalescer.rs
 
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs
@@ -199,7 +196,7 @@ impl crate::protocol::queue::Server for Server {
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
-        let storage = Arc::clone(&self.storage);
+        let _storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
         let coalescer = Arc::clone(&self.coalescer);
 
@@ -224,10 +221,13 @@ impl crate::protocol::queue::Server for Server {
             };
 
             loop {
-                let (lease, items) = coalescer.poll(num_items, lease_validity_secs).await?;
-                if !items.is_empty() {
-                    write_poll_response(&lease, items, &mut results)?;
-                    return Ok(());
+                match coalescer.poll(num_items, lease_validity_secs).await {
+                    Ok(Some((lease, items))) => {
+                        write_poll_response(&lease, items, &mut results)?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(capnp::Error::failed(e.to_string())),
                 }
 
                 match deadline {
