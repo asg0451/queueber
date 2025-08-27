@@ -422,9 +422,7 @@ async fn main() -> Result<()> {
                                                     let mut lease_arr = [0u8; 16];
                                                     lease_arr.copy_from_slice(lease);
                                                     current_lease = Some(lease_arr);
-                                                    if !items.is_empty()
-                                                        && let Ok(mut s) = unique_leases.lock()
-                                                    {
+                                                    if !items.is_empty() && let Ok(mut s) = unique_leases.lock() {
                                                         s.insert(lease_arr);
                                                     }
                                                 }
