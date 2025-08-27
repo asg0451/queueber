@@ -482,7 +482,10 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                     let reply = match request.send().promise.await {
                                         Ok(r) => r,
                                         Err(e) => {
-                                            let _ = busy_tracker::track_and_ignore_busy_error::<(), _>(Err(e));
+                                            let _ =
+                                                busy_tracker::track_and_ignore_busy_error::<(), _>(
+                                                    Err(e),
+                                                );
                                             continue;
                                         }
                                     };

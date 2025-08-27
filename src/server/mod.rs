@@ -10,6 +10,8 @@ use crate::protocol::queue::{
     AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
 use crate::storage::{RetriedStorage, Storage};
+mod coalescer;
+use coalescer::PollCoalescer;
 
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs
@@ -18,6 +20,7 @@ pub struct Server {
     notify: Arc<Notify>,
     #[allow(dead_code)]
     shutdown_tx: watch::Sender<bool>,
+    coalescer: Arc<PollCoalescer>,
 }
 
 impl Server {
@@ -26,10 +29,12 @@ impl Server {
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
+        let coalescer = Arc::new(PollCoalescer::new(Arc::clone(&storage)));
         Self {
             storage,
             notify,
             shutdown_tx,
+            coalescer,
         }
     }
 }
@@ -188,8 +193,9 @@ impl crate::protocol::queue::Server for Server {
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
-        let storage = Arc::clone(&self.storage);
+        let _storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
+        let coalescer = Arc::clone(&self.coalescer);
 
         Promise::from_future(async move {
             let req = params.get()?.get_req()?;
@@ -212,12 +218,13 @@ impl crate::protocol::queue::Server for Server {
             };
 
             loop {
-                let (lease, items) = storage
-                    .get_next_available_entries_with_lease(num_items, lease_validity_secs)
-                    .await?;
-                if !items.is_empty() {
-                    write_poll_response(&lease, items, &mut results)?;
-                    return Ok(());
+                match coalescer.poll(num_items, lease_validity_secs).await {
+                    Ok(Some((lease, items))) => {
+                        write_poll_response(&lease, items, &mut results)?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(capnp::Error::failed(e.to_string())),
                 }
 
                 match deadline {
