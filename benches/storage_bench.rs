@@ -71,6 +71,39 @@ mod busy_tracker {
     }
 }
 
+mod lease_tracker {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static UNIQUE_LEASES: OnceLock<Mutex<HashSet<[u8; 16]>>> = OnceLock::new();
+
+    fn set() -> &'static Mutex<HashSet<[u8; 16]>> {
+        UNIQUE_LEASES.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    pub fn record_lease(lease: &[u8; 16]) {
+        // Ignore nil lease (all zeros) as it indicates no items
+        if lease.iter().all(|b| *b == 0) {
+            return;
+        }
+        if let Ok(mut guard) = set().lock() {
+            guard.insert(*lease);
+        }
+    }
+
+    pub fn report_and_reset(context: &str) {
+        if let Ok(mut guard) = set().lock() {
+            let count = guard.len();
+            println!(
+                "[{}] Unique leases observed (proxy for coalesced polls): {}",
+                context, count
+            );
+            guard.clear();
+        }
+    }
+}
+
 fn bench_add_messages(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_add");
 
@@ -186,7 +219,13 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
                 (dir, storage)
             },
             |(_dir, storage)| {
-                let res = storage.get_next_available_entries(num_items).map(|_| ());
+                let res = storage
+                    .get_next_available_entries(num_items)
+                    .map(|(lease, items)| {
+                        if !items.is_empty() {
+                            lease_tracker::record_lease(&lease);
+                        }
+                    });
                 busy_tracker::track_and_ignore_busy_error(res).expect("get_next_available_entries");
             },
             BatchSize::SmallInput,
@@ -195,6 +234,7 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
 
     group.finish();
     busy_tracker::report_and_reset("bench_poll_messages_storage");
+    lease_tracker::report_and_reset("bench_poll_messages_storage");
 }
 
 // =============== End-to-end benches (server + RPC client) ===============
@@ -364,7 +404,16 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                     req.set_timeout_secs(0);
                     let res: Result<(), capnp::Error> = async move {
                         let reply = request.send().promise.await?;
-                        let _resp = reply.get()?.get_resp()?;
+                        let resp = reply.get()?.get_resp()?;
+                        let items = resp.get_items()?;
+                        if !items.is_empty() {
+                            let lease = resp.get_lease()?;
+                            if lease.len() == 16 {
+                                let mut lease_arr = [0u8; 16];
+                                lease_arr.copy_from_slice(lease);
+                                lease_tracker::record_lease(&lease_arr);
+                            }
+                        }
                         Ok(())
                     }
                     .await;
@@ -407,6 +456,11 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                     let resp = reply.get().unwrap().get_resp().unwrap();
                     let lease = resp.get_lease().unwrap().to_vec();
                     let items = resp.get_items().unwrap();
+                    if !items.is_empty() && lease.len() == 16 {
+                        let mut lease_arr = [0u8; 16];
+                        lease_arr.copy_from_slice(&lease);
+                        lease_tracker::record_lease(&lease_arr);
+                    }
                     let mut ids: Vec<Vec<u8>> = Vec::with_capacity(items.len() as usize);
                     for i in 0..items.len() {
                         ids.push(items.get(i).get_id().unwrap().to_vec());
@@ -433,6 +487,7 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
 
     group.finish();
     busy_tracker::report_and_reset("bench_e2e_add_poll_remove");
+    lease_tracker::report_and_reset("bench_e2e_add_poll_remove");
 }
 
 fn bench_e2e_stress_like(c: &mut Criterion) {
@@ -500,6 +555,11 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
 
                                     if items.is_empty() {
                                         continue;
+                                    }
+
+                                    // Record non-empty poll's lease
+                                    if let Some(lease_arr) = current_lease {
+                                        lease_tracker::record_lease(&lease_arr);
                                     }
 
                                     let promises = items.iter().map(|i| {
@@ -588,6 +648,7 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
 
     group.finish();
     busy_tracker::report_and_reset("bench_e2e_stress_like");
+    lease_tracker::report_and_reset("bench_e2e_stress_like");
 }
 
 criterion_group!(
