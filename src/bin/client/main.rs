@@ -213,7 +213,10 @@ async fn main() -> Result<()> {
                         .iter()
                         .map(|id_res| -> std::result::Result<Uuid, capnp::Error> {
                             let bytes = id_res?;
-                            Uuid::from_slice(bytes).map_err(|e| capnp::Error::failed(e.to_string()))
+                            match Uuid::from_slice(bytes) {
+                                Ok(u) => Ok(u),
+                                Err(e) => Err(capnp::Error::failed(e.to_string())),
+                            }
                         })
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     println!("received {:?} ids: {:?}", ids.len(), parsed_ids);
@@ -221,7 +224,7 @@ async fn main() -> Result<()> {
                 }
                 .await;
                 busy_tracker::track_and_ignore_busy_error(res)
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
@@ -273,7 +276,7 @@ async fn main() -> Result<()> {
                 }
                 .await;
                 busy_tracker::track_and_ignore_busy_error(res)
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
@@ -298,7 +301,7 @@ async fn main() -> Result<()> {
                 }
                 .await;
                 busy_tracker::track_and_ignore_busy_error(res)
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
@@ -323,7 +326,7 @@ async fn main() -> Result<()> {
                 }
                 .await;
                 busy_tracker::track_and_ignore_busy_error(res)
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)?;
                 Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
