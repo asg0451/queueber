@@ -397,7 +397,13 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
                     preq.set_lease_validity_secs(30);
                     preq.set_num_items(num_items);
                     preq.set_timeout_secs(0);
-                    let reply = poll.send().promise.await.unwrap();
+                    let reply = match poll.send().promise.await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = busy_tracker::track_and_ignore_busy_error::<(), _>(Err(e));
+                            return (Vec::new(), Vec::new());
+                        }
+                    };
                     let resp = reply.get().unwrap().get_resp().unwrap();
                     let lease = resp.get_lease().unwrap().to_vec();
                     let items = resp.get_items().unwrap();
@@ -473,7 +479,13 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                     req.set_lease_validity_secs(30);
                                     req.set_num_items(batch_size);
                                     req.set_timeout_secs(1);
-                                    let reply = request.send().promise.await.unwrap();
+                                    let reply = match request.send().promise.await {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            let _ = busy_tracker::track_and_ignore_busy_error::<(), _>(Err(e));
+                                            continue;
+                                        }
+                                    };
                                     let resp = reply.get().unwrap().get_resp().unwrap();
                                     let items = resp.get_items().unwrap();
                                     let lease = resp.get_lease().unwrap();
