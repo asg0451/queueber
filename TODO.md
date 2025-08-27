@@ -37,7 +37,7 @@
   - evaluate pessimistic transactions under contention; compare retries vs lock waits
   - reduce redundant copies (to_vec, id conversions); prefer borrowing/Arc reuse across async boundaries
   - pre-size vectors/lists based on `n` to avoid reallocs in poll and lease building
-  - [X] (likely win) split RocksDB namespaces into column families; see `docs/rocksdb-column-families.md`
+  - (likely win) split RocksDB namespaces into column families; see `docs/rocksdb-column-families.md`
 - [ ] (perf) improve poll wakeups
 - [X] (perf) per-worker accept via `SO_REUSEPORT`
 - [ ] (perf) buffer/message reuse to reduce allocations on hot paths (if that makes sense for capnp)
