@@ -67,6 +67,16 @@ pub struct Storage {
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
         let mut opts = Options::default();
+        // Parallelism and background jobs sized to CPUs for compaction/flush
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(2);
+        // Increase parallelism also sets max_background_jobs if larger in RocksDB
+        opts.increase_parallelism(cpus);
+        // Keep background jobs roughly equal to CPU count to avoid contention
+        opts.set_max_background_jobs(cpus);
+
+        // Enable prefix extractor for our namespace scheme (before creating bloom)
         // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
         // Extract the namespace prefix up to and including the first '/'.
         // Examples:
@@ -83,6 +93,35 @@ impl Storage {
             Some(|_key: &[u8]| true),
         );
         opts.set_prefix_extractor(ns_prefix);
+
+        // Block table + bloom filters (including whole-key bloom for point lookups)
+        // Note: newer rust-rocksdb exposes set_opt/optimize APIs on Options directly for simplicity
+        {
+            use rocksdb::BlockBasedOptions;
+            let mut bopts = BlockBasedOptions::default();
+            // 10 bits per key is a good latency/false-positive tradeoff
+            bopts.set_bloom_filter(10.0, false);
+            bopts.set_whole_key_filtering(true);
+            // Reasonable block size; many values are small
+            bopts.set_block_size(32 * 1024);
+            // Cache index+filter blocks to reduce I/O under scan/prefix iterator
+            bopts.set_cache_index_and_filter_blocks(true);
+            opts.set_block_based_table_factory(&bopts);
+        }
+
+        // Compaction strategy and write path improvements
+        opts.set_level_compaction_dynamic_level_bytes(true);
+        opts.set_allow_concurrent_memtable_write(true);
+        opts.set_enable_write_thread_adaptive_yield(true);
+        opts.set_enable_pipelined_write(true);
+
+        // Smooth write I/O to reduce tail latencies
+        opts.set_bytes_per_sync(1 << 20); // 1 MiB
+        opts.set_wal_bytes_per_sync(1 << 20); // 1 MiB
+
+        // Compression: disable for lower CPU on synthetic stress; revisit if disk is a concern
+        opts.set_compression_type(rocksdb::DBCompressionType::None);
+
         opts.create_if_missing(true);
         let db = OptimisticTransactionDB::open(&opts, path)?;
         Ok(Self { db })
