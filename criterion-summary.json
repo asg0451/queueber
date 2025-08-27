@@ -1,0 +1,58 @@
+[
+  {
+    "name": "e2e_rpc",
+    "value": 0.000
+  },
+  {
+    "name": "e2e_rpc",
+    "value": 0.000
+  },
+  {
+    "name": "e2e_rpc",
+    "value": 0.000
+  },
+  {
+    "name": "storage_add",
+    "value": 0.000
+  },
+  {
+    "name": "storage_poll",
+    "value": 0.000
+  },
+  {
+    "name": "storage_remove",
+    "value": 0.000
+  },
+  {
+    "name": "synthetic_bench",
+    "value": 12.340
+  },
+  {
+    "name": "e2e_rpc",
+    "value": 0.000
+  },
+  {
+    "name": "e2e_rpc",
+    "value": 0.000
+  },
+  {
+    "name": "e2e_rpc",
+    "value": 0.000
+  },
+  {
+    "name": "storage_add",
+    "value": 0.000
+  },
+  {
+    "name": "storage_poll",
+    "value": 0.000
+  },
+  {
+    "name": "storage_remove",
+    "value": 0.000
+  },
+  {
+    "name": "synthetic_bench",
+    "value": 12.340
+  }
+]
