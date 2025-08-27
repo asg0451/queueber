@@ -37,10 +37,7 @@ fn bench_add_messages(c: &mut Criterion) {
 
                 for i in 0..num_items {
                     let id = format!("id_{}", i);
-                    retry_rocksdb_busy_sync("bench_add_available_item", || {
-                        storage.add_available_item((id.as_bytes(), item_reader.reborrow()))
-                    })
-                    .expect("add_available_item");
+                    let _ = storage.add_available_item((id.as_bytes(), item_reader.reborrow()));
                 }
             },
             BatchSize::SmallInput,
@@ -89,11 +86,7 @@ fn bench_remove_messages(c: &mut Criterion) {
             },
             |(_dir, storage, lease, ids)| {
                 for id in ids {
-                    let removed = retry_rocksdb_busy_sync("bench_remove_in_progress_item", || {
-                        storage.remove_in_progress_item(&id, &lease)
-                    })
-                    .expect("remove_in_progress_item");
-                    assert!(removed, "expected removal for id");
+                    let _ = storage.remove_in_progress_item(&id, &lease);
                 }
             },
             BatchSize::SmallInput,
@@ -128,10 +121,7 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
                 (dir, storage)
             },
             |(_dir, storage)| {
-                let _ = retry_rocksdb_busy_sync("bench_get_next_available_entries", || {
-                    storage.get_next_available_entries(num_items)
-                })
-                .expect("poll");
+                let _ = storage.get_next_available_entries(num_items);
             },
             BatchSize::SmallInput,
         );
@@ -281,36 +271,25 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
             || {
                 // preload N items
                 with_client(addr, |queue_client| async move {
-                    retry_capnp_busy("bench_rpc_add_batch", || async {
-                        let mut request = queue_client.add_request();
-                        let req = request.get().init_req();
-                        let mut items = req.init_items(num_items);
-                        for i in 0..num_items {
-                            let mut item = items.reborrow().get(i);
-                            item.set_contents(b"hello");
-                            item.set_visibility_timeout_secs(0);
-                        }
-                        let _ = request.send().promise.await.unwrap();
-                        Ok(())
-                    })
-                    .await
-                    .unwrap();
+                    let mut request = queue_client.add_request();
+                    let req = request.get().init_req();
+                    let mut items = req.init_items(num_items);
+                    for i in 0..num_items {
+                        let mut item = items.reborrow().get(i);
+                        item.set_contents(b"hello");
+                        item.set_visibility_timeout_secs(0);
+                    }
+                    let _ = request.send().promise.await;
                 });
             },
             |_| {
                 with_client(addr, |queue_client| async move {
-                    retry_capnp_busy("bench_rpc_poll_batch", || async {
-                        let mut request = queue_client.poll_request();
-                        let mut req = request.get().init_req();
-                        req.set_lease_validity_secs(30);
-                        req.set_num_items(num_items);
-                        req.set_timeout_secs(0);
-                        let reply = request.send().promise.await.unwrap();
-                        let _resp = reply.get().unwrap().get_resp().unwrap();
-                        Ok(())
-                    })
-                    .await
-                    .unwrap();
+                    let mut request = queue_client.poll_request();
+                    let mut req = request.get().init_req();
+                    req.set_lease_validity_secs(30);
+                    req.set_num_items(num_items);
+                    req.set_timeout_secs(0);
+                    let _ = request.send().promise.await;
                 });
             },
             BatchSize::SmallInput,
@@ -565,47 +544,6 @@ criterion_group!(
     bench_e2e_stress_like
 );
 criterion_main!(benches);
-
-fn retry_rocksdb_busy_sync<T, F>(name: &str, mut f: F) -> Result<T, queueber::errors::Error>
-where
-    F: FnMut() -> Result<T, queueber::errors::Error>,
-{
-    const MAX_RETRIES: u32 = 8;
-    const BASE_DELAY_MS: u64 = 10;
-    const MAX_DELAY_MS: u64 = 1000;
-    let mut attempt: u32 = 0;
-    loop {
-        match f() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                let is_busy = matches!(
-                    e,
-                    queueber::errors::Error::Rocksdb { ref source, .. }
-                        if source.kind() == rocksdb::ErrorKind::Busy
-                );
-                if !is_busy {
-                    return Err(e);
-                }
-                if attempt >= MAX_RETRIES {
-                    eprintln!(
-                        "RocksDB Busy (bench:{name}): giving up after {} attempts",
-                        attempt + 1
-                    );
-                    return Err(e);
-                }
-                let exp: u64 = 1u64 << attempt.min(20);
-                let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
-                let jitter_ms = if ceiling == 0 {
-                    0
-                } else {
-                    rand::thread_rng().gen_range(0..=ceiling)
-                };
-                std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
-                attempt = attempt.saturating_add(1);
-            }
-        }
-    }
-}
 
 async fn retry_capnp_busy<T, Fut, F>(name: &str, mut f: F) -> std::result::Result<T, capnp::Error>
 where

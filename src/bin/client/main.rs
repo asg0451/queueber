@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::protocol::queue;
-use rand::Rng;
 use std::{
     net::SocketAddr,
     str::FromStr,
@@ -139,35 +138,46 @@ async fn main() -> Result<()> {
             visibility_timeout_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                retry_capnp_busy("add", || async {
-                    let mut request = queue_client.add_request();
-                    let req = request.get().init_req();
-                    let items = req.init_items(1);
-                    let mut item = items.get(0);
-                    item.set_contents(contents.as_bytes());
-                    item.set_visibility_timeout_secs(visibility_timeout_secs);
+                let mut request = queue_client.add_request();
+                let req = request.get().init_req();
+                let items = req.init_items(1);
+                let mut item = items.get(0);
+                item.set_contents(contents.as_bytes());
+                item.set_visibility_timeout_secs(visibility_timeout_secs);
 
-                    let reply = request.send().promise.await?;
-                    let ids = reply.get()?.get_resp()?.get_ids()?;
-
-                    let id_strs: Vec<String> = (0..ids.len())
-                        .map(|i| {
-                            let bytes = ids
-                                .get(i)
-                                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                            Ok::<String, capnp::Error>(
-                                Uuid::from_slice(bytes)
-                                    .map(|u| u.to_string())
-                                    .unwrap_or_else(|_| format!("{:?}", bytes)),
-                            )
-                        })
-                        .collect::<Result<_, _>>()?;
-
-                    println!("received {:?} ids: {:?}", ids.len(), id_strs);
-                    Ok(())
-                })
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                match request.send().promise.await {
+                    Ok(reply) => {
+                        let ids = reply.get()?.get_resp()?.get_ids()?;
+                        let id_strs: Vec<String> = (0..ids.len())
+                            .map(|i| {
+                                let bytes = ids
+                                    .get(i)
+                                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                                Ok::<String, capnp::Error>(
+                                    Uuid::from_slice(bytes)
+                                        .map(|u| u.to_string())
+                                        .unwrap_or_else(|_| format!("{:?}", bytes)),
+                                )
+                            })
+                            .collect::<Result<_, _>>()?;
+                        println!("received {:?} ids: {:?}", ids.len(), id_strs);
+                    }
+                    Err(e) => {
+                        if is_capnp_busy_error(&e) {
+                            tracing::warn!(
+                                operation = "add",
+                                total_reqs = 1,
+                                busy_reqs = 1,
+                                percent = 100.0,
+                                "resource busy: ignoring"
+                            );
+                            return Ok::<(), Box<dyn std::error::Error>>(());
+                        } else {
+                            return Err::<(), Box<dyn std::error::Error>>(Box::new(e));
+                        }
+                    }
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
@@ -178,71 +188,96 @@ async fn main() -> Result<()> {
             timeout_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                retry_capnp_busy("poll", || async {
-                    let mut request = queue_client.poll_request();
-                    let mut req = request.get().init_req();
-                    req.set_lease_validity_secs(lease_validity_secs);
-                    req.set_num_items(num_items);
-                    req.set_timeout_secs(timeout_secs);
+                let mut request = queue_client.poll_request();
+                let mut req = request.get().init_req();
+                req.set_lease_validity_secs(lease_validity_secs);
+                req.set_num_items(num_items);
+                req.set_timeout_secs(timeout_secs);
 
-                    let reply = request.send().promise.await?;
-                    let resp = reply.get()?.get_resp()?;
-                    let lease = resp.get_lease()?;
-                    let items = resp.get_items()?;
-
-                    println!(
-                        "lease: {}",
-                        Uuid::from_slice(lease)
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|_| format!("{:?}", lease))
-                    );
-                    if items.is_empty() {
-                        println!("no items available");
-                    } else {
-                        for i in 0..items.len() {
-                            let item = items.get(i);
-                            let id = item.get_id()?;
-                            let contents = item.get_contents()?;
-                            println!(
-                                "item {}: id={}, contents=",
-                                i,
-                                Uuid::from_slice(id)
-                                    .map(|u| u.to_string())
-                                    .unwrap_or_else(|_| format!("{:?}", id)),
-                            );
-                            println!("{}", String::from_utf8_lossy(contents));
+                match request.send().promise.await {
+                    Ok(reply) => {
+                        let resp = reply.get()?.get_resp()?;
+                        let lease = resp.get_lease()?;
+                        let items = resp.get_items()?;
+                        println!(
+                            "lease: {}",
+                            Uuid::from_slice(lease)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|_| format!("{:?}", lease))
+                        );
+                        if items.is_empty() {
+                            println!("no items available");
+                        } else {
+                            for i in 0..items.len() {
+                                let item = items.get(i);
+                                let id = item.get_id()?;
+                                let contents = item.get_contents()?;
+                                println!(
+                                    "item {}: id={}, contents=",
+                                    i,
+                                    Uuid::from_slice(id)
+                                        .map(|u| u.to_string())
+                                        .unwrap_or_else(|_| format!("{:?}", id)),
+                                );
+                                println!("{}", String::from_utf8_lossy(contents));
+                            }
                         }
                     }
-                    Ok(())
-                })
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                    Err(e) => {
+                        if is_capnp_busy_error(&e) {
+                            tracing::warn!(
+                                operation = "poll",
+                                total_reqs = 1,
+                                busy_reqs = 1,
+                                percent = 100.0,
+                                "resource busy: ignoring"
+                            );
+                            return Ok::<(), Box<dyn std::error::Error>>(());
+                        } else {
+                            return Err::<(), Box<dyn std::error::Error>>(Box::new(e));
+                        }
+                    }
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
         }
         Commands::Remove { id, lease } => {
             with_client(addr, |queue_client| async move {
-                retry_capnp_busy("remove", || async {
-                    let id_bytes = uuid::Uuid::parse_str(&id)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?
-                        .into_bytes();
-                    let lease_bytes = uuid::Uuid::parse_str(&lease)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?
-                        .into_bytes();
+                let id_bytes = uuid::Uuid::parse_str(&id)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?
+                    .into_bytes();
+                let lease_bytes = uuid::Uuid::parse_str(&lease)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?
+                    .into_bytes();
 
-                    let mut request = queue_client.remove_request();
-                    let mut req = request.get().init_req();
-                    req.set_id(&id_bytes);
-                    req.set_lease(&lease_bytes);
+                let mut request = queue_client.remove_request();
+                let mut req = request.get().init_req();
+                req.set_id(&id_bytes);
+                req.set_lease(&lease_bytes);
 
-                    let reply = request.send().promise.await?;
-                    let removed = reply.get()?.get_resp()?.get_removed();
-                    println!("removed: {}", removed);
-                    Ok(())
-                })
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                match request.send().promise.await {
+                    Ok(reply) => {
+                        let removed = reply.get()?.get_resp()?.get_removed();
+                        println!("removed: {}", removed);
+                    }
+                    Err(e) => {
+                        if is_capnp_busy_error(&e) {
+                            tracing::warn!(
+                                operation = "remove",
+                                total_reqs = 1,
+                                busy_reqs = 1,
+                                percent = 100.0,
+                                "resource busy: ignoring"
+                            );
+                            return Ok::<(), Box<dyn std::error::Error>>(());
+                        } else {
+                            return Err::<(), Box<dyn std::error::Error>>(Box::new(e));
+                        }
+                    }
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
@@ -252,21 +287,34 @@ async fn main() -> Result<()> {
             lease_validity_secs,
         } => {
             with_client(addr, |queue_client| async move {
-                retry_capnp_busy("extend", || async {
-                    let lease_bytes = uuid::Uuid::parse_str(&lease)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?
-                        .into_bytes();
-                    let mut request = queue_client.extend_request();
-                    let mut req = request.get().init_req();
-                    req.set_lease(&lease_bytes);
-                    req.set_lease_validity_secs(lease_validity_secs);
-                    let reply = request.send().promise.await?;
-                    let extended = reply.get()?.get_resp()?.get_extended();
-                    println!("extended: {}", extended);
-                    Ok(())
-                })
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                let lease_bytes = uuid::Uuid::parse_str(&lease)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?
+                    .into_bytes();
+                let mut request = queue_client.extend_request();
+                let mut req = request.get().init_req();
+                req.set_lease(&lease_bytes);
+                req.set_lease_validity_secs(lease_validity_secs);
+                match request.send().promise.await {
+                    Ok(reply) => {
+                        let extended = reply.get()?.get_resp()?.get_extended();
+                        println!("extended: {}", extended);
+                    }
+                    Err(e) => {
+                        if is_capnp_busy_error(&e) {
+                            tracing::warn!(
+                                operation = "extend",
+                                total_reqs = 1,
+                                busy_reqs = 1,
+                                percent = 100.0,
+                                "resource busy: ignoring"
+                            );
+                            return Ok::<(), Box<dyn std::error::Error>>(());
+                        } else {
+                            return Err::<(), Box<dyn std::error::Error>>(Box::new(e));
+                        }
+                    }
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
             })
             .await?
             .unwrap();
@@ -286,6 +334,14 @@ async fn main() -> Result<()> {
             let poll_count = Arc::new(atomic::AtomicU64::new(0));
             let remove_count = Arc::new(atomic::AtomicU64::new(0));
             let extend_count = Arc::new(atomic::AtomicU64::new(0));
+            let add_req_count = Arc::new(atomic::AtomicU64::new(0));
+            let poll_req_count = Arc::new(atomic::AtomicU64::new(0));
+            let remove_req_count = Arc::new(atomic::AtomicU64::new(0));
+            let extend_req_count = Arc::new(atomic::AtomicU64::new(0));
+            let busy_add_count = Arc::new(atomic::AtomicU64::new(0));
+            let busy_poll_count = Arc::new(atomic::AtomicU64::new(0));
+            let busy_remove_count = Arc::new(atomic::AtomicU64::new(0));
+            let busy_extend_count = Arc::new(atomic::AtomicU64::new(0));
 
             // periodic metrics reporter
             tokio::task::Builder::new()
@@ -295,6 +351,14 @@ async fn main() -> Result<()> {
                     let poll_count = Arc::clone(&poll_count);
                     let remove_count = Arc::clone(&remove_count);
                     let extend_count = Arc::clone(&extend_count);
+                    let add_req_count = Arc::clone(&add_req_count);
+                    let poll_req_count = Arc::clone(&poll_req_count);
+                    let remove_req_count = Arc::clone(&remove_req_count);
+                    let extend_req_count = Arc::clone(&extend_req_count);
+                    let busy_add_count = Arc::clone(&busy_add_count);
+                    let busy_poll_count = Arc::clone(&busy_poll_count);
+                    let busy_remove_count = Arc::clone(&busy_remove_count);
+                    let busy_extend_count = Arc::clone(&busy_extend_count);
                     async move {
                         let mut last_time = Instant::now();
                         while Instant::now() < end_time {
@@ -304,11 +368,20 @@ async fn main() -> Result<()> {
                             let polls = poll_count.swap(0, atomic::Ordering::Relaxed);
                             let removes = remove_count.swap(0, atomic::Ordering::Relaxed);
                             let extends = extend_count.swap(0, atomic::Ordering::Relaxed);
+                            let add_reqs = add_req_count.swap(0, atomic::Ordering::Relaxed);
+                            let poll_reqs = poll_req_count.swap(0, atomic::Ordering::Relaxed);
+                            let remove_reqs = remove_req_count.swap(0, atomic::Ordering::Relaxed);
+                            let extend_reqs = extend_req_count.swap(0, atomic::Ordering::Relaxed);
+                            let busy_adds = busy_add_count.swap(0, atomic::Ordering::Relaxed);
+                            let busy_polls = busy_poll_count.swap(0, atomic::Ordering::Relaxed);
+                            let busy_removes = busy_remove_count.swap(0, atomic::Ordering::Relaxed);
+                            let busy_extends = busy_extend_count.swap(0, atomic::Ordering::Relaxed);
                             let duration = now.duration_since(last_time);
                             last_time = now;
                             let secs = duration.as_secs_f64().max(1.0);
+                            let pct = |busy: u64, reqs: u64| if reqs > 0 { (busy as f64 / reqs as f64) * 100.0 } else { 0.0 };
                             println!(
-                                "add: {} ({:.1}/s), poll: {} ({:.1}/s), remove: {} ({:.1}/s), extend: {} ({:.1}/s)",
+                                "add: {} ({:.1}/s), poll: {} ({:.1}/s), remove: {} ({:.1}/s), extend: {} ({:.1}/s) | busy%% add:{:.1} poll:{:.1} remove:{:.1} extend:{:.1}",
                                 adds,
                                 adds as f64 / secs,
                                 polls,
@@ -316,7 +389,11 @@ async fn main() -> Result<()> {
                                 removes,
                                 removes as f64 / secs,
                                 extends,
-                                extends as f64 / secs
+                                extends as f64 / secs,
+                                pct(busy_adds, add_reqs),
+                                pct(busy_polls, poll_reqs),
+                                pct(busy_removes, remove_reqs),
+                                pct(busy_extends, extend_reqs)
                             );
                         }
                     }
@@ -329,6 +406,12 @@ async fn main() -> Result<()> {
                     let poll_count = Arc::clone(&poll_count);
                     let remove_count = Arc::clone(&remove_count);
                     let extend_count = Arc::clone(&extend_count);
+                    let poll_req_count = Arc::clone(&poll_req_count);
+                    let remove_req_count = Arc::clone(&remove_req_count);
+                    let extend_req_count = Arc::clone(&extend_req_count);
+                    let busy_poll_count = Arc::clone(&busy_poll_count);
+                    let busy_remove_count = Arc::clone(&busy_remove_count);
+                    let busy_extend_count = Arc::clone(&busy_extend_count);
                     let handle = Handle::current();
                     s.spawn(move || {
                         handle.block_on(async move {
@@ -343,7 +426,21 @@ async fn main() -> Result<()> {
                                             req.set_lease_validity_secs(30);
                                             req.set_num_items(10);
                                             req.set_timeout_secs(5);
-                                            let reply = request.send().promise.await.unwrap();
+                                            poll_req_count.fetch_add(1, atomic::Ordering::Relaxed);
+                                            let reply = match request.send().promise.await {
+                                                Ok(r) => r,
+                                                Err(e) => {
+                                                    if is_capnp_busy_error(&e) {
+                                                        busy_poll_count.fetch_add(
+                                                            1,
+                                                            atomic::Ordering::Relaxed,
+                                                        );
+                                                        continue;
+                                                    } else {
+                                                        continue;
+                                                    }
+                                                }
+                                            };
                                             let resp = reply.get().unwrap().get_resp().unwrap();
                                             let items = resp.get_items().unwrap();
                                             poll_count.fetch_add(
@@ -359,13 +456,23 @@ async fn main() -> Result<()> {
                                             }
 
                                             let promises = items.iter().map(|i| {
+                                                remove_req_count
+                                                    .fetch_add(1, atomic::Ordering::Relaxed);
                                                 let mut request = queue_client.remove_request();
                                                 let mut req = request.get().init_req();
                                                 req.set_id(i.get_id().unwrap());
                                                 req.set_lease(lease);
                                                 request.send().promise
                                             });
-                                            let _ = futures::future::join_all(promises).await;
+                                            let results = futures::future::join_all(promises).await;
+                                            for r in results.into_iter() {
+                                                if let Err(e) = r
+                                                    && is_capnp_busy_error(&e)
+                                                {
+                                                    busy_remove_count
+                                                        .fetch_add(1, atomic::Ordering::Relaxed);
+                                                }
+                                            }
                                             remove_count.fetch_add(
                                                 items.len() as u64,
                                                 atomic::Ordering::Relaxed,
@@ -378,7 +485,16 @@ async fn main() -> Result<()> {
                                                     let mut req = request.get().init_req();
                                                     req.set_lease(&lease_arr);
                                                     req.set_lease_validity_secs(30);
-                                                    let _ = request.send().promise.await;
+                                                    extend_req_count
+                                                        .fetch_add(1, atomic::Ordering::Relaxed);
+                                                    if let Err(e) = request.send().promise.await
+                                                        && is_capnp_busy_error(&e)
+                                                    {
+                                                        busy_extend_count.fetch_add(
+                                                            1,
+                                                            atomic::Ordering::Relaxed,
+                                                        );
+                                                    }
                                                     extend_count
                                                         .fetch_add(1, atomic::Ordering::Relaxed);
                                                 }
@@ -396,6 +512,8 @@ async fn main() -> Result<()> {
                 // spawn adding clients
                 for _ in 0..adding_clients {
                     let add_count = Arc::clone(&add_count);
+                    let add_req_count = Arc::clone(&add_req_count);
+                    let busy_add_count = Arc::clone(&busy_add_count);
                     let handle = Handle::current();
                     s.spawn(move || {
                         handle.block_on(async move {
@@ -420,7 +538,21 @@ async fn main() -> Result<()> {
                                                 item.set_contents(format!("test {}", i).as_bytes());
                                                 item.set_visibility_timeout_secs(3);
                                             }
-                                            let _ = request.send().promise.await.unwrap();
+                                            add_req_count.fetch_add(1, atomic::Ordering::Relaxed);
+                                            match request.send().promise.await {
+                                                Ok(_) => {}
+                                                Err(e) => {
+                                                    if is_capnp_busy_error(&e) {
+                                                        busy_add_count.fetch_add(
+                                                            1,
+                                                            atomic::Ordering::Relaxed,
+                                                        );
+                                                        continue;
+                                                    } else {
+                                                        continue;
+                                                    }
+                                                }
+                                            }
                                             add_count.fetch_add(
                                                 batch_size as u64,
                                                 atomic::Ordering::Relaxed,
@@ -466,41 +598,7 @@ where
         .await)
 }
 
-async fn retry_capnp_busy<T, Fut, F>(name: &str, mut f: F) -> std::result::Result<T, capnp::Error>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<T, capnp::Error>>,
-{
-    const MAX_RETRIES: u32 = 8;
-    const BASE_DELAY_MS: u64 = 10;
-    const MAX_DELAY_MS: u64 = 1000;
-
-    let mut attempt: u32 = 0;
-    loop {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                let msg = e.to_string();
-                let is_busy =
-                    msg.contains("Busy") || msg.contains("busy") || msg.contains("resource busy");
-                if !is_busy {
-                    return Err(e);
-                }
-                if attempt >= MAX_RETRIES {
-                    tracing::warn!(operation = %name, attempts = attempt + 1, "RocksDB Busy (via RPC): giving up after max retries");
-                    return Err(e);
-                }
-                let exp: u64 = 1u64 << attempt.min(20);
-                let ceiling = (BASE_DELAY_MS.saturating_mul(exp)).min(MAX_DELAY_MS);
-                let jitter_ms = if ceiling == 0 {
-                    0
-                } else {
-                    rand::thread_rng().gen_range(0..=ceiling)
-                };
-                tracing::debug!(operation = %name, attempt = attempt + 1, delay_ms = jitter_ms, "RocksDB Busy (via RPC): backing off with jitter");
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-                attempt = attempt.saturating_add(1);
-            }
-        }
-    }
+fn is_capnp_busy_error(e: &capnp::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Busy") || msg.contains("busy") || msg.contains("resource busy")
 }
