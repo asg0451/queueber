@@ -1,8 +1,9 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize;
 use rocksdb::{
-    Direction, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options,
-    ReadOptions, SliceTransform, WriteBatchWithTransaction, WriteOptions,
+    ColumnFamilyDescriptor, Direction, IteratorMode, OptimisticTransactionDB,
+    OptimisticTransactionOptions, Options, ReadOptions, SliceTransform, WriteBatchWithTransaction,
+    WriteOptions,
 };
 use std::path::Path;
 use uuid::Uuid;
@@ -66,26 +67,82 @@ pub struct Storage {
 
 impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
-        let mut opts = Options::default();
-        // Optimize for prefix scans used by `prefix_iterator` across all key namespaces.
-        // Extract the namespace prefix up to and including the first '/'.
-        // Examples:
-        //  - b"visibility_index/123/abc" -> b"visibility_index/"
-        //  - b"available/42" -> b"available/"
-        //  - b"leases/<uuid>" -> b"leases/"
-        // If a key contains no '/', return the full key.
-        let ns_prefix = SliceTransform::create(
-            "ns_prefix",
-            |key: &[u8]| match key.iter().position(|b| *b == b'/') {
-                Some(idx) => &key[..=idx],
-                None => key,
-            },
-            Some(|_key: &[u8]| true),
-        );
-        opts.set_prefix_extractor(ns_prefix);
-        opts.create_if_missing(true);
-        let db = OptimisticTransactionDB::open(&opts, path)?;
+        // DB-level options
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+
+        // Prefix extractor: treat the namespace segment up to and including the first '/'
+        // as the prefix across our keyspaces.
+        let make_ns_prefix = || {
+            SliceTransform::create(
+                "ns_prefix",
+                |key: &[u8]| match key.iter().position(|b| *b == b'/') {
+                    Some(idx) => &key[..=idx],
+                    None => key,
+                },
+                Some(|_key: &[u8]| true),
+            )
+        };
+
+        // Build per-CF options. Simplicity: use the same prefix extractor for all CFs.
+        let mut cf_default = Options::default();
+        cf_default.set_prefix_extractor(make_ns_prefix());
+        let mut cf_available = Options::default();
+        cf_available.set_prefix_extractor(make_ns_prefix());
+        let mut cf_in_progress = Options::default();
+        cf_in_progress.set_prefix_extractor(make_ns_prefix());
+        let mut cf_visibility_index = Options::default();
+        cf_visibility_index.set_prefix_extractor(make_ns_prefix());
+        let mut cf_leases = Options::default();
+        cf_leases.set_prefix_extractor(make_ns_prefix());
+        let mut cf_lease_expiry = Options::default();
+        cf_lease_expiry.set_prefix_extractor(make_ns_prefix());
+
+        let cf_descs = vec![
+            ColumnFamilyDescriptor::new("default", cf_default),
+            ColumnFamilyDescriptor::new("available", cf_available),
+            ColumnFamilyDescriptor::new("in_progress", cf_in_progress),
+            ColumnFamilyDescriptor::new("visibility_index", cf_visibility_index),
+            ColumnFamilyDescriptor::new("leases", cf_leases),
+            ColumnFamilyDescriptor::new("lease_expiry", cf_lease_expiry),
+        ];
+
+        let db = OptimisticTransactionDB::open_cf_descriptors(&db_opts, path, cf_descs)?;
         Ok(Self { db })
+    }
+
+    #[inline]
+    fn cf_available(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle("available")
+            .expect("available CF must exist")
+    }
+
+    #[inline]
+    fn cf_in_progress(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle("in_progress")
+            .expect("in_progress CF must exist")
+    }
+
+    #[inline]
+    fn cf_visibility_index(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle("visibility_index")
+            .expect("visibility_index CF must exist")
+    }
+
+    #[inline]
+    fn cf_leases(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle("leases").expect("leases CF must exist")
+    }
+
+    #[inline]
+    fn cf_lease_expiry(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle("lease_expiry")
+            .expect("lease_expiry CF must exist")
     }
 
     // id+item -> store stored_item and visibility index entry
@@ -155,8 +212,12 @@ impl Storage {
             stored_contents.clear();
             serialize::write_message(&mut stored_contents, &simsg)?;
 
-            batch.put(main_key.as_ref(), &stored_contents);
-            batch.put(visibility_index_key.as_ref(), main_key.as_ref());
+            batch.put_cf(self.cf_available(), main_key.as_ref(), &stored_contents);
+            batch.put_cf(
+                self.cf_visibility_index(),
+                visibility_index_key.as_ref(),
+                main_key.as_ref(),
+            );
 
             tracing::debug!(
                 "inserted item (from parts): ({}: <contents len: {}>), (viz/{}: avail/{})",
@@ -180,7 +241,9 @@ impl Storage {
     /// visibility index, if any. This is determined by reading the first key in
     /// the `visibility_index/` namespace which is ordered by big-endian timestamp.
     pub fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
-        let mut iter = self.db.prefix_iterator(VisibilityIndexKey::PREFIX);
+        let mut iter = self
+            .db
+            .prefix_iterator_cf(self.cf_visibility_index(), VisibilityIndexKey::PREFIX);
         if let Some(kv) = iter.next() {
             let (idx_key, _) = kv?;
             Ok(Some(VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?))
@@ -234,7 +297,7 @@ impl Storage {
         ro_get.set_snapshot(&snapshot);
         // Prefix-bounded forward iterator from the prefix start using the snapshot-bound ReadOptions
         let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
-        let viz_iter = txn.iterator_opt(mode, ro_iter);
+        let viz_iter = txn.iterator_cf_opt(self.cf_visibility_index(), ro_iter, mode);
 
         let mut polled_items = Vec::with_capacity(n);
 
@@ -261,7 +324,7 @@ impl Storage {
 
             // Attempt to lock the index entry so we know it's ours.
             if txn
-                .get_pinned_for_update_opt(&idx_key, true, &ro_get)?
+                .get_pinned_for_update_cf_opt(self.cf_visibility_index(), &idx_key, true, &ro_get)?
                 .is_none()
             {
                 // We lost the race on this one, try another.
@@ -270,7 +333,7 @@ impl Storage {
 
             // Fetch and decode the item.
             let main_value = txn
-                .get_pinned_for_update_opt(&main_key, true, &ro_get)?
+                .get_pinned_for_update_cf_opt(self.cf_available(), &main_key, true, &ro_get)?
                 .ok_or_else(|| {
                     Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
                 })?;
@@ -311,10 +374,10 @@ impl Storage {
             // ensures concurrent readers don't see an index that points to a deleted main.
             // NOTE: i dont think this is true lmao and it's still broken in any case.
             // TODO: use snapshots in txns maybe that will help
-            txn.delete(&idx_key)?;
+            txn.delete_cf(self.cf_visibility_index(), &idx_key)?;
             // Then move the value from available -> in_progress.
-            txn.delete(&main_key)?;
-            txn.put(new_main_key.as_ref(), &main_value)?;
+            txn.delete_cf(self.cf_available(), &main_key)?;
+            txn.put_cf(self.cf_in_progress(), new_main_key.as_ref(), &main_value)?;
         }
 
         // If no items were found, return a nil lease and empty polled items. TODO: is this to golangy (:
@@ -332,8 +395,12 @@ impl Storage {
         serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
         // Write the lease entry and its expiry index
-        txn.put(lease_key.as_ref(), &lease_entry_bs)?;
-        txn.put(lease_expiry_index_key.as_ref(), lease_key.as_ref())?;
+        txn.put_cf(self.cf_leases(), lease_key.as_ref(), &lease_entry_bs)?;
+        txn.put_cf(
+            self.cf_lease_expiry(),
+            lease_expiry_index_key.as_ref(),
+            lease_key.as_ref(),
+        )?;
 
         drop(snapshot);
         txn.commit()?;
@@ -360,12 +427,16 @@ impl Storage {
 
         let txn = self.db.transaction();
         // Validate item exists in in_progress
-        if txn.get_pinned_for_update(&in_progress_key, true)?.is_none() {
+        if txn
+            .get_pinned_for_update_cf(self.cf_in_progress(), &in_progress_key, true)?
+            .is_none()
+        {
             return Ok(false);
         }
 
         // Validate lease exists
-        let Some(lease_value) = txn.get_pinned_for_update(&lease_key, true)? else {
+        let Some(lease_value) = txn.get_pinned_for_update_cf(self.cf_leases(), &lease_key, true)?
+        else {
             tracing::info!("lease entry not found: {:?}", Uuid::from_bytes(*lease));
             return Ok(false);
         };
@@ -384,12 +455,12 @@ impl Storage {
         };
 
         // Delete item from in_progress.
-        txn.delete(in_progress_key.as_ref())?;
+        txn.delete_cf(self.cf_in_progress(), in_progress_key.as_ref())?;
 
         // Rewrite the lease entry to exclude the id. If no items remain under this lease,
         // delete the lease entry instead.
         if ids.len() - 1 == 0 {
-            txn.delete(lease_key.as_ref())?;
+            txn.delete_cf(self.cf_leases(), lease_key.as_ref())?;
         } else {
             // Rebuild lease entry with remaining keys.
             // TODO: this could be done more efficiently by unifying the above search and this one.
@@ -418,7 +489,7 @@ impl Storage {
             }
             let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
             serialize::write_message(&mut buf, &msg)?;
-            txn.put(lease_key.as_ref(), &buf)?;
+            txn.put_cf(self.cf_leases(), lease_key.as_ref(), &buf)?;
         }
         drop(lease_value);
 
@@ -448,7 +519,7 @@ impl Storage {
         expiry_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
         ro.set_iterate_upper_bound(expiry_upper_bound.clone());
         let mode = IteratorMode::From(LeaseExpiryIndexKey::PREFIX, Direction::Forward);
-        let iter = txn.iterator_opt(mode, ro);
+        let iter = txn.iterator_cf_opt(self.cf_lease_expiry(), ro, mode);
         // Avoid deleting keys while iterating; collect expiry index keys to delete later.
         let mut expiry_index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
         for kv in iter {
@@ -459,7 +530,9 @@ impl Storage {
                 LeaseExpiryIndexKey::PREFIX
             );
 
-            let _idx_val = txn.get_pinned_for_update(&idx_key, true)?.ok_or_else(|| {
+            let _idx_val = txn
+                .get_pinned_for_update_cf(self.cf_lease_expiry(), &idx_key, true)?
+                .ok_or_else(|| {
                 Error::assertion_failed("visibility index entry not found after we scanned it. expiry should be the only one deleting leases (once expiry is single flighted... TODO)")
             })?;
 
@@ -473,7 +546,9 @@ impl Storage {
             let lease_key = LeaseKey::from_lease_bytes(lease_bytes);
 
             // Load the lease entry. If it's not found, we lost the race with another call and that's fine; move on.
-            let Some(lease_value) = txn.get_pinned_for_update(lease_key.as_ref(), true)? else {
+            let Some(lease_value) =
+                txn.get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
+            else {
                 tracing::debug!(
                     "lease entry not found after we scanned it. ignoring. lease: {:?}",
                     Uuid::from_slice(lease_bytes).unwrap_or_default()
@@ -499,7 +574,11 @@ impl Storage {
             for id in keys.iter() {
                 let id = id?;
                 let in_progress_key = InProgressKey::from_id(id);
-                let Some(item_value) = txn.get_pinned_for_update(in_progress_key.as_ref(), true)?
+                let Some(item_value) = txn.get_pinned_for_update_cf(
+                    self.cf_in_progress(),
+                    in_progress_key.as_ref(),
+                    true,
+                )?
                 else {
                     // Item has already been removed or re-queued; skip.
                     continue;
@@ -531,19 +610,23 @@ impl Storage {
                 }
                 updated.clear();
                 serialize::write_message(&mut updated, &builder)?;
-                txn.put(avail_key.as_ref(), &updated)?;
-                txn.put(vis_idx_now.as_ref(), avail_key.as_ref())?;
-                txn.delete(in_progress_key.as_ref())?;
+                txn.put_cf(self.cf_available(), avail_key.as_ref(), &updated)?;
+                txn.put_cf(
+                    self.cf_visibility_index(),
+                    vis_idx_now.as_ref(),
+                    avail_key.as_ref(),
+                )?;
+                txn.delete_cf(self.cf_in_progress(), in_progress_key.as_ref())?;
             }
 
             // Remove the lease entry immediately; defer deleting the expiry index key
-            txn.delete(lease_key.as_ref())?;
+            txn.delete_cf(self.cf_leases(), lease_key.as_ref())?;
             expiry_index_keys_to_delete.push(idx_key.to_vec());
             processed += 1;
         }
         // Now delete collected expiry index keys outside of the iterator loop
         for key in expiry_index_keys_to_delete {
-            txn.delete(&key)?;
+            txn.delete_cf(self.cf_lease_expiry(), &key)?;
         }
         txn.commit()?;
         Ok(processed)
@@ -556,7 +639,7 @@ impl Storage {
         // Validate lease exists; if not, do nothing
         let lease_key = LeaseKey::from_lease_bytes(lease);
         if txn
-            .get_pinned_for_update(lease_key.as_ref(), true)?
+            .get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
             .is_none()
         {
             return Ok(false);
@@ -568,11 +651,17 @@ impl Storage {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let new_idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, lease);
-        txn.put(new_idx_key.as_ref(), lease_key.as_ref())?;
+        txn.put_cf(
+            self.cf_lease_expiry(),
+            new_idx_key.as_ref(),
+            lease_key.as_ref(),
+        )?;
 
         // Update the lease entry: delete old expiry index (if present in entry),
         // then set the new expiry ts and index key while preserving ids.
-        if let Some(lease_value) = txn.get_pinned_for_update(lease_key.as_ref(), true)? {
+        if let Some(lease_value) =
+            txn.get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
+        {
             let lease_msg = serialize::read_message_from_flat_slice(
                 &mut &lease_value[..],
                 message::ReaderOptions::new(),
@@ -586,7 +675,7 @@ impl Storage {
                 "expiryTsIndexKey must be present after full cutover"
             );
             if prev_idx_key != new_idx_key.as_bytes() {
-                txn.delete(prev_idx_key)?;
+                txn.delete_cf(self.cf_lease_expiry(), prev_idx_key)?;
             }
 
             // TODO: do this with set_root or some such / more efficiently.
@@ -600,7 +689,7 @@ impl Storage {
             }
             let mut buf = Vec::with_capacity(out.size_in_words() * 8);
             serialize::write_message(&mut buf, &out)?;
-            txn.put(lease_key.as_ref(), &buf)?;
+            txn.put_cf(self.cf_leases(), lease_key.as_ref(), &buf)?;
         }
         txn.commit()?;
         Ok(true)
@@ -1026,7 +1115,10 @@ mod tests {
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage
             .db
-            .get(lease_key.as_ref())?
+            .get_cf(
+                storage.db.cf_handle("leases").expect("cf leases"),
+                lease_key.as_ref(),
+            )?
             .ok_or("lease not found")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
@@ -1077,7 +1169,10 @@ mod tests {
             let in_progress_key = InProgressKey::from_id(id);
             let value = storage
                 .db
-                .get(in_progress_key.as_ref())?
+                .get_cf(
+                    storage.db.cf_handle("in_progress").expect("cf in_progress"),
+                    in_progress_key.as_ref(),
+                )?
                 .ok_or("in_progress value missing")?;
 
             // parse stored item to get original visibility index key
@@ -1089,18 +1184,40 @@ mod tests {
 
             // available entry must be gone
             let avail_key = AvailableKey::from_id(id);
-            assert!(storage.db.get(avail_key.as_ref())?.is_none());
+            assert!(
+                storage
+                    .db
+                    .get_cf(
+                        storage.db.cf_handle("available").expect("cf available"),
+                        avail_key.as_ref(),
+                    )?
+                    .is_none()
+            );
 
             // visibility index entry must be gone
             let idx_key = stored_item.get_visibility_ts_index_key()?;
-            assert!(storage.db.get(idx_key)?.is_none());
+            assert!(
+                storage
+                    .db
+                    .get_cf(
+                        storage
+                            .db
+                            .cf_handle("visibility_index")
+                            .expect("cf visibility_index"),
+                        idx_key,
+                    )?
+                    .is_none()
+            );
         }
 
         // lease entry exists and has keys (at least the ones we set)
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage
             .db
-            .get(lease_key.as_ref())?
+            .get_cf(
+                storage.db.cf_handle("leases").expect("cf leases"),
+                lease_key.as_ref(),
+            )?
             .ok_or("lease not found")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
@@ -1142,14 +1259,36 @@ mod tests {
 
         // id1 gone from in_progress, id2 remains
         let inprog_id1 = InProgressKey::from_id(b"id1");
-        assert!(storage.db.get(inprog_id1.as_ref())?.is_none());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage.db.cf_handle("in_progress").expect("cf in_progress"),
+                    inprog_id1.as_ref(),
+                )?
+                .is_none()
+        );
 
         let inprog_id2 = InProgressKey::from_id(b"id2");
-        assert!(storage.db.get(inprog_id2.as_ref())?.is_some());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage.db.cf_handle("in_progress").expect("cf in_progress"),
+                    inprog_id2.as_ref(),
+                )?
+                .is_some()
+        );
 
         // lease entry should contain only id2
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
+        let lease_value = storage
+            .db
+            .get_cf(
+                storage.db.cf_handle("leases").expect("cf leases"),
+                lease_key.as_ref(),
+            )?
+            .ok_or("lease missing")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
             message::ReaderOptions::new(),
@@ -1185,11 +1324,27 @@ mod tests {
 
         // in_progress entry gone
         let inprog = InProgressKey::from_id(b"only");
-        assert!(storage.db.get(inprog.as_ref())?.is_none());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage.db.cf_handle("in_progress").expect("cf in_progress"),
+                    inprog.as_ref(),
+                )?
+                .is_none()
+        );
 
         // lease entry deleted
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        assert!(storage.db.get(lease_key.as_ref())?.is_none());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage.db.cf_handle("leases").expect("cf leases"),
+                    lease_key.as_ref(),
+                )?
+                .is_none()
+        );
 
         Ok(())
     }
@@ -1219,11 +1374,25 @@ mod tests {
 
         // in_progress still exists
         let inprog = InProgressKey::from_id(b"only");
-        assert!(storage.db.get(inprog.as_ref())?.is_some());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage.db.cf_handle("in_progress").expect("cf in_progress"),
+                    inprog.as_ref(),
+                )?
+                .is_some()
+        );
 
         // original lease entry still exists and contains the id
         let lease_key = LeaseKey::from_lease_bytes(&lease);
-        let lease_value = storage.db.get(lease_key.as_ref())?.ok_or("lease missing")?;
+        let lease_value = storage
+            .db
+            .get_cf(
+                storage.db.cf_handle("leases").expect("cf leases"),
+                lease_key.as_ref(),
+            )?
+            .ok_or("lease missing")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
             message::ReaderOptions::new(),
@@ -1288,7 +1457,19 @@ mod tests {
         // Count expiry index entries that reference this lease
         let mut count = 0usize;
         let txn = storage.db.transaction();
-        for kv in txn.prefix_iterator(LeaseExpiryIndexKey::PREFIX) {
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let mode =
+            rocksdb::IteratorMode::From(LeaseExpiryIndexKey::PREFIX, rocksdb::Direction::Forward);
+        let iter = txn.iterator_cf_opt(
+            storage
+                .db
+                .cf_handle("lease_expiry")
+                .expect("cf lease_expiry"),
+            ro,
+            mode,
+        );
+        for kv in iter {
             let (idx_key, _val) = kv?;
             let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
             if lbytes == lease {
@@ -1355,15 +1536,34 @@ mod tests {
 
         // The item should still be in available, not in in_progress, and its index should remain
         let avail_key = AvailableKey::from_id(id);
-        assert!(storage.db.get(avail_key.as_ref())?.is_some());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage.db.cf_handle("available").expect("cf available"),
+                    avail_key.as_ref(),
+                )?
+                .is_some()
+        );
 
         let inprog_key = InProgressKey::from_id(id);
-        assert!(storage.db.get(inprog_key.as_ref())?.is_none());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage.db.cf_handle("in_progress").expect("cf in_progress"),
+                    inprog_key.as_ref(),
+                )?
+                .is_none()
+        );
 
         // Read stored item to get its visibility index key and ensure it still exists
         let value = storage
             .db
-            .get(avail_key.as_ref())?
+            .get_cf(
+                storage.db.cf_handle("available").expect("cf available"),
+                avail_key.as_ref(),
+            )?
             .ok_or("missing available value")?;
         let msg = serialize::read_message_from_flat_slice(
             &mut &value[..],
@@ -1371,7 +1571,18 @@ mod tests {
         )?;
         let stored_item = msg.get_root::<protocol::stored_item::Reader>()?;
         let idx_key = stored_item.get_visibility_ts_index_key()?;
-        assert!(storage.db.get(idx_key)?.is_some());
+        assert!(
+            storage
+                .db
+                .get_cf(
+                    storage
+                        .db
+                        .cf_handle("visibility_index")
+                        .expect("cf visibility_index"),
+                    idx_key,
+                )?
+                .is_some()
+        );
 
         Ok(())
     }
@@ -1549,7 +1760,14 @@ mod tests {
         let idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(past_secs, &lease);
         let lease_key = LeaseKey::from_lease_bytes(&lease);
 
-        storage.db.put(idx_key.as_ref(), lease_key.as_ref())?;
+        storage.db.put_cf(
+            storage
+                .db
+                .cf_handle("lease_expiry")
+                .expect("cf lease_expiry"),
+            idx_key.as_ref(),
+            lease_key.as_ref(),
+        )?;
 
         // Should not error and should process zero leases
         let processed = storage.expire_due_leases()?;
@@ -1579,23 +1797,49 @@ mod tests {
             .transaction_opt(&rocksdb::WriteOptions::default(), &txn_opts);
 
         // Iterate visibility index and capture the first entry
-        let mut viz_iter = txn.prefix_iterator(VisibilityIndexKey::PREFIX);
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let mode =
+            rocksdb::IteratorMode::From(VisibilityIndexKey::PREFIX, rocksdb::Direction::Forward);
+        let mut viz_iter = txn.iterator_cf_opt(
+            storage
+                .db
+                .cf_handle("visibility_index")
+                .expect("cf visibility_index"),
+            ro,
+            mode,
+        );
         let (idx_key, main_key) = viz_iter
             .next()
             .expect("expected at least one visibility index entry")?;
 
         // Lock the visibility index entry so we simulate the poller owning it
-        let locked = txn.get_pinned_for_update(&idx_key, true)?;
+        let locked = txn.get_pinned_for_update_cf(
+            storage
+                .db
+                .cf_handle("visibility_index")
+                .expect("cf visibility_index"),
+            &idx_key,
+            true,
+        )?;
         assert!(locked.is_some(), "failed to lock visibility index entry");
 
         // Delete the main key outside the transaction after we've taken the snapshot
         let main_key_vec = main_key.as_ref().to_vec();
-        storage.db.delete(&main_key_vec)?;
+        storage.db.delete_cf(
+            storage.db.cf_handle("available").expect("cf available"),
+            &main_key_vec,
+        )?;
 
         // Read using the transaction's snapshot; this should still see the value
         let mut ropts = rocksdb::ReadOptions::default();
         ropts.set_snapshot(&txn.snapshot());
-        let got = txn.get_pinned_for_update_opt(&main_key_vec, true, &ropts)?;
+        let got = txn.get_pinned_for_update_cf_opt(
+            storage.db.cf_handle("available").expect("cf available"),
+            &main_key_vec,
+            true,
+            &ropts,
+        )?;
         assert!(
             got.is_some(),
             "snapshot read should see the main value even if concurrently deleted"
@@ -1630,7 +1874,10 @@ mod tests {
         let lease_key = LeaseKey::from_lease_bytes(&lease);
         let lease_value = storage
             .db
-            .get(lease_key.as_ref())?
+            .get_cf(
+                storage.db.cf_handle("leases").expect("cf leases"),
+                lease_key.as_ref(),
+            )?
             .ok_or("lease not found")?;
         let lease_entry = serialize::read_message_from_flat_slice(
             &mut &lease_value[..],
