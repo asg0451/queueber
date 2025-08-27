@@ -1,0 +1,108 @@
+name: Benchmarks (Criterion)
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+
+permissions:
+  contents: write
+  actions: read
+  checks: write
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  criterion:
+    name: Run Criterion benchmarks and track over time
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto jq
+
+      - name: Set up Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Show rustc version
+        run: rustc -Vv && cargo -V
+
+      - name: Build benches
+        run: cargo build --benches --locked
+
+      - name: Run tests (sanity)
+        run: |
+          cargo test --all --locked --no-fail-fast
+          cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Criterion benches
+        run: |
+          # Run all benches; Criterion outputs to target/criterion
+          cargo bench --all -- --noplot
+
+      - name: Summarize Criterion results -> JSON (ms, smaller is better)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULTS=criterion-summary.json
+          echo '[]' > "$RESULTS"
+          shopt -s globstar nullglob
+          declare -A picked
+          files=(target/criterion/**/new/estimates.json target/criterion/**/estimates.json)
+          for f in "${files[@]}"; do
+            [[ -f "$f" ]] || continue
+            benchdir=$(sed -E 's#^target/criterion/([^/]+)/.*#\1#' <<<"$f")
+            # Prefer 'new' over root estimates if both exist
+            if [[ -n "${picked[$benchdir]:-}" && "$f" != */new/* ]]; then
+              continue
+            fi
+            mean_sec=$(jq -r '.Mean.point_estimate' "$f")
+            # Convert seconds to milliseconds for readability
+            ms=$(awk -v s="$mean_sec" 'BEGIN{printf "%.3f", s*1000}')
+            tmp=$(mktemp)
+            jq --arg name "$benchdir" --argjson value "$ms" '. + [{"name":$name,"value":$value}]' "$RESULTS" > "$tmp"
+            mv "$tmp" "$RESULTS"
+            picked[$benchdir]=1
+          done
+          echo 'Generated summary:'
+          cat "$RESULTS"
+
+      - name: Store benchmark result (github-action-benchmark)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Criterion
+          tool: "customSmallerIsBetter"
+          output-file-path: criterion-summary.json
+          gh-repository: ${{ github.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-data
+          comment-always: true
+          alert-threshold: '200%'
+          fail-on-alert: false
+
+      - name: Upload Criterion raw output (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-output
+          path: |
+            target/criterion/**
+            criterion-summary.json
+          if-no-files-found: warn
