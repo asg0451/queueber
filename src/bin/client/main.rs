@@ -112,6 +112,9 @@ enum Commands {
         /// Target message add rate per client (messages/second)
         #[arg(short = 'r', long = "rate", default_value_t = 100)]
         rate: u32,
+        /// How long to run the stress test for (seconds)
+        #[arg(short = 'd', long = "duration", default_value_t = 30)]
+        duration_secs: u64,
     },
 }
 
@@ -242,7 +245,13 @@ async fn main() -> Result<()> {
             polling_clients,
             adding_clients,
             rate,
+            duration_secs,
         } => {
+            let start_time = Instant::now();
+            let end_time = start_time
+                .checked_add(Duration::from_secs(duration_secs))
+                .unwrap();
+
             let add_count = Arc::new(atomic::AtomicU64::new(0));
             let poll_count = Arc::new(atomic::AtomicU64::new(0));
             let remove_count = Arc::new(atomic::AtomicU64::new(0));
@@ -258,7 +267,7 @@ async fn main() -> Result<()> {
                     let extend_count = Arc::clone(&extend_count);
                     async move {
                         let mut last_time = Instant::now();
-                        loop {
+                        while Instant::now() < end_time {
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             let now = Instant::now();
                             let adds = add_count.swap(0, atomic::Ordering::Relaxed);
@@ -298,7 +307,7 @@ async fn main() -> Result<()> {
                                     let _ = with_client(addr, |queue_client| async move {
                                         let mut current_lease: Option<[u8; 16]> = None;
                                         let mut last_extend = Instant::now();
-                                        loop {
+                                        while Instant::now() < end_time {
                                             let mut request = queue_client.poll_request();
                                             let mut req = request.get().init_req();
                                             req.set_lease_validity_secs(30);
@@ -369,7 +378,7 @@ async fn main() -> Result<()> {
                                         if let Some(ref mut t) = ticker {
                                             t.set_missed_tick_behavior(MissedTickBehavior::Delay);
                                         }
-                                        loop {
+                                        while Instant::now() < end_time {
                                             if let Some(t) = &mut ticker {
                                                 t.tick().await;
                                             }
@@ -395,6 +404,7 @@ async fn main() -> Result<()> {
                     });
                 }
             });
+            println!("stress test completed");
         }
     }
     Ok(())

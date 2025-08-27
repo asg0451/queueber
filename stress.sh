@@ -16,6 +16,7 @@ if [ $# -eq 0 ]; then
         -p 2
         -a 2
         -r0
+        -d 10
     )
 else
     args=("$@")
