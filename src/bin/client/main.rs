@@ -4,9 +4,10 @@ use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::protocol::queue;
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     str::FromStr,
-    sync::{Arc, atomic},
+    sync::{Arc, Mutex, atomic},
     time::Duration,
 };
 use tokio::{
@@ -348,6 +349,7 @@ async fn main() -> Result<()> {
             let poll_count = Arc::new(atomic::AtomicU64::new(0));
             let remove_count = Arc::new(atomic::AtomicU64::new(0));
             let extend_count = Arc::new(atomic::AtomicU64::new(0));
+            let unique_leases: Arc<Mutex<HashSet<[u8; 16]>>> = Arc::new(Mutex::new(HashSet::new()));
 
             // periodic metrics reporter
             tokio::task::Builder::new()
@@ -391,6 +393,7 @@ async fn main() -> Result<()> {
                     let poll_count = Arc::clone(&poll_count);
                     let remove_count = Arc::clone(&remove_count);
                     let extend_count = Arc::clone(&extend_count);
+                    let unique_leases = Arc::clone(&unique_leases);
                     let handle = Handle::current();
                     s.spawn(move || {
                         handle.block_on(async move {
@@ -419,6 +422,11 @@ async fn main() -> Result<()> {
                                                     let mut lease_arr = [0u8; 16];
                                                     lease_arr.copy_from_slice(lease);
                                                     current_lease = Some(lease_arr);
+                                                    if !items.is_empty() {
+                                                        if let Ok(mut s) = unique_leases.lock() {
+                                                            s.insert(lease_arr);
+                                                        }
+                                                    }
                                                 }
 
                                                 let promises = items.iter().map(|i| {
@@ -509,6 +517,13 @@ async fn main() -> Result<()> {
                 }
             });
             println!("stress test completed");
+            // Report unique leases observed across all polling clients
+            if let Ok(s) = unique_leases.lock() {
+                println!(
+                    "Unique leases observed (proxy for coalesced polls): {}",
+                    s.len()
+                );
+            }
             busy_tracker::report_and_reset("client-stress");
         }
     }
