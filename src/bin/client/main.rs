@@ -466,11 +466,11 @@ async fn main() -> Result<()> {
                                             });
                                             let results = futures::future::join_all(promises).await;
                                             for r in results.into_iter() {
-                                                if let Err(e) = r
-                                                    && is_capnp_busy_error(&e)
-                                                {
-                                                    busy_remove_count
-                                                        .fetch_add(1, atomic::Ordering::Relaxed);
+                                                if let Err(e) = r {
+                                                    let _ = is_capnp_busy_and_incr(
+                                                        &e,
+                                                        &busy_remove_count,
+                                                    );
                                                 }
                                             }
                                             remove_count.fetch_add(
@@ -487,12 +487,10 @@ async fn main() -> Result<()> {
                                                     req.set_lease_validity_secs(30);
                                                     extend_req_count
                                                         .fetch_add(1, atomic::Ordering::Relaxed);
-                                                    if let Err(e) = request.send().promise.await
-                                                        && is_capnp_busy_error(&e)
-                                                    {
-                                                        busy_extend_count.fetch_add(
-                                                            1,
-                                                            atomic::Ordering::Relaxed,
+                                                    if let Err(e) = request.send().promise.await {
+                                                        let _ = is_capnp_busy_and_incr(
+                                                            &e,
+                                                            &busy_extend_count,
                                                         );
                                                     }
                                                     extend_count
@@ -539,18 +537,11 @@ async fn main() -> Result<()> {
                                                 item.set_visibility_timeout_secs(3);
                                             }
                                             add_req_count.fetch_add(1, atomic::Ordering::Relaxed);
-                                            match request.send().promise.await {
-                                                Ok(_) => {}
-                                                Err(e) => {
-                                                    if is_capnp_busy_error(&e) {
-                                                        busy_add_count.fetch_add(
-                                                            1,
-                                                            atomic::Ordering::Relaxed,
-                                                        );
-                                                        continue;
-                                                    } else {
-                                                        continue;
-                                                    }
+                                            if let Err(e) = request.send().promise.await {
+                                                if is_capnp_busy_and_incr(&e, &busy_add_count) {
+                                                    continue;
+                                                } else {
+                                                    panic!("{}", e);
                                                 }
                                             }
                                             add_count.fetch_add(
@@ -601,4 +592,13 @@ where
 fn is_capnp_busy_error(e: &capnp::Error) -> bool {
     let msg = e.to_string();
     msg.contains("Busy") || msg.contains("busy") || msg.contains("resource busy")
+}
+
+fn is_capnp_busy_and_incr(e: &capnp::Error, counter: &atomic::AtomicU64) -> bool {
+    if is_capnp_busy_error(e) {
+        counter.fetch_add(1, atomic::Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
