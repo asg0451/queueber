@@ -100,8 +100,8 @@ impl Storage {
             use rocksdb::BlockBasedOptions;
             use rocksdb::Cache;
             let mut bopts = BlockBasedOptions::default();
-            // 10 bits per key is a good latency/false-positive tradeoff
-            bopts.set_bloom_filter(10.0, false);
+            // 6 bits per key reduces CPU for filters; good tradeoff in mixed workloads
+            bopts.set_bloom_filter(6.0, false);
             bopts.set_whole_key_filtering(true);
             // 32 KiB block size balances CPU and I/O
             bopts.set_block_size(32 * 1024);
