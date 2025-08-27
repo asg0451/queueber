@@ -260,27 +260,18 @@ impl Storage {
         let keys_iter = staged_pairs.iter().map(|(_idx, main)| &main[..]);
         let values = self.db.multi_get_opt(keys_iter, &ro_get);
 
-        // Build a map from main key -> value for quick lookup
-        type MainKeyAndValue = (Box<[u8]>, Vec<u8>);
-        let mut main_to_value: Vec<MainKeyAndValue> = Vec::with_capacity(values.len());
+        // Process each result in the same order as staged_pairs to keep ordering stable.
         for (i, res) in values.into_iter().enumerate() {
-            match res {
-                Ok(Some(val)) => {
-                    main_to_value.push((staged_pairs[i].1.clone(), val.to_vec()));
-                }
-                Ok(None) => {
-                    // If missing, skip; another worker could be moving it concurrently.
-                    // Our index lock should prevent this in steady-state, but be tolerant.
-                }
+            let (idx_key, main_key) = (&staged_pairs[i].0, &staged_pairs[i].1);
+            let Some(main_value) = (match res {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => None,
                 Err(e) => return Err(Error::from(e)),
-            }
-        }
-
-        // For each found value, decode, emit, and move available->in_progress while deleting index.
-        for (idx_main_pair, (_main_key, main_value)) in
-            staged_pairs.into_iter().zip(main_to_value.into_iter())
-        {
-            let (idx_key, main_key) = idx_main_pair;
+            }) else {
+                // If missing, skip; another worker could be moving it concurrently.
+                // Our index lock should prevent this in steady-state, but be tolerant.
+                continue;
+            };
 
             let stored_item_message = serialize::read_message_from_flat_slice(
                 &mut &main_value[..],
@@ -289,23 +280,39 @@ impl Storage {
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
             debug_assert!(!stored_item.get_id()?.is_empty());
+            // contents may be empty; only assert structural invariants
+            // debug_assert!(!stored_item.get_contents()?.is_empty());
             debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
             debug_assert_eq!(
                 stored_item.get_id()?,
-                AvailableKey::id_suffix_from_key_bytes(&main_key)
+                AvailableKey::id_suffix_from_key_bytes(main_key)
             );
 
-            let mut builder = message::Builder::new_default();
+            tracing::debug!(
+                "got stored item: (id: {}, contents: <contents len: {}>)",
+                Uuid::from_slice(stored_item.get_id()?).unwrap_or_default(),
+                stored_item.get_contents()?.len()
+            );
+
+            // Build the polled item.
+            let mut builder = message::Builder::new_default(); // TODO: reduce allocs
             let mut polled_item = builder.init_root::<protocol::polled_item::Builder>();
             polled_item.set_contents(stored_item.get_contents()?);
             polled_item.set_id(stored_item.get_id()?);
             let polled_item = builder.into_typed().into_reader();
             polled_items.push(polled_item);
 
-            // Move to in_progress and delete index and available main
+            // Move the item to in progress and delete the index entry.
+            // First remove the visibility index so others won't see it.
+            // Important: Although the transaction commits atomically, readers without a
+            // snapshot may interleave reads (index then main). Deleting the index first
+            // ensures concurrent readers don't see an index that points to a deleted main.
+            // NOTE: i dont think this is true lmao and it's still broken in any case.
+            // TODO: use snapshots in txns maybe that will help
             let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
-            txn.delete(&idx_key)?;
-            txn.delete(&main_key)?;
+            txn.delete(idx_key)?;
+            // Then move the value from available -> in_progress.
+            txn.delete(main_key)?;
             txn.put(new_main_key.as_ref(), &main_value)?;
         }
 
