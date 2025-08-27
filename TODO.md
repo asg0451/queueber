@@ -31,7 +31,7 @@
 - [ ] (perf) improve performance
   - (likely win) add iterator upper bounds to time-ordered scans (`visibility_index`, `lease_expiry_index`) to stop at now [implemented]
   - (likely win) batch main value reads via `multi_get` in poll; batch writes where feasible
-  - (likely win) reuse Cap'n Proto builders and byte buffers to cut allocations on hot paths
+  - [X] (likely win) reuse Cap'n Proto builders and byte buffers to cut allocations on hot paths
   - (likely win) avoid reserializing `stored_item` during expiry; update index only or decouple index key from value
   - guard expensive debug logging/UUID formatting behind level checks; sample logs under load
   - evaluate pessimistic transactions under contention; compare retries vs lock waits
