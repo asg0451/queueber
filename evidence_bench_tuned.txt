@@ -1,0 +1,59 @@
+
+running 15 tests
+iiiiiiiiiiiiiii
+test result: ok. 0 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+ii
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+iii
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+storage_add/add_available_500
+                        time:   [6.7382 ms 6.7811 ms 6.8238 ms]
+                        change: [-9.3638% -7.3265% -5.4330%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) low severe
+  4 (4.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+
+storage_remove/remove_in_progress_500
+                        time:   [14.019 ms 14.090 ms 14.177 ms]
+                        change: [-5.6906% -3.0197% -1.1119%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+storage_poll/get_next_available_entries_500
+                        time:   [8.7392 ms 8.7829 ms 8.8274 ms]
+                        change: [-3.0541% -2.0906% -1.1655%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+e2e_rpc/rpc_add_batch_200
+                        time:   [480.94 µs 485.13 µs 489.57 µs]
+                        change: [-3.7387% -2.2809% -0.7758%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+e2e_rpc/rpc_poll_batch_200
+                        time:   [36.773 ms 39.280 ms 41.768 ms]
+                        change: [-5.7240% +1.1551% +9.2170%] (p = 0.77 > 0.05)
+                        No change in performance detected.
+e2e_rpc/rpc_remove_each_200
+                        time:   [10.739 ms 10.926 ms 11.128 ms]
+                        change: [-4.9157% -2.4799% -0.0714%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  5 (5.00%) high mild
+  2 (2.00%) high severe
+
+

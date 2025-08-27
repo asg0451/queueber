@@ -1,0 +1,7 @@
+[2m2025-08-27T18:25:06.426026Z[0m [32m INFO[0m [2mqueueber[0m[2m:[0m using 4 worker threads
+Running client with args: -p 2 -a 2 -r0 -d 10
+[2m2025-08-27T18:25:12.073416Z[0m [33m WARN[0m [2mqueueber::storage[0m[2m:[0m RocksDB Busy: giving up after max retries [3moperation[0m[2m=[0mget_next_available_entries_with_lease [3mattempts[0m[2m=[0m9
+add: 1058990 (211772.4/s), poll: 10400 (2079.7/s), remove: 10400 (2079.7/s), extend: 2 (0.4/s)
+Waiting for server to exit...
+Server exited with code 137
+Client exited with code 101

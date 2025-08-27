@@ -1,0 +1,8 @@
+[2m2025-08-27T18:25:38.125770Z[0m [32m INFO[0m [2mqueueber[0m[2m:[0m using 4 worker threads
+Running client with args: -p 2 -a 2 -r0 -d 10
+add: 891970 (178361.0/s), poll: 10050 (2009.6/s), remove: 10050 (2009.6/s), extend: 2 (0.4/s)
+add: 662090 (132388.2/s), poll: 17670 (3533.2/s), remove: 17670 (3533.2/s), extend: 6 (1.2/s)
+stress test completed
+Waiting for server to exit...
+Server exited with code 137
+Client exited with code 0
