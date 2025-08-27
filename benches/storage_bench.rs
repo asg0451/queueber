@@ -378,6 +378,8 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                         s.spawn(move || {
                             with_client(addr, |queue_client| async move {
                                 // Keep polling/removing until we've removed all items for this run
+                                let mut current_lease: Option<[u8; 16]> = None;
+                                let mut last_extend = std::time::Instant::now();
                                 loop {
                                     let done = removed_count.load(atomic::Ordering::Relaxed)
                                         >= total_items;
@@ -394,6 +396,11 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                     let resp = reply.get().unwrap().get_resp().unwrap();
                                     let items = resp.get_items().unwrap();
                                     let lease = resp.get_lease().unwrap();
+                                    if lease.len() == 16 {
+                                        let mut lease_arr = [0u8; 16];
+                                        lease_arr.copy_from_slice(lease);
+                                        current_lease = Some(lease_arr);
+                                    }
 
                                     if items.is_empty() {
                                         continue;
@@ -408,6 +415,18 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
                                     });
                                     let _ = futures::future::join_all(promises).await;
                                     removed_count.fetch_add(items.len(), atomic::Ordering::Relaxed);
+
+                                    // Occasionally extend the current lease to exercise extend path
+                                    if last_extend.elapsed() > std::time::Duration::from_secs(2) {
+                                        if let Some(lease_arr) = current_lease {
+                                            let mut xreq = queue_client.extend_request();
+                                            let mut xr = xreq.get().init_req();
+                                            xr.set_lease(&lease_arr);
+                                            xr.set_lease_validity_secs(30);
+                                            let _ = xreq.send().promise.await;
+                                        }
+                                        last_extend = std::time::Instant::now();
+                                    }
                                 }
                             });
                         });
