@@ -466,12 +466,12 @@ async fn main() -> Result<()> {
                                             });
                                             let results = futures::future::join_all(promises).await;
                                             for r in results.into_iter() {
-                                                if let Err(e) = r {
-                                                    let _ = is_capnp_busy_and_incr(
-                                                        &e,
-                                                        &busy_remove_count,
-                                                    );
-                                                }
+                                                let _ = handle_capnp_busy(
+                                                    r,
+                                                    "remove",
+                                                    &remove_req_count,
+                                                    &busy_remove_count,
+                                                );
                                             }
                                             remove_count.fetch_add(
                                                 items.len() as u64,
@@ -487,12 +487,12 @@ async fn main() -> Result<()> {
                                                     req.set_lease_validity_secs(30);
                                                     extend_req_count
                                                         .fetch_add(1, atomic::Ordering::Relaxed);
-                                                    if let Err(e) = request.send().promise.await {
-                                                        let _ = is_capnp_busy_and_incr(
-                                                            &e,
-                                                            &busy_extend_count,
-                                                        );
-                                                    }
+                                                    let _ = handle_capnp_busy(
+                                                        request.send().promise.await,
+                                                        "extend",
+                                                        &extend_req_count,
+                                                        &busy_extend_count,
+                                                    );
                                                     extend_count
                                                         .fetch_add(1, atomic::Ordering::Relaxed);
                                                 }
@@ -536,13 +536,15 @@ async fn main() -> Result<()> {
                                                 item.set_contents(format!("test {}", i).as_bytes());
                                                 item.set_visibility_timeout_secs(3);
                                             }
-                                            add_req_count.fetch_add(1, atomic::Ordering::Relaxed);
-                                            if let Err(e) = request.send().promise.await {
-                                                if is_capnp_busy_and_incr(&e, &busy_add_count) {
-                                                    continue;
-                                                } else {
-                                                    panic!("{}", e);
-                                                }
+                                            match handle_capnp_busy(
+                                                request.send().promise.await,
+                                                "add",
+                                                &add_req_count,
+                                                &busy_add_count,
+                                            ) {
+                                                Ok(Some(_)) => {}
+                                                Ok(None) => continue,
+                                                Err(_e) => continue,
                                             }
                                             add_count.fetch_add(
                                                 batch_size as u64,
@@ -594,11 +596,23 @@ fn is_capnp_busy_error(e: &capnp::Error) -> bool {
     msg.contains("Busy") || msg.contains("busy") || msg.contains("resource busy")
 }
 
-fn is_capnp_busy_and_incr(e: &capnp::Error, counter: &atomic::AtomicU64) -> bool {
-    if is_capnp_busy_error(e) {
-        counter.fetch_add(1, atomic::Ordering::Relaxed);
-        true
-    } else {
-        false
+fn handle_capnp_busy<T>(
+    res: std::result::Result<T, capnp::Error>,
+    op: &str,
+    total_counter: &atomic::AtomicU64,
+    busy_counter: &atomic::AtomicU64,
+) -> std::result::Result<Option<T>, capnp::Error> {
+    total_counter.fetch_add(1, atomic::Ordering::Relaxed);
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            if is_capnp_busy_error(&e) {
+                busy_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                tracing::warn!(operation = op, "resource busy: ignoring");
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
