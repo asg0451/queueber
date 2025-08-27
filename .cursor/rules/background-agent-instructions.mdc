@@ -15,6 +15,7 @@ alwaysApply: true
 - likewise, make sure all merge conflits are resolved before declaring success. do this by running `git pull --no-rebase origin master` before every `git push`
 - always run `cargo fmt` before committing as well
 - consider running `./stress.sh` to see if any concurrency issues pop up
+- NEVER PUSH TO MASTER! you are already on a branch. ONLY PUSH TO THAT BRANCH OR THEY WILL KILL ME
 
 ## guidelines
 - i can be wrong. if i say something you think is wrong, please push back on it at least once
