@@ -37,6 +37,7 @@ where
 }
 
 #[inline]
+#[allow(unused_variables, unused_mut)] // because in non debug mode it complains otherwise
 fn debug_assert_sorted_by_index<'a, F>(len: u32, mut get_at: F)
 where
     F: FnMut(u32) -> Option<&'a [u8]>,
