@@ -21,6 +21,10 @@ jobs:
   criterion:
     name: Run Criterion benchmarks and track over time
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: --cfg tokio_unstable
+      RUST_BACKTRACE: 1
 
     steps:
       - name: Checkout
@@ -31,7 +35,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y capnproto jq libclang-19-dev
+          sudo apt-get install -y capnproto libcapnp-dev libclang-dev build-essential jq pkg-config
 
       - name: Set up Rust toolchain (nightly)
         uses: dtolnay/rust-toolchain@nightly
