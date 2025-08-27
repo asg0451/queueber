@@ -119,8 +119,8 @@ impl Storage {
         opts.set_bytes_per_sync(1 << 20); // 1 MiB
         opts.set_wal_bytes_per_sync(1 << 20); // 1 MiB
 
-        // Compression: disable for lower CPU on synthetic stress; revisit if disk is a concern
-        opts.set_compression_type(rocksdb::DBCompressionType::None);
+        // Compression: favor speed with Snappy; keeps space reasonable without high CPU
+        opts.set_compression_type(rocksdb::DBCompressionType::Snappy);
 
         opts.create_if_missing(true);
         let db = OptimisticTransactionDB::open(&opts, path)?;
