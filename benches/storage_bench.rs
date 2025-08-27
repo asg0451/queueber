@@ -246,6 +246,7 @@ where
 
 fn bench_e2e_add_poll_remove(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e_rpc");
+    group.measurement_time(std::time::Duration::from_secs(15));
     let num_items: u32 = 200;
     let handle = ensure_server_started();
     let addr = handle.addr;
@@ -351,6 +352,7 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
 
 fn bench_e2e_stress_like(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e_rpc");
+    group.measurement_time(std::time::Duration::from_secs(15));
     // Parameters inspired by stress.sh defaults but with bounded total work per iteration.
     let adding_clients: u32 = 2;
     let polling_clients: u32 = 2;
