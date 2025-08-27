@@ -57,7 +57,7 @@ jobs:
       - name: Run Criterion benches
         run: |
           # Run all benches; Criterion outputs to target/criterion
-          cargo bench --all -- --noplot
+          cargo bench --all
 
       - name: Summarize Criterion results -> JSON (ms, smaller is better)
         shell: bash
