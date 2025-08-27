@@ -35,9 +35,30 @@ fn bench_add_messages(c: &mut Criterion) {
                 item.set_visibility_timeout_secs(0);
                 let item_reader = item.into_reader();
 
+                let mut total_reqs: u64 = 0;
+                let mut busy_reqs: u64 = 0;
                 for i in 0..num_items {
                     let id = format!("id_{}", i);
-                    let _ = storage.add_available_item((id.as_bytes(), item_reader.reborrow()));
+                    total_reqs += 1;
+                    match storage.add_available_item((id.as_bytes(), item_reader.reborrow())) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            if let queueber::errors::Error::Rocksdb { ref source, .. } = e
+                                && source.kind() == rocksdb::ErrorKind::Busy
+                            {
+                                busy_reqs += 1;
+                                continue;
+                            }
+                            panic!("{}", e);
+                        }
+                    }
+                }
+                if total_reqs > 0 {
+                    let pct = (busy_reqs as f64 / total_reqs as f64) * 100.0;
+                    eprintln!(
+                        "bench storage_add: busy {:.1}% ({} / {})",
+                        pct, busy_reqs, total_reqs
+                    );
                 }
             },
             BatchSize::SmallInput,
@@ -85,8 +106,29 @@ fn bench_remove_messages(c: &mut Criterion) {
                 (dir, storage, lease, ids)
             },
             |(_dir, storage, lease, ids)| {
+                let mut total_reqs: u64 = 0;
+                let mut busy_reqs: u64 = 0;
                 for id in ids {
-                    let _ = storage.remove_in_progress_item(&id, &lease);
+                    total_reqs += 1;
+                    match storage.remove_in_progress_item(&id, &lease) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            if let queueber::errors::Error::Rocksdb { ref source, .. } = e
+                                && source.kind() == rocksdb::ErrorKind::Busy
+                            {
+                                busy_reqs += 1;
+                                continue;
+                            }
+                            panic!("{}", e);
+                        }
+                    }
+                }
+                if total_reqs > 0 {
+                    let pct = (busy_reqs as f64 / total_reqs as f64) * 100.0;
+                    eprintln!(
+                        "bench storage_remove: busy {:.1}% ({} / {})",
+                        pct, busy_reqs, total_reqs
+                    );
                 }
             },
             BatchSize::SmallInput,
@@ -121,7 +163,30 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
                 (dir, storage)
             },
             |(_dir, storage)| {
-                let _ = storage.get_next_available_entries(num_items);
+                let mut total_reqs: u64 = 0;
+                let mut busy_reqs: u64 = 0;
+                total_reqs += 1;
+                match storage.get_next_available_entries(num_items) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if let queueber::errors::Error::Rocksdb { ref source, .. } = e {
+                            if source.kind() == rocksdb::ErrorKind::Busy {
+                                busy_reqs += 1;
+                            } else {
+                                panic!("{}", e);
+                            }
+                        } else {
+                            panic!("{}", e);
+                        }
+                    }
+                }
+                if total_reqs > 0 {
+                    let pct = (busy_reqs as f64 / total_reqs as f64) * 100.0;
+                    eprintln!(
+                        "bench storage_poll: busy {:.1}% ({} / {})",
+                        pct, busy_reqs, total_reqs
+                    );
+                }
             },
             BatchSize::SmallInput,
         );
