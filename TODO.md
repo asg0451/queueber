@@ -29,7 +29,7 @@
 - [X] (bugfix) why does the server just shut down under stress after a while with exit code 0 ...
 - [X] (perf) add `--workers` CLI flag and name RPC worker threads
 - [ ] (perf) improve performance
-  - (likely win) add iterator upper bounds to time-ordered scans (`visibility_index`, `lease_expiry_index`) to stop at now
+  - [X] (likely win) add iterator upper bounds to time-ordered scans (`visibility_index`, `lease_expiry_index`) to stop at now
   - [X] (likely win) batch main value reads via `multi_get` in poll; batch writes where feasible
   - (likely win) reuse Cap'n Proto builders and byte buffers to cut allocations on hot paths
   - (likely win) avoid reserializing `stored_item` during expiry; update index only or decouple index key from value
