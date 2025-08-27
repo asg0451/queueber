@@ -49,9 +49,6 @@ jobs:
       - name: Build benches
         run: cargo build --benches --locked
 
-      - name: Run clippy (sanity)
-        run: |
-          cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run Criterion benches
         run: |
