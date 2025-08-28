@@ -65,5 +65,5 @@
 - [ ] (productionize) packaging: Dockerfile (non-root, minimal base, HEALTHCHECK), multi-arch builds
 - [ ] (productionize) Kubernetes/Helm: liveness/readiness probes, resource limits/requests, PDB, PV, ConfigMap-based configuration
 - [ ] (productionize) systemd unit: restart policy, sandboxing, rlimits, service user/group
-- [ ] (productionize) repository hygiene: add LICENSE and CONTRIBUTING.md
+- [X] (productionize) repository hygiene: add LICENSE and CONTRIBUTING.md
 - [ ] (productionize) update README
