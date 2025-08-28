@@ -22,6 +22,9 @@ COPY src ./src
 COPY benches ./benches
 COPY tests ./tests
 
+ENV RUSTFLAGS="--cfg tokio_unstable"
+ENV RUST_BACKTRACE=1
+
 # Build optimized binary (rust-toolchain.toml pins nightly)
 # Use the custom fastrelease profile defined in Cargo.toml
 RUN cargo build --profile fastrelease --bin queueber
@@ -41,6 +44,8 @@ COPY --from=builder /app/target/fastrelease/queueber /usr/local/bin/queueber
 
 USER queueber
 ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
+
 EXPOSE 9090
 # Tokio console default port
 EXPOSE 6669
