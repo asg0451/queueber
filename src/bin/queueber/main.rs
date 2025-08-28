@@ -8,6 +8,8 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{
+    metrics,
+    metrics_server::MetricsServer,
     server::Server,
     storage::{RetriedStorage, Storage},
 };
@@ -37,6 +39,10 @@ struct Args {
     /// Number of RPC worker threads. Defaults to available_parallelism.
     #[arg(long = "workers")]
     workers: Option<usize>,
+
+    /// Metrics server port. Defaults to disabled metrics server.
+    #[arg(long = "metrics-port")]
+    metrics_port: Option<u16>,
 }
 
 // NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
@@ -65,6 +71,24 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let addr = args.listen.to_socket_addrs()?.next().unwrap();
+
+    // Initialize metrics subsystem
+    metrics::init();
+    tracing::info!("Metrics initialized");
+
+    // Start metrics server if requested
+    if let Some(metrics_port) = args.metrics_port {
+        let metrics_addr = SocketAddr::new(addr.ip(), metrics_port);
+        let metrics_server = MetricsServer::new(metrics_addr);
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server.run().await {
+                tracing::error!("Metrics server error: {}", e);
+            }
+        });
+        tracing::info!("Metrics server started on {}", metrics_addr);
+    } else {
+        tracing::info!("Metrics server disabled (use --metrics-port to enable)");
+    }
 
     std::fs::create_dir_all(&args.data_dir)?;
     if args.wipe {

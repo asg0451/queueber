@@ -3,6 +3,8 @@
 
 pub mod dbkeys;
 pub mod errors;
+pub mod metrics;
+pub mod metrics_server;
 pub mod protocol;
 pub mod server;
 pub mod storage;

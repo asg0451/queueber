@@ -10,6 +10,7 @@ use crate::protocol::queue::{
     AddParams, AddResults, PollParams, PollResults, RemoveParams, RemoveResults,
 };
 use crate::storage::{RetriedStorage, Storage};
+use crate::{inc_rpc_counter, rpc_timer};
 mod coalescer;
 use coalescer::PollCoalescer;
 
@@ -115,9 +116,23 @@ pub fn spawn_background_tasks(
 
 impl crate::protocol::queue::Server for Server {
     fn add(&mut self, params: AddParams, mut results: AddResults) -> Promise<(), capnp::Error> {
-        let req = params.get()?;
-        let req = req.get_req()?;
-        let items = req.get_items()?;
+        let _timer = rpc_timer!("add");
+        
+        let req = match params.get().and_then(|p| p.get_req()) {
+            Ok(req) => req,
+            Err(e) => {
+                inc_rpc_counter!("add", "error");
+                return Promise::err(e);
+            }
+        };
+        
+        let items = match req.get_items() {
+            Ok(items) => items,
+            Err(e) => {
+                inc_rpc_counter!("add", "error");
+                return Promise::err(e);
+            }
+        };
 
         // Generate ids upfront and copy request data into owned memory so we can move
         // it into a blocking task (capnp readers are not Send).
@@ -134,10 +149,18 @@ impl crate::protocol::queue::Server for Server {
                 let vis = item.get_visibility_timeout_secs();
                 Ok((contents, vis))
             })
-            .collect::<Result<Vec<_>>>()
-            .map_err(Into::<capnp::Error>::into)?;
+            .collect::<Result<Vec<_>>>();
+            
+        let items_owned = match items_owned.map_err(Into::<capnp::Error>::into) {
+            Ok(items) => items,
+            Err(e) => {
+                inc_rpc_counter!("add", "error");
+                return Promise::err(e);
+            }
+        };
 
         let any_immediately_visible = items_owned.iter().any(|(_, vis)| *vis == 0);
+        let item_count = items_owned.len();
 
         let storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
@@ -148,7 +171,20 @@ impl crate::protocol::queue::Server for Server {
                 .iter()
                 .map(|id| id.as_slice())
                 .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
-            storage.add_available_items_from_parts(iter).await?;
+            
+            match storage.add_available_items_from_parts(iter).await {
+                Ok(()) => {
+                    inc_rpc_counter!("add", "success");
+                    crate::metrics::METRICS
+                        .queue_items_added_total
+                        .with_label_values(&["default"])
+                        .inc_by(item_count as u64);
+                }
+                Err(e) => {
+                    inc_rpc_counter!("add", "error");
+                    return Err(capnp::Error::failed(e.to_string()));
+                }
+            }
 
             if any_immediately_visible {
                 notify.notify_one();
@@ -168,11 +204,34 @@ impl crate::protocol::queue::Server for Server {
         params: RemoveParams,
         mut results: RemoveResults,
     ) -> Promise<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        let id = req.get_id()?;
-        let lease_bytes = req.get_lease()?;
+        let _timer = rpc_timer!("remove");
+        
+        let req = match params.get().and_then(|p| p.get_req()) {
+            Ok(req) => req,
+            Err(e) => {
+                inc_rpc_counter!("remove", "error");
+                return Promise::err(e);
+            }
+        };
+        
+        let id = match req.get_id() {
+            Ok(id) => id,
+            Err(e) => {
+                inc_rpc_counter!("remove", "error");
+                return Promise::err(e);
+            }
+        };
+        
+        let lease_bytes = match req.get_lease() {
+            Ok(lease) => lease,
+            Err(e) => {
+                inc_rpc_counter!("remove", "error");
+                return Promise::err(e);
+            }
+        };
 
         if lease_bytes.len() != 16 {
+            inc_rpc_counter!("remove", "error");
             return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
         }
         let mut lease: [u8; 16] = [0; 16];
@@ -183,24 +242,44 @@ impl crate::protocol::queue::Server for Server {
 
         let storage = Arc::clone(&self.storage);
         Promise::from_future(async move {
-            let removed = storage
-                .remove_in_progress_item(id_owned.as_ref(), &lease)
-                .await?;
-
-            results.get().init_resp().set_removed(removed);
-            Ok(())
+            match storage.remove_in_progress_item(id_owned.as_ref(), &lease).await {
+                Ok(removed) => {
+                    inc_rpc_counter!("remove", "success");
+                    if removed {
+                        crate::metrics::METRICS
+                            .queue_items_removed_total
+                            .with_label_values(&["default"])
+                            .inc();
+                    }
+                    results.get().init_resp().set_removed(removed);
+                    Ok(())
+                }
+                Err(e) => {
+                    inc_rpc_counter!("remove", "error");
+                    Err(capnp::Error::failed(e.to_string()))
+                }
+            }
         })
     }
 
     fn poll(&mut self, params: PollParams, mut results: PollResults) -> Promise<(), capnp::Error> {
+        let _timer = rpc_timer!("poll");
         let _storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
         let coalescer = Arc::clone(&self.coalescer);
 
         Promise::from_future(async move {
-            let req = params.get()?.get_req()?;
+            let req = match params.get().and_then(|p| p.get_req()) {
+                Ok(req) => req,
+                Err(e) => {
+                    inc_rpc_counter!("poll", "error");
+                    return Err(e);
+                }
+            };
+            
             let lease_validity_secs = req.get_lease_validity_secs();
             if lease_validity_secs == 0 {
+                inc_rpc_counter!("poll", "error");
                 return Err(capnp::Error::failed(
                     "invariant: leaseValiditySecs must be > 0".to_string(),
                 ));
@@ -220,23 +299,36 @@ impl crate::protocol::queue::Server for Server {
             loop {
                 match coalescer.poll(num_items, lease_validity_secs).await {
                     Ok(Some((lease, items))) => {
+                        inc_rpc_counter!("poll", "success");
+                        let item_count = items.len();
+                        crate::metrics::METRICS
+                            .queue_items_polled_total
+                            .with_label_values(&["default"])
+                            .inc_by(item_count as u64);
                         write_poll_response(&lease, items, &mut results)?;
                         return Ok(());
                     }
                     Ok(None) => {}
-                    Err(e) => return Err(capnp::Error::failed(e.to_string())),
+                    Err(e) => {
+                        inc_rpc_counter!("poll", "error");
+                        return Err(capnp::Error::failed(e.to_string()));
+                    }
                 }
 
                 match deadline {
                     Some(d) => {
                         let now = std::time::Instant::now();
                         if now >= d {
+                            inc_rpc_counter!("poll", "timeout");
                             return Ok(());
                         }
                         let remaining = d - now;
                         tokio::select! {
                             _ = notify.notified() => {},
-                            _ = tokio::time::sleep(remaining) => { return Ok(()); },
+                            _ = tokio::time::sleep(remaining) => { 
+                                inc_rpc_counter!("poll", "timeout");
+                                return Ok(()); 
+                            },
                         }
                     }
                     None => {
@@ -252,15 +344,33 @@ impl crate::protocol::queue::Server for Server {
         params: crate::protocol::queue::ExtendParams,
         mut results: crate::protocol::queue::ExtendResults,
     ) -> Promise<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        let lease_bytes = req.get_lease()?;
+        let _timer = rpc_timer!("extend");
+        
+        let req = match params.get().and_then(|p| p.get_req()) {
+            Ok(req) => req,
+            Err(e) => {
+                inc_rpc_counter!("extend", "error");
+                return Promise::err(e);
+            }
+        };
+        
+        let lease_bytes = match req.get_lease() {
+            Ok(lease) => lease,
+            Err(e) => {
+                inc_rpc_counter!("extend", "error");
+                return Promise::err(e);
+            }
+        };
+        
         let lease_validity_secs = req.get_lease_validity_secs();
         if lease_validity_secs == 0 {
+            inc_rpc_counter!("extend", "error");
             return Promise::err(capnp::Error::failed(
                 "invariant: leaseValiditySecs must be > 0".to_string(),
             ));
         }
         if lease_bytes.len() != 16 {
+            inc_rpc_counter!("extend", "error");
             return Promise::err(capnp::Error::failed("invalid lease length".to_string()));
         }
         let mut lease: [u8; 16] = [0; 16];
@@ -268,9 +378,21 @@ impl crate::protocol::queue::Server for Server {
 
         let storage = Arc::clone(&self.storage);
         Promise::from_future(async move {
-            let extended = storage.extend_lease(&lease, lease_validity_secs).await?;
-            results.get().init_resp().set_extended(extended);
-            Ok(())
+            match storage.extend_lease(&lease, lease_validity_secs).await {
+                Ok(extended) => {
+                    inc_rpc_counter!("extend", "success");
+                    crate::metrics::METRICS
+                        .queue_items_extended_total
+                        .with_label_values(&["default", if extended { "true" } else { "false" }])
+                        .inc();
+                    results.get().init_resp().set_extended(extended);
+                    Ok(())
+                }
+                Err(e) => {
+                    inc_rpc_counter!("extend", "error");
+                    Err(capnp::Error::failed(e.to_string()))
+                }
+            }
         })
     }
 }

@@ -51,4 +51,4 @@
 - [X] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency. even now that we use a snapshotted txn in poll.
 - [X] (perf) implement poll request coalescing to reduce contention - when multiple clients are polling simultaneously, batch their requests to reduce database contention and improve throughput ([sketch](docs/poll_coalescing_sketch.md))
 - [ ] (ci/perf) compare PR benchmark summary vs latest master artifact and post delta table in PR
-- [ ] add lightweight prometheus metrics for key SLIs and rocksdb stuff
+- [X] add lightweight prometheus metrics for key SLIs and rocksdb stuff

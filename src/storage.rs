@@ -13,6 +13,7 @@ use crate::dbkeys::{
 };
 use crate::errors::{Error, Result};
 use crate::protocol;
+use crate::{inc_storage_counter, storage_timer};
 use rand::Rng;
 
 #[inline]
@@ -187,6 +188,8 @@ impl Storage {
     where
         I: IntoIterator<Item = (&'a [u8], (&'a [u8], u64))>,
     {
+        let _timer = storage_timer!("add_available_items");
+        
         let mut batch = WriteBatchWithTransaction::<true>::default();
         // Reuse a byte buffer for capnp serialization across items to avoid repeated allocations.
         let mut stored_contents: Vec<u8> = Vec::new();
@@ -233,8 +236,17 @@ impl Storage {
                     .unwrap_or_default()
             );
         }
-        self.db.write(batch)?;
-        Ok(())
+        
+        match self.db.write(batch) {
+            Ok(()) => {
+                inc_storage_counter!("add_available_items", "success");
+                Ok(())
+            }
+            Err(e) => {
+                inc_storage_counter!("add_available_items", "error");
+                Err(e.into())
+            }
+        }
     }
 
     /// Return the next visibility timestamp (secs since epoch) among items in the
@@ -266,6 +278,7 @@ impl Storage {
         n: usize,
         lease_validity_secs: u64,
     ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
+        let _timer = storage_timer!("get_next_available_entries");
         // Create a lease and its expiry index entry
         let now = std::time::SystemTime::now();
         let now_secs: u64 = now.duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -415,12 +428,15 @@ impl Storage {
                 .collect::<Vec<_>>()
         );
 
+        inc_storage_counter!("get_next_available_entries", "success");
         Ok((lease, polled_items))
     }
 
     /// Remove an in-progress item if the provided lease currently owns it.
     /// Returns true if an item was removed, false if not found or lease mismatch.
     pub fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
+        let _timer = storage_timer!("remove_in_progress_item");
+        
         // Build keys
         let in_progress_key = InProgressKey::from_id(id);
         let lease_key = LeaseKey::from_lease_bytes(lease);
@@ -431,6 +447,7 @@ impl Storage {
             .get_pinned_for_update_cf(self.cf_in_progress(), &in_progress_key, true)?
             .is_none()
         {
+            inc_storage_counter!("remove_in_progress_item", "not_found");
             return Ok(false);
         }
 
@@ -438,6 +455,7 @@ impl Storage {
         let Some(lease_value) = txn.get_pinned_for_update_cf(self.cf_leases(), &lease_key, true)?
         else {
             tracing::info!("lease entry not found: {:?}", Uuid::from_bytes(*lease));
+            inc_storage_counter!("remove_in_progress_item", "lease_not_found");
             return Ok(false);
         };
 
@@ -451,6 +469,7 @@ impl Storage {
         let ids = lease_entry_reader.get_ids()?;
         debug_assert_sorted_by_index(ids.len(), |i| ids.get(i).ok());
         let Some(found_idx) = binary_search_by_index(ids.len(), |i| ids.get(i).ok(), id) else {
+            inc_storage_counter!("remove_in_progress_item", "id_not_in_lease");
             return Ok(false);
         };
 
@@ -493,15 +512,23 @@ impl Storage {
         }
         drop(lease_value);
 
-        txn.commit()?;
-
-        Ok(true)
+        match txn.commit() {
+            Ok(()) => {
+                inc_storage_counter!("remove_in_progress_item", "success");
+                Ok(true)
+            }
+            Err(e) => {
+                inc_storage_counter!("remove_in_progress_item", "error");
+                Err(e.into())
+            }
+        }
     }
 
     /// Sweep expired leases: for each expired lease, move any remaining
     /// in-progress items back to available and delete the lease and its index.
     /// Returns the number of expired leases processed.
     pub fn expire_due_leases(&self) -> Result<usize> {
+        let _timer = storage_timer!("expire_due_leases");
         let now_secs: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -628,13 +655,24 @@ impl Storage {
         for key in expiry_index_keys_to_delete {
             txn.delete_cf(self.cf_lease_expiry(), &key)?;
         }
-        txn.commit()?;
-        Ok(processed)
+        
+        match txn.commit() {
+            Ok(()) => {
+                inc_storage_counter!("expire_due_leases", "success");
+                Ok(processed)
+            }
+            Err(e) => {
+                inc_storage_counter!("expire_due_leases", "error");
+                Err(e.into())
+            }
+        }
     }
 
     /// Extend an existing lease's validity by resetting its expiry to now + lease_validity_secs.
     /// Returns false if the lease does not exist.
     pub fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
+        let _timer = storage_timer!("extend_lease");
+        
         let txn = self.db.transaction();
         // Validate lease exists; if not, do nothing
         let lease_key = LeaseKey::from_lease_bytes(lease);
@@ -642,6 +680,7 @@ impl Storage {
             .get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
             .is_none()
         {
+            inc_storage_counter!("extend_lease", "not_found");
             return Ok(false);
         }
 
@@ -691,8 +730,17 @@ impl Storage {
             serialize::write_message(&mut buf, &out)?;
             txn.put_cf(self.cf_leases(), lease_key.as_ref(), &buf)?;
         }
-        txn.commit()?;
-        Ok(true)
+        
+        match txn.commit() {
+            Ok(()) => {
+                inc_storage_counter!("extend_lease", "success");
+                Ok(true)
+            }
+            Err(e) => {
+                inc_storage_counter!("extend_lease", "error");
+                Err(e.into())
+            }
+        }
     }
 }
 

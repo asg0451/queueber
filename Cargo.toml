@@ -24,6 +24,11 @@ console-subscriber = "0.4"
 uuid = { version = "1.18.0", features = ["std", "v4", "v7", "zerocopy"] }
 rand = "0.8"
 socket2 = "0.5"
+prometheus = { version = "0.13", default-features = false }
+hyper = { version = "1.5", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1.0"
 
 [build-dependencies]
 capnpc = "0.21.2"
