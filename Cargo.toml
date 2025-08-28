@@ -36,6 +36,11 @@ proptest = "1.5"
 [profile.release]
 debug = "line-directives-only"
 
+[profile.fastrelease]
+inherits = "release"
+lto = true
+codegen-units = 1
+
 [[bench]]
 name = "storage_bench"
 harness = false
