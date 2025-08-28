@@ -448,6 +448,17 @@ impl Storage {
             message::ReaderOptions::new(),
         )?;
         let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+        // Reject operations under an expired lease, even if background expiry hasn't run yet.
+        let now_secs: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        if lease_entry_reader.get_expiry_ts_secs() <= now_secs {
+            tracing::info!(
+                "expired lease cannot operate: {:?}",
+                Uuid::from_bytes(*lease)
+            );
+            return Ok(false);
+        }
         let ids = lease_entry_reader.get_ids()?;
         debug_assert_sorted_by_index(ids.len(), |i| ids.get(i).ok());
         let Some(found_idx) = binary_search_by_index(ids.len(), |i| ids.get(i).ok(), id) else {
@@ -638,35 +649,40 @@ impl Storage {
         let txn = self.db.transaction();
         // Validate lease exists; if not, do nothing
         let lease_key = LeaseKey::from_lease_bytes(lease);
-        if txn
-            .get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
-            .is_none()
         {
-            return Ok(false);
-        }
+            let Some(lease_value) =
+                txn.get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
+            else {
+                return Ok(false);
+            };
 
-        // Compute and write the new expiry index key.
-        let now = std::time::SystemTime::now();
-        let expiry_ts_secs = (now + std::time::Duration::from_secs(lease_validity_secs))
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let new_idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, lease);
-        txn.put_cf(
-            self.cf_lease_expiry(),
-            new_idx_key.as_ref(),
-            lease_key.as_ref(),
-        )?;
-
-        // Update the lease entry: delete old expiry index (if present in entry),
-        // then set the new expiry ts and index key while preserving ids.
-        if let Some(lease_value) =
-            txn.get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
-        {
+            // Reject extending an already expired lease
             let lease_msg = serialize::read_message_from_flat_slice(
                 &mut &lease_value[..],
                 message::ReaderOptions::new(),
             )?;
             let lease_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+            let now_secs: u64 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            if lease_reader.get_expiry_ts_secs() <= now_secs {
+                return Ok(false);
+            }
+
+            // Compute and write the new expiry index key.
+            let expiry_ts_secs = (std::time::SystemTime::now()
+                + std::time::Duration::from_secs(lease_validity_secs))
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+            let new_idx_key = LeaseExpiryIndexKey::from_expiry_ts_and_lease(expiry_ts_secs, lease);
+            txn.put_cf(
+                self.cf_lease_expiry(),
+                new_idx_key.as_ref(),
+                lease_key.as_ref(),
+            )?;
+
+            // Update the lease entry: delete old expiry index (if present in entry),
+            // then set the new expiry ts and index key while preserving ids.
             let keys = lease_reader.get_ids()?;
             // Delete the previous expiry index key referenced by the lease entry.
             let prev_idx_key = lease_reader.get_expiry_ts_index_key()?;
@@ -690,7 +706,9 @@ impl Storage {
             let mut buf = Vec::with_capacity(out.size_in_words() * 8);
             serialize::write_message(&mut buf, &out)?;
             txn.put_cf(self.cf_leases(), lease_key.as_ref(), &buf)?;
+            // lease_value and related readers/messages drop here before commit
         }
+
         txn.commit()?;
         Ok(true)
     }
@@ -1401,6 +1419,98 @@ mod tests {
         let ids = lease_entry.get_ids()?;
         assert_eq!(ids.len(), 1);
         assert_eq!(ids.get(0)?, b"only");
+
+        Ok(())
+    }
+
+    #[test]
+    fn expired_lease_cannot_remove_before_sweeper_runs() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Add one item and poll with very short lease
+        storage.add_available_item_from_parts(b"x", b"p", 0)?;
+        let (lease, items) = storage.get_next_available_entries_with_lease(1, 1)?;
+        assert_eq!(items.len(), 1);
+
+        // Wait until the lease would be expired
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Without running the sweeper, removal under the expired lease should be rejected
+        let removed = storage.remove_in_progress_item(b"x", &lease)?;
+        assert!(!removed, "expired lease should not be able to remove item");
+
+        Ok(())
+    }
+
+    #[test]
+    fn expired_lease_cannot_extend_and_does_not_create_new_index() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(tmp.path()).expect("storage");
+
+        // Create an item and a short-lived lease
+        storage.add_available_item_from_parts(b"y", b"p", 0)?;
+        let (lease, items) = storage.get_next_available_entries_with_lease(1, 1)?;
+        assert_eq!(items.len(), 1);
+
+        // Wait for expiry wall clock
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Capture count of index entries referencing this lease before extend attempt
+        let mut before = 0usize;
+        {
+            let txn = storage.db.transaction();
+            let mut ro = rocksdb::ReadOptions::default();
+            ro.set_prefix_same_as_start(true);
+            let mode = rocksdb::IteratorMode::From(
+                LeaseExpiryIndexKey::PREFIX,
+                rocksdb::Direction::Forward,
+            );
+            let iter = txn.iterator_cf_opt(storage.cf_lease_expiry(), ro, mode);
+            for kv in iter {
+                let (idx_key, _val) = kv?;
+                let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
+                if lbytes == lease {
+                    before += 1;
+                }
+            }
+        }
+
+        // Attempt to extend; should be rejected
+        let ok = storage.extend_lease(&lease, 5)?;
+        assert!(!ok, "should not extend an expired lease");
+
+        // Ensure no new index entries were created for this lease
+        let mut after = 0usize;
+        {
+            let txn = storage.db.transaction();
+            let mut ro = rocksdb::ReadOptions::default();
+            ro.set_prefix_same_as_start(true);
+            let mode = rocksdb::IteratorMode::From(
+                LeaseExpiryIndexKey::PREFIX,
+                rocksdb::Direction::Forward,
+            );
+            let iter = txn.iterator_cf_opt(storage.cf_lease_expiry(), ro, mode);
+            for kv in iter {
+                let (idx_key, _val) = kv?;
+                let (_ts, lbytes) = LeaseExpiryIndexKey::split_ts_and_lease(&idx_key)?;
+                if lbytes == lease {
+                    after += 1;
+                }
+            }
+        }
+        assert_eq!(
+            before, after,
+            "extend should not add index entries for expired lease"
+        );
 
         Ok(())
     }
