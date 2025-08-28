@@ -172,53 +172,23 @@ async fn main() -> Result<()> {
         worker_handles.push(handle);
     }
 
-    // Signals: first SIGINT/SIGTERM triggers graceful shutdown; second exits immediately
+    // Signals: single-shot handlers for SIGINT and SIGTERM (unix)
     {
         let shutdown_tx_for_signals = shutdown_tx.clone();
         tokio::spawn(async move {
-            let mut first_seen = false;
-            #[cfg(unix)]
-            let mut sigterm_opt = signal(SignalKind::terminate()).ok();
-            loop {
-                #[cfg(unix)]
-                {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            if !first_seen {
-                                first_seen = true;
-                                tracing::info!("received Ctrl-C; initiating graceful shutdown");
-                                let _ = shutdown_tx_for_signals.send(true);
-                            } else {
-                                tracing::warn!("received second Ctrl-C; exiting now");
-                                std::process::exit(130);
-                            }
-                        }
-                        _ = async {
-                            if let Some(ref mut s) = sigterm_opt { let _ = s.recv().await; } else { futures::future::pending::<Option<()>>().await; }
-                        } => {
-                            if !first_seen {
-                                first_seen = true;
-                                tracing::info!("received SIGTERM; initiating graceful shutdown");
-                                let _ = shutdown_tx_for_signals.send(true);
-                            } else {
-                                tracing::warn!("received second SIGTERM; exiting now");
-                                std::process::exit(143);
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                    if !first_seen {
-                        first_seen = true;
-                        tracing::info!("received Ctrl-C; initiating graceful shutdown");
-                        let _ = shutdown_tx_for_signals.send(true);
-                    } else {
-                        tracing::warn!("received second Ctrl-C; exiting now");
-                        std::process::exit(130);
-                    }
-                }
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("received Ctrl-C; initiating graceful shutdown");
+            let _ = shutdown_tx_for_signals.send(true);
+        });
+    }
+    #[cfg(unix)]
+    {
+        let shutdown_tx_for_signals = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                let _ = sigterm.recv().await;
+                tracing::info!("received SIGTERM; initiating graceful shutdown");
+                let _ = shutdown_tx_for_signals.send(true);
             }
         });
     }
