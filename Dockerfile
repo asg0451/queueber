@@ -17,7 +17,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Leverage Docker layer caching: copy manifests first
-COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs queueber.capnp rust.capnp ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs queueber.capnp rust.capnp .cargo ./
 COPY src ./src
 COPY benches ./benches
 COPY tests ./tests
