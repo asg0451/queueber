@@ -1048,9 +1048,9 @@ where
     Fut: std::future::Future<Output = Result<T>>,
     F: FnMut() -> Fut,
 {
-    const MAX_RETRIES: u32 = 8;
+    const MAX_RETRIES: u32 = 15;
     const BASE_DELAY_MS: u64 = 10;
-    const MAX_DELAY_MS: u64 = 1000;
+    const MAX_DELAY_MS: u64 = 5000;
 
     let mut attempt: u32 = 0;
     loop {
