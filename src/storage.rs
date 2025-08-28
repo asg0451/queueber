@@ -197,9 +197,6 @@ impl Storage {
         let avail_cf = self.cf_available();
 
         for (id, (contents, visibility_timeout_secs)) in items.into_iter() {
-            stored_contents.clear();
-            // there's no way to reset the simsg but it's fine right cause we always set all the fields
-
             let main_key = AvailableKey::from_id(id);
             let now = std::time::SystemTime::now();
             let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
@@ -209,11 +206,17 @@ impl Storage {
                 VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
             {
+                // there's no way to reset the simsg but it's fine right cause we always set all the fields
                 let mut stored_item = simsg.get_root::<protocol::stored_item::Builder>().unwrap();
                 stored_item.set_contents(contents);
                 stored_item.set_id(id);
                 stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
             }
+            let needed = simsg.size_in_words() * 8;
+            if stored_contents.capacity() < needed {
+                stored_contents.reserve(needed - stored_contents.capacity());
+            }
+            stored_contents.clear();
             serialize::write_message(&mut stored_contents, &simsg)?;
 
             batch.put_cf(avail_cf, main_key.as_ref(), &stored_contents);
