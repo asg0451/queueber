@@ -25,18 +25,10 @@ RUN cargo build --release --bin queueber
 # --- Runtime stage ---
 FROM debian:bookworm-slim AS runtime
 
-# Minimal runtime deps and healthcheck tool
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        ca-certificates \
-        tzdata \
-        netcat-openbsd \
-    && rm -rf /var/lib/apt/lists/*
-
 # Create non-root user and data dir
 RUN useradd -u 10001 -r -m -d /home/queueber queueber && \
-    mkdir -p /var/lib/queueber && \
-    chown -R queueber:queueber /var/lib/queueber
+    mkdir -p /data && \
+    chown -R queueber:queueber /data
 
 # Copy binary
 COPY --from=builder /app/target/release/queueber /usr/local/bin/queueber
@@ -44,10 +36,8 @@ COPY --from=builder /app/target/release/queueber /usr/local/bin/queueber
 USER queueber
 ENV RUST_LOG=info
 EXPOSE 9090
-
-# Basic TCP healthcheck on the Cap'n Proto port
-HEALTHCHECK --interval=10s --timeout=2s --start-period=5s --retries=3 \
-  CMD nc -z 127.0.0.1 9090 || exit 1
+# Tokio console default port
+EXPOSE 6669
 
 # Default entrypoint; can be overridden
-ENTRYPOINT ["/usr/local/bin/queueber", "--listen", "0.0.0.0:9090", "--data-dir", "/var/lib/queueber"]
+ENTRYPOINT ["/usr/local/bin/queueber", "--listen", "0.0.0.0:9090", "--data-dir", "/data"]
