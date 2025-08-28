@@ -13,7 +13,6 @@ use queueber::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::Arc;
-#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -172,24 +171,21 @@ async fn main() -> Result<()> {
         worker_handles.push(handle);
     }
 
-    // Signals: single-shot handlers for SIGINT and SIGTERM (unix)
+    // Signals: listen for SIGINT and SIGTERM once; trigger graceful shutdown on first
     {
         let shutdown_tx_for_signals = shutdown_tx.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("received Ctrl-C; initiating graceful shutdown");
-            let _ = shutdown_tx_for_signals.send(true);
-        });
-    }
-    #[cfg(unix)]
-    {
-        let shutdown_tx_for_signals = shutdown_tx.clone();
-        tokio::spawn(async move {
-            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-                let _ = sigterm.recv().await;
-                tracing::info!("received SIGTERM; initiating graceful shutdown");
-                let _ = shutdown_tx_for_signals.send(true);
+            let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            tokio::select! {
+                _ = sigint.recv() => {
+                    tracing::info!("received SIGINT; initiating graceful shutdown");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("received SIGTERM; initiating graceful shutdown");
+                }
             }
+            let _ = shutdown_tx_for_signals.send(true);
         });
     }
 
