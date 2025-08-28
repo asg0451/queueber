@@ -1,0 +1,14 @@
+# Ignore build artifacts and VCS metadata
+/target
+**/target
+/.git
+/.github
+/.vscode
+/.idea
+/node_modules
+/tmp
+/profile.json.gz
+/criterion-summary.json
+/tests
+/benches
+/docs
