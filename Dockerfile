@@ -1,5 +1,5 @@
 # --- Builder stage ---
-FROM rust:bookworm AS builder
+FROM rust:trixie AS builder
 
 # Install dependencies for building (Cap'n Proto CLI, compilers, and C/C++ libs)
 RUN apt-get update && \
@@ -11,6 +11,7 @@ RUN apt-get update && \
         pkg-config \
         make \
         g++ \
+        binutils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -18,12 +19,16 @@ WORKDIR /app
 # Leverage Docker layer caching: copy manifests first
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs queueber.capnp rust.capnp ./
 COPY src ./src
+COPY benches ./benches
+COPY tests ./tests
 
-# Build release binary (rust-toolchain.toml pins nightly)
-RUN cargo build --release --bin queueber
+# Build optimized binary (rust-toolchain.toml pins nightly)
+# Use the custom fastrelease profile defined in Cargo.toml
+RUN cargo build --profile fastrelease --bin queueber
+RUN strip target/fastrelease/queueber || true
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 # Create non-root user and data dir
 RUN useradd -u 10001 -r -m -d /home/queueber queueber && \
@@ -31,7 +36,8 @@ RUN useradd -u 10001 -r -m -d /home/queueber queueber && \
     chown -R queueber:queueber /data
 
 # Copy binary
-COPY --from=builder /app/target/release/queueber /usr/local/bin/queueber
+# Copy binary built with fastrelease profile
+COPY --from=builder /app/target/fastrelease/queueber /usr/local/bin/queueber
 
 USER queueber
 ENV RUST_LOG=info
@@ -39,5 +45,4 @@ EXPOSE 9090
 # Tokio console default port
 EXPOSE 6669
 
-# Default entrypoint; can be overridden
 ENTRYPOINT ["/usr/local/bin/queueber", "--listen", "0.0.0.0:9090", "--data-dir", "/data"]

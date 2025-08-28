@@ -9,6 +9,4 @@
 /tmp
 /profile.json.gz
 /criterion-summary.json
-/tests
-/benches
 /docs
