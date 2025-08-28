@@ -190,7 +190,16 @@ impl Storage {
         let mut batch = WriteBatchWithTransaction::<true>::default();
         // Reuse a byte buffer for capnp serialization across items to avoid repeated allocations.
         let mut stored_contents: Vec<u8> = Vec::new();
+        let mut simsg = message::Builder::new_default();
+        let _ = simsg.init_root::<protocol::stored_item::Builder>(); // initialize the root once
+
+        let vis_idx_cf = self.cf_visibility_index();
+        let avail_cf = self.cf_available();
+
         for (id, (contents, visibility_timeout_secs)) in items.into_iter() {
+            stored_contents.clear();
+            // there's no way to reset the simsg but it's fine right cause we always set all the fields
+
             let main_key = AvailableKey::from_id(id);
             let now = std::time::SystemTime::now();
             let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
@@ -199,39 +208,16 @@ impl Storage {
             let visibility_index_key =
                 VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
-            let mut simsg = message::Builder::new_default();
-            let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
-            stored_item.set_contents(contents);
-            stored_item.set_id(id);
-            stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
-            // Ensure buffer has enough capacity, then clear and reuse it
-            let needed = simsg.size_in_words() * 8;
-            if stored_contents.capacity() < needed {
-                stored_contents.reserve(needed - stored_contents.capacity());
+            {
+                let mut stored_item = simsg.get_root::<protocol::stored_item::Builder>().unwrap();
+                stored_item.set_contents(contents);
+                stored_item.set_id(id);
+                stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
             }
-            stored_contents.clear();
             serialize::write_message(&mut stored_contents, &simsg)?;
 
-            batch.put_cf(self.cf_available(), main_key.as_ref(), &stored_contents);
-            batch.put_cf(
-                self.cf_visibility_index(),
-                visibility_index_key.as_ref(),
-                main_key.as_ref(),
-            );
-
-            tracing::debug!(
-                "inserted item (from parts): ({}: <contents len: {}>), (viz/{}: avail/{})",
-                Uuid::from_slice(id).unwrap_or_default(),
-                contents.len(),
-                Uuid::from_slice(
-                    VisibilityIndexKey::split_ts_and_id(visibility_index_key.as_ref())
-                        .unwrap()
-                        .1
-                )
-                .unwrap_or_default(),
-                Uuid::from_slice(AvailableKey::id_suffix_from_key_bytes(main_key.as_ref()))
-                    .unwrap_or_default()
-            );
+            batch.put_cf(avail_cf, main_key.as_ref(), &stored_contents);
+            batch.put_cf(vis_idx_cf, visibility_index_key.as_ref(), main_key.as_ref());
         }
         self.db.write(batch)?;
         Ok(())
