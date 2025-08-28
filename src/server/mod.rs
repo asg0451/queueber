@@ -39,6 +39,8 @@ impl Server {
     }
 }
 
+const BACKGROUND_LEASE_EXPIRY_INTERVAL_SECS: u64 = 1;
+
 pub fn spawn_background_tasks(
     storage: Arc<RetriedStorage<Storage>>,
     notify: Arc<Notify>,
@@ -55,6 +57,8 @@ pub fn spawn_background_tasks(
         .spawn(async move {
             let st = Arc::clone(&bg_storage);
             loop {
+                tokio::time::sleep(Duration::from_secs(BACKGROUND_LEASE_EXPIRY_INTERVAL_SECS))
+                    .await;
                 match st.expire_due_leases().await {
                     Ok(n) => {
                         if n > 0 {
