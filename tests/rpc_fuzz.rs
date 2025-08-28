@@ -3,8 +3,8 @@ use std::sync::mpsc::sync_channel;
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
-use proptest::prelude::*;
 use proptest::prelude::ProptestConfig;
+use proptest::prelude::*;
 use proptest::strategy::Strategy;
 use queueber::protocol::queue;
 use queueber::storage::{RetriedStorage, Storage};
