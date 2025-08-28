@@ -66,4 +66,4 @@
 - [ ] (productionize) Kubernetes/Helm: liveness/readiness probes, resource limits/requests, PDB, PV, ConfigMap-based configuration
 - [ ] (productionize) systemd unit: restart policy, sandboxing, rlimits, service user/group
 - [X] (productionize) repository hygiene: add LICENSE and CONTRIBUTING.md
-- [ ] (productionize) update README
+- [X] (productionize) update README
