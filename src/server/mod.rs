@@ -29,7 +29,10 @@ impl Server {
         notify: Arc<Notify>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
-        let coalescer = Arc::new(PollCoalescer::new(Arc::clone(&storage)));
+        let coalescer = Arc::new(PollCoalescer::new(
+            Arc::clone(&storage),
+            shutdown_tx.subscribe(),
+        ));
         Self {
             storage,
             notify,
@@ -48,6 +51,8 @@ pub fn spawn_background_tasks(
     let bg_notify = Arc::clone(&notify);
     let lease_expiry_shutdown = shutdown_tx.clone();
     let visibility_wakeup_shutdown = shutdown_tx.clone();
+    let shutdown_rx_for_lease = shutdown_tx.subscribe();
+    let mut shutdown_rx_for_visibility = shutdown_tx.subscribe();
 
     // Background task to expire leases periodically
     tokio::task::Builder::new()
@@ -55,6 +60,9 @@ pub fn spawn_background_tasks(
         .spawn(async move {
             let st = Arc::clone(&bg_storage);
             loop {
+                if *shutdown_rx_for_lease.borrow() {
+                    break;
+                }
                 match st.expire_due_leases().await {
                     Ok(n) => {
                         if n > 0 {
@@ -91,16 +99,25 @@ pub fn spawn_background_tasks(
                         if ts_secs <= now_secs {
                             vis_notify.notify_one();
                             // Avoid busy loop; small sleep before checking again.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                _ = async { if *shutdown_rx_for_visibility.borrow() { } else { let _ = shutdown_rx_for_visibility.changed().await; } } => { break; }
+                            }
                         } else {
                             let sleep_dur = std::time::Duration::from_secs(ts_secs - now_secs);
-                            tokio::time::sleep(sleep_dur).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(sleep_dur) => {}
+                                _ = async { if *shutdown_rx_for_visibility.borrow() { } else { let _ = shutdown_rx_for_visibility.changed().await; } } => { break; }
+                            }
                             vis_notify.notify_one();
                         }
                     }
                     Ok(None) => {
                         // No items; back off
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                            _ = async { if *shutdown_rx_for_visibility.borrow() { } else { let _ = shutdown_rx_for_visibility.changed().await; } } => { break; }
+                        }
                     }
                     Err(e) => {
                         tracing::error!("peek_next_visibility_ts_secs: {}", e);
@@ -196,6 +213,7 @@ impl crate::protocol::queue::Server for Server {
         let _storage = Arc::clone(&self.storage);
         let notify = Arc::clone(&self.notify);
         let coalescer = Arc::clone(&self.coalescer);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         Promise::from_future(async move {
             let req = params.get()?.get_req()?;
@@ -237,10 +255,14 @@ impl crate::protocol::queue::Server for Server {
                         tokio::select! {
                             _ = notify.notified() => {},
                             _ = tokio::time::sleep(remaining) => { return Ok(()); },
+                            _ = async { if *shutdown_rx.borrow() { } else { let _ = shutdown_rx.changed().await; } } => { return Ok(()); },
                         }
                     }
                     None => {
-                        notify.notified().await;
+                        tokio::select! {
+                            _ = notify.notified() => {},
+                            _ = async { if *shutdown_rx.borrow() { } else { let _ = shutdown_rx.changed().await; } } => { return Ok(()); },
+                        }
                     }
                 }
             }

@@ -13,6 +13,8 @@ use queueber::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::Arc;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -116,8 +118,8 @@ async fn main() -> Result<()> {
                                 .expect("set nonblocking");
                             let listener = tokio::net::TcpListener::from_std(std_listener)
                                 .expect("tokio listener from std");
-
                             let mut conn_id: u64 = 0;
+                            let mut conn_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
                             loop {
                                 tokio::select! {
                                     _ = async { if *shutdown_rx_worker.borrow() { } else { let _ = shutdown_rx_worker.changed().await; } } => {
@@ -129,7 +131,7 @@ async fn main() -> Result<()> {
                                         let client = queue_client.clone();
                                         let this_conn = conn_id;
                                         conn_id = conn_id.wrapping_add(1);
-                                        let _jh = tokio::task::Builder::new()
+                                        let jh = tokio::task::Builder::new()
                                             .name("rpc_server")
                                             .spawn_local(async move {
                                                 let (reader, writer) =
@@ -152,8 +154,14 @@ async fn main() -> Result<()> {
                                                 let _ = this_conn; // reserved for future naming/metrics
                                             })
                                             .unwrap();
+                                        conn_handles.push(jh);
                                     }
                                 }
+                            }
+
+                            // Drain in-flight RPC tasks
+                            for jh in conn_handles {
+                                let _ = jh.await;
                             }
                         })
                         .await;
@@ -162,6 +170,27 @@ async fn main() -> Result<()> {
             })
             .expect("spawn worker thread");
         worker_handles.push(handle);
+    }
+
+    // Signal handling tasks: SIGINT and SIGTERM (unix)
+    {
+        let shutdown_tx_for_signals = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("received Ctrl-C; initiating shutdown");
+            let _ = shutdown_tx_for_signals.send(true);
+        });
+    }
+    #[cfg(unix)]
+    {
+        let shutdown_tx_for_signals = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                let _ = sigterm.recv().await;
+                tracing::info!("received SIGTERM; initiating shutdown");
+                let _ = shutdown_tx_for_signals.send(true);
+            }
+        });
     }
 
     // Wait for shutdown signal, then join workers
