@@ -62,7 +62,7 @@
 - [ ] (productionize) admin operations: safe drain, purge, and stats endpoints
 - [ ] (productionize) abstract a mockable clock for leases/visibility to enable deterministic tests
 - [X] (productionize) release profile tuning: LTO, codegen-units, panic=abort (if acceptable), symbol levels
-- [ ] (productionize) packaging: Dockerfile (non-root, minimal base, HEALTHCHECK), multi-arch builds
+- [X] (productionize) packaging: Dockerfile (non-root, minimal base, HEALTHCHECK), multi-arch builds
 - [ ] (productionize) Kubernetes/Helm: liveness/readiness probes, resource limits/requests, PDB, PV, ConfigMap-based configuration
 - [ ] (productionize) systemd unit: restart policy, sandboxing, rlimits, service user/group
 - [ ] (productionize) repository hygiene: add LICENSE and CONTRIBUTING.md

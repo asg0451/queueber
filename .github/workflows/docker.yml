@@ -1,0 +1,56 @@
+name: Docker Image
+
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker.yml'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+  pull_request:
+    branches: [ master, main ]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker.yml'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: queueber
+
+jobs:
+  build:
+    name: Build multi-arch image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: |
+            ${{ github.repository }}:${{ github.sha }}
+          build-args: |
+            RUST_TOOLCHAIN=nightly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
