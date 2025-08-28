@@ -50,4 +50,4 @@ EXPOSE 9090
 # Tokio console default port
 EXPOSE 6669
 
-ENTRYPOINT ["/usr/local/bin/queueber", "--listen", "0.0.0.0:9090", "--data-dir", "/data"]
+CMD ["/usr/local/bin/queueber", "--listen", "0.0.0.0:9090", "--data-dir", "/data"]
