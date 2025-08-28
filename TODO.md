@@ -53,7 +53,7 @@
 - [X] (ci/perf) compare PR benchmark summary vs latest master artifact and post delta table in PR
 - [ ] (productionize) add lightweight prometheus metrics for key SLIs and rocksdb stuff
 - [ ] (testing) test startup recovery / durability
-- [ ] (testing) extend property/fuzz tests to RPC surface with failure injection
+- [X] (testing) extend property/fuzz tests to RPC surface with failure injection
 - [ ] (feat) multiple-queues/namespaces with per-queue isolation and limits
 - [ ] (productionize) implement graceful shutdown: handle SIGTERM/SIGINT, stop accepting, drain in-flight RPCs, signal background tasks to exit
 - [ ] (productionize) add configurablerate limiting to RPCs with backpressure
