@@ -51,4 +51,19 @@
 - [X] (bugfix) i still get `assertion failed: main key not found: [97, 118, 97, 105, 108, 97, 98, 108, 101, 47, 1, 152, 216, 213, 36, 239, 114, 179, 154, 59, 190, 29, 213, 115, 111, 117]"` from poll requests when running with high concurrency. even now that we use a snapshotted txn in poll.
 - [X] (perf) implement poll request coalescing to reduce contention - when multiple clients are polling simultaneously, batch their requests to reduce database contention and improve throughput ([sketch](docs/poll_coalescing_sketch.md))
 - [X] (ci/perf) compare PR benchmark summary vs latest master artifact and post delta table in PR
-- [ ] add lightweight prometheus metrics for key SLIs and rocksdb stuff
+- [ ] (productionize) add lightweight prometheus metrics for key SLIs and rocksdb stuff
+- [ ] (testing) test startup recovery / durability
+- [ ] (testing) extend property/fuzz tests to RPC surface with failure injection
+- [ ] (feat) multiple-queues/namespaces with per-queue isolation and limits
+- [ ] (productionize) implement graceful shutdown: handle SIGTERM/SIGINT, stop accepting, drain in-flight RPCs, signal background tasks to exit
+- [ ] (productionize) add configurablerate limiting to RPCs with backpressure
+- [ ] (productionize) RocksDB durability/tuning surfaced via config: WAL sync policy, background jobs, compaction, block cache, rate limiter, max open files
+- [ ] (productionize) data directory hardening: avoid /tmp default, permissions/ownership checks, separate WAL dir, disk space checks
+- [ ] (productionize) admin operations: safe drain, purge, and stats endpoints
+- [ ] (productionize) abstract a mockable clock for leases/visibility to enable deterministic tests
+- [ ] (productionize) release profile tuning: LTO, codegen-units, panic=abort (if acceptable), symbol levels
+- [ ] (productionize) packaging: Dockerfile (non-root, minimal base, HEALTHCHECK), multi-arch builds
+- [ ] (productionize) Kubernetes/Helm: liveness/readiness probes, resource limits/requests, PDB, PV, ConfigMap-based configuration
+- [ ] (productionize) systemd unit: restart policy, sandboxing, rlimits, service user/group
+- [ ] (productionize) repository hygiene: add LICENSE and CONTRIBUTING.md
+- [ ] (productionize) update README
