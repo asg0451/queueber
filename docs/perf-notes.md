@@ -89,6 +89,15 @@ Recommended fixes (incremental):
   - Consider `DBCompressionType::None` if disk space is acceptable; otherwise ZSTD with a very light level.
   - Smooth I/O: `opts.set_bytes_per_sync(1<<20)`, `opts.set_wal_bytes_per_sync(1<<20)`.
   - For synthetic benchmarks only, you can disable WAL (`WriteOptions::disable_wal(true)`) to compare upper bounds.
+  - DB-level options:
+    - `increase_parallelism(num_cpus)`, `set_max_background_jobs(2 * num_cpus)`.
+    - `set_bytes_per_sync(1<<20)`, `set_wal_bytes_per_sync(1<<20)`.
+    - `set_atomic_flush(true)`.
+
+  - Per-CF table options:
+    - `available`: larger blocks (32–64 KiB), ZSTD/LZ4 light, optional whole-key Bloom.
+    - `in_progress`/`leases`: small blocks (4–8 KiB), whole-key Bloom, light/no compression.
+    - `visibility_index`/`lease_expiry`: small blocks (~4 KiB), prefix Bloom tuned for forward scans using the namespace prefix extractor.
 
 - Networking path:
   - Replace acceptor fan-out via mpsc with per-worker listeners using `SO_REUSEPORT` so each worker accepts directly. This removes a hop and improves scalability under high accept rates.
