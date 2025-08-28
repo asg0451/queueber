@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio::time::Duration;
 
 use capnp::message::{Builder, HeapAllocator, TypedReader};
@@ -40,15 +40,17 @@ pub struct PollCoalescer {
     cfg: PollCoalescingConfig,
     state: Arc<tokio::sync::Mutex<VecDeque<PendingPoll>>>, // pending batch
     wake: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
 }
 
 impl PollCoalescer {
-    pub fn new(storage: Arc<RetriedStorage<Storage>>) -> Self {
+    pub fn new(storage: Arc<RetriedStorage<Storage>>, shutdown: watch::Receiver<bool>) -> Self {
         let this = Self {
             storage,
             cfg: PollCoalescingConfig::default(),
             state: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             wake: Arc::new(Notify::new()),
+            shutdown,
         };
         this.spawn_batcher();
         this
@@ -59,15 +61,23 @@ impl PollCoalescer {
         let cfg = self.cfg;
         let state = Arc::clone(&self.state);
         let wake = Arc::clone(&self.wake);
+        let mut shutdown = self.shutdown.clone();
         tokio::task::Builder::new()
             .name("poll_coalescer")
             .spawn(async move {
                 loop {
                     if state.lock().await.is_empty() {
-                        wake.notified().await;
+                        tokio::select! {
+                            _ = wake.notified() => {}
+                            _ = async { if *shutdown.borrow() { } else { let _ = shutdown.changed().await; } } => { break; }
+                        }
                     }
 
-                    tokio::time::sleep(Duration::from_millis(cfg.batch_window_ms)).await;
+                    // Wait the batch window or abort on shutdown
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(cfg.batch_window_ms)) => {}
+                        _ = async { if *shutdown.borrow() { } else { let _ = shutdown.changed().await; } } => { break; }
+                    }
 
                     let mut batch: Vec<PendingPoll> = Vec::new();
                     {
@@ -143,6 +153,12 @@ impl PollCoalescer {
                             p.tx.send(Ok(Some((lease, items_for_req))))
                         };
                     }
+                }
+
+                // Shutdown: drain any pending polls with an empty result to unblock waiters
+                let mut guard = state.lock().await;
+                while let Some(p) = guard.pop_front() {
+                    let _ = p.tx.send(Ok(None));
                 }
             })
             .expect("spawn poll coalescer");

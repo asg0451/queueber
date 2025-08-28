@@ -55,7 +55,7 @@
 - [ ] (testing) test startup recovery / durability
 - [X] (testing) extend property/fuzz tests to RPC surface with failure injection
 - [ ] (feat) multiple-queues/namespaces with per-queue isolation and limits
-- [ ] (productionize) implement graceful shutdown: handle SIGTERM/SIGINT, stop accepting, drain in-flight RPCs, signal background tasks to exit
+- [X] (productionize) implement graceful shutdown: handle SIGTERM/SIGINT, stop accepting, drain in-flight RPCs, signal background tasks to exit
 - [ ] (productionize) add configurablerate limiting to RPCs with backpressure
 - [ ] (productionize) RocksDB durability/tuning surfaced via config: WAL sync policy, background jobs, compaction, block cache, rate limiter, max open files
 - [ ] (productionize) data directory hardening: avoid /tmp default, permissions/ownership checks, separate WAL dir, disk space checks
