@@ -187,15 +187,16 @@ impl Storage {
     where
         I: IntoIterator<Item = (&'a [u8], (&'a [u8], u64))>,
     {
+        // Compute base time once per batch to avoid per-item syscalls/conversions.
+        let base_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
         let mut batch = WriteBatchWithTransaction::<true>::default();
         // Reuse a byte buffer for capnp serialization across items to avoid repeated allocations.
         let mut stored_contents: Vec<u8> = Vec::new();
         for (id, (contents, visibility_timeout_secs)) in items.into_iter() {
             let main_key = AvailableKey::from_id(id);
-            let now = std::time::SystemTime::now();
-            let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
+            let visible_ts_secs = base_secs.saturating_add(visibility_timeout_secs);
             let visibility_index_key =
                 VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
