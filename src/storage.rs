@@ -425,14 +425,14 @@ impl Storage {
         let txn = self.db.transaction();
         // Validate item exists in in_progress
         if txn
-            .get_pinned_for_update_cf(self.cf_in_progress(), &in_progress_key, true)?
+            .get_pinned_for_update_cf(self.cf_in_progress(), in_progress_key, true)?
             .is_none()
         {
             return Ok(false);
         }
 
         // Validate lease exists
-        let Some(lease_value) = txn.get_pinned_for_update_cf(self.cf_leases(), &lease_key, true)?
+        let Some(lease_value) = txn.get_pinned_for_update_cf(self.cf_leases(), lease_key, true)?
         else {
             tracing::info!("lease entry not found: {:?}", Uuid::from_bytes(*lease));
             return Ok(false);
