@@ -299,10 +299,10 @@ impl Storage {
         let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
         let viz_iter = txn.iterator_cf_opt(self.cf_visibility_index(), ro_iter, mode);
 
-        let mut polled_items = Vec::with_capacity(n);
-
+        // Stage 1: scan visibility index, lock eligible entries, and collect their main keys.
+        let mut locked_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n); // (idx_key, main_key)
         for kv in viz_iter {
-            if polled_items.len() >= n {
+            if locked_pairs.len() >= n {
                 break;
             }
 
@@ -331,12 +331,63 @@ impl Storage {
                 continue;
             }
 
-            // Fetch and decode the item.
-            let main_value = txn
-                .get_pinned_for_update_cf_opt(self.cf_available(), &main_key, true, &ro_get)?
-                .ok_or_else(|| {
-                    Error::assertion_failed(&format!("main key not found: {:?}", main_key.as_ref()))
-                })?;
+            locked_pairs.push((idx_key.to_vec(), main_key.to_vec()));
+        }
+
+        // Nothing to do if we didn't lock any candidates.
+        if locked_pairs.is_empty() {
+            return Ok((Uuid::nil().into_bytes(), Vec::new()));
+        }
+
+        // Stage 2: batch read the main values via multi_get on a snapshot-bound ReadOptions.
+        let mut ro_get_for_batch = ReadOptions::default();
+        ro_get_for_batch.set_snapshot(&snapshot);
+
+        // Prepare request pairs of (&CF, K) while owning the backing key storage.
+        let cf_avail = self.cf_available();
+        let owned_keys: Vec<Vec<u8>> = locked_pairs.iter().map(|(_, k)| k.clone()).collect();
+        let reqs: Vec<(&rocksdb::ColumnFamily, Vec<u8>)> =
+            owned_keys.into_iter().map(|k| (cf_avail, k)).collect();
+
+        // Fetch in one round trip; fall back to per-key get_for_update for any misses.
+        let mut fetched_values: Vec<Vec<u8>> = Vec::with_capacity(locked_pairs.len());
+        let multi_results = self.db.multi_get_cf_opt(reqs, &ro_get_for_batch);
+
+        // The rocksdb crate returns a Vec<Result<Option<PinnableSlice>, Error>> for multi_get.
+        // Normalize into concrete owned Vec<u8>, performing fallback lookups for misses.
+        for (i, res) in multi_results.into_iter().enumerate() {
+            let val_bytes: Vec<u8> = match res {
+                Ok(Some(ps)) => ps.to_vec(),
+                Ok(None) => {
+                    // Fallback: lock and fetch the specific key using the transaction.
+                    let main_key = &locked_pairs[i].1;
+                    let Some(pinned) = txn.get_pinned_for_update_cf_opt(
+                        self.cf_available(),
+                        main_key,
+                        true,
+                        &ro_get,
+                    )?
+                    else {
+                        return Err(Error::assertion_failed(&format!(
+                            "main key not found: {:?}",
+                            main_key
+                        )));
+                    };
+                    pinned.to_vec()
+                }
+                Err(e) => return Err(Error::from(e)),
+            };
+            fetched_values.push(val_bytes);
+        }
+
+        // Stage 3: decode, build response items, and move entries to in_progress within the txn.
+        let mut polled_items = Vec::with_capacity(fetched_values.len().min(n));
+        for (i, (idx_key, main_key)) in locked_pairs.into_iter().enumerate() {
+            if polled_items.len() >= n {
+                break;
+            }
+
+            let main_value = &fetched_values[i];
             let stored_item_message = serialize::read_message_from_flat_slice(
                 &mut &main_value[..],
                 message::ReaderOptions::new(),
@@ -344,8 +395,6 @@ impl Storage {
             let stored_item = stored_item_message.get_root::<protocol::stored_item::Reader>()?;
 
             debug_assert!(!stored_item.get_id()?.is_empty());
-            // contents may be empty; only assert structural invariants
-            // debug_assert!(!stored_item.get_contents()?.is_empty());
             debug_assert!(!stored_item.get_visibility_ts_index_key()?.is_empty());
             debug_assert_eq!(
                 stored_item.get_id()?,
@@ -368,16 +417,10 @@ impl Storage {
 
             // Move the item to in progress and delete the index entry.
             let new_main_key = InProgressKey::from_id(stored_item.get_id()?);
-            // First remove the visibility index so others won't see it.
-            // Important: Although the transaction commits atomically, readers without a
-            // snapshot may interleave reads (index then main). Deleting the index first
-            // ensures concurrent readers don't see an index that points to a deleted main.
-            // NOTE: i dont think this is true lmao and it's still broken in any case.
-            // TODO: use snapshots in txns maybe that will help
+            // Remove the visibility index first, then move value.
             txn.delete_cf(self.cf_visibility_index(), &idx_key)?;
-            // Then move the value from available -> in_progress.
             txn.delete_cf(self.cf_available(), &main_key)?;
-            txn.put_cf(self.cf_in_progress(), new_main_key.as_ref(), &main_value)?;
+            txn.put_cf(self.cf_in_progress(), new_main_key.as_ref(), main_value)?;
         }
 
         // If no items were found, return a nil lease and empty polled items. TODO: is this to golangy (:
