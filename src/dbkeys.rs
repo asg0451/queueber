@@ -5,12 +5,12 @@ use std::backtrace::Backtrace;
 use crate::errors::{Error, Result};
 
 /// Key for items that are available to be polled: raw `id` bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AvailableKey(Vec<u8>);
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct AvailableKey<'a>(&'a [u8]);
 
 /// Key for items that are currently in progress: raw `id` bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InProgressKey(Vec<u8>);
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct InProgressKey<'a>(&'a [u8]);
 
 /// Visibility index key: `visible_ts_be + b"/" + id`.
 ///
@@ -22,8 +22,8 @@ pub struct InProgressKey(Vec<u8>);
 pub struct VisibilityIndexKey(Vec<u8>);
 
 /// Lease key: raw `lease_bytes`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeaseKey(Vec<u8>);
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct LeaseKey<'a>(&'a [u8]);
 
 /// Lease expiry index key: `expiry_ts_be + b"/" + lease_bytes`.
 ///
@@ -32,19 +32,19 @@ pub struct LeaseKey(Vec<u8>);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseExpiryIndexKey(Vec<u8>);
 
-impl AvailableKey {
-    pub fn from_id(id: &[u8]) -> Self {
-        Self(id.to_vec())
+impl<'a> AvailableKey<'a> {
+    pub fn from_id(id: &'a [u8]) -> Self {
+        Self(id)
     }
 
     /// Returns the underlying database key bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.0
     }
 
     /// Returns the item id suffix contained in this key.
     pub fn id_suffix(&self) -> &[u8] {
-        &self.0
+        self.0
     }
 
     /// Returns the item id from a raw key without allocating.
@@ -55,23 +55,23 @@ impl AvailableKey {
     }
 }
 
-impl AsRef<[u8]> for AvailableKey {
+impl AsRef<[u8]> for AvailableKey<'_> {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
 }
 
-impl InProgressKey {
-    pub fn from_id(id: &[u8]) -> Self {
-        Self(id.to_vec())
+impl<'a> InProgressKey<'a> {
+    pub fn from_id(id: &'a [u8]) -> Self {
+        Self(id)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.0
     }
 }
 
-impl AsRef<[u8]> for InProgressKey {
+impl AsRef<[u8]> for InProgressKey<'_> {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
@@ -127,17 +127,17 @@ impl AsRef<[u8]> for VisibilityIndexKey {
     }
 }
 
-impl LeaseKey {
-    pub fn from_lease_bytes(lease: &[u8]) -> Self {
-        Self(lease.to_vec())
+impl<'a> LeaseKey<'a> {
+    pub fn from_lease_bytes(lease: &'a [u8]) -> Self {
+        Self(lease)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.0
     }
 }
 
-impl AsRef<[u8]> for LeaseKey {
+impl AsRef<[u8]> for LeaseKey<'_> {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
