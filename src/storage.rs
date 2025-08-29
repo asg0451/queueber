@@ -71,6 +71,17 @@ impl Storage {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        // Parallelism and background jobs sized to CPU
+        let num_cpus_i32: i32 = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(2);
+        db_opts.increase_parallelism(num_cpus_i32);
+        db_opts.set_max_background_jobs(num_cpus_i32.saturating_mul(2));
+        // Smooth I/O
+        db_opts.set_bytes_per_sync(1u64 << 20);
+        db_opts.set_wal_bytes_per_sync(1u64 << 20);
+        // Crash-consistency across CFs
+        db_opts.set_atomic_flush(true);
 
         // Prefix extractor: treat the namespace segment up to and including the first '/'
         // as the prefix across our keyspaces.
@@ -85,19 +96,81 @@ impl Storage {
             )
         };
 
-        // Build per-CF options. Simplicity: use the same prefix extractor for all CFs.
+        // Build per-CF options. Use the same prefix extractor across keyspaces,
+        // but tailor table/bloom/compression settings by access pattern.
         let mut cf_default = Options::default();
         cf_default.set_prefix_extractor(make_ns_prefix());
+
         let mut cf_available = Options::default();
         cf_available.set_prefix_extractor(make_ns_prefix());
+        {
+            // Larger blocks; light compression; whole-key bloom
+            let mut bbt = rocksdb::BlockBasedOptions::default();
+            bbt.set_block_size(64 * 1024);
+            bbt.set_cache_index_and_filter_blocks(true);
+            bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            bbt.set_whole_key_filtering(true);
+            // Use block-based bloom filter builder
+            bbt.set_bloom_filter(10.0, true);
+            cf_available.set_block_based_table_factory(&bbt);
+            cf_available.set_compression_type(rocksdb::DBCompressionType::Zstd);
+        }
+
         let mut cf_in_progress = Options::default();
         cf_in_progress.set_prefix_extractor(make_ns_prefix());
+        {
+            // Small blocks; minimal compression; whole-key bloom
+            let mut bbt = rocksdb::BlockBasedOptions::default();
+            bbt.set_block_size(8 * 1024);
+            bbt.set_cache_index_and_filter_blocks(true);
+            bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            bbt.set_whole_key_filtering(true);
+            bbt.set_bloom_filter(10.0, true);
+            cf_in_progress.set_block_based_table_factory(&bbt);
+            cf_in_progress.set_compression_type(rocksdb::DBCompressionType::None);
+        }
+
         let mut cf_visibility_index = Options::default();
         cf_visibility_index.set_prefix_extractor(make_ns_prefix());
+        {
+            // Small blocks; prefix-heavy scans; prefer prefix bloom; no compression
+            let mut bbt = rocksdb::BlockBasedOptions::default();
+            bbt.set_block_size(4 * 1024);
+            bbt.set_cache_index_and_filter_blocks(true);
+            bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            bbt.set_whole_key_filtering(false);
+            bbt.set_bloom_filter(10.0, true);
+            cf_visibility_index.set_block_based_table_factory(&bbt);
+            cf_visibility_index.set_compression_type(rocksdb::DBCompressionType::None);
+        }
+
         let mut cf_leases = Options::default();
         cf_leases.set_prefix_extractor(make_ns_prefix());
+        {
+            // Small blocks; whole-key bloom; minimal compression
+            let mut bbt = rocksdb::BlockBasedOptions::default();
+            bbt.set_block_size(8 * 1024);
+            bbt.set_cache_index_and_filter_blocks(true);
+            bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            bbt.set_whole_key_filtering(true);
+            bbt.set_bloom_filter(10.0, true);
+            cf_leases.set_block_based_table_factory(&bbt);
+            cf_leases.set_compression_type(rocksdb::DBCompressionType::None);
+        }
+
         let mut cf_lease_expiry = Options::default();
         cf_lease_expiry.set_prefix_extractor(make_ns_prefix());
+        {
+            // Small blocks; prefix-heavy scans; prefer prefix bloom; no compression
+            let mut bbt = rocksdb::BlockBasedOptions::default();
+            bbt.set_block_size(4 * 1024);
+            bbt.set_cache_index_and_filter_blocks(true);
+            bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            bbt.set_whole_key_filtering(false);
+            bbt.set_bloom_filter(10.0, true);
+            cf_lease_expiry.set_block_based_table_factory(&bbt);
+            cf_lease_expiry.set_compression_type(rocksdb::DBCompressionType::None);
+        }
 
         let cf_descs = vec![
             ColumnFamilyDescriptor::new("default", cf_default),
