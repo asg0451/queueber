@@ -113,3 +113,7 @@ If you can make per-connection work `Send` (or isolate the non-`Send` parts), yo
 
 These yield quick, measurable wins without changing external behavior.
 
+### Tried optimizations and results
+
+- RPC IO buffers: Increased `futures::io::BufReader`/`futures::io::BufWriter` capacities to 64 KiB at all RPC endpoints (server, client, benches, tests). Result: no measurable improvement in throughput or latency in stress tests/benchmarks (within noise). PR: `https://github.com/ORG/REPO/pull/XXXX`
+
