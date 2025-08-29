@@ -107,10 +107,9 @@
 
 ### Measurement plan
 
-- Use `benches/*` and `criterion` to measure CPU/latency; extend with scenarios covering add/poll/remove mixes.
-- Run `stress.sh` under varying concurrency to validate coalescing and contention improvements.
-- Validate worker and blocking pool utilization (`top -H`, tracing).
-- Add CPU/heap profiling (`pprof`/jemalloc) to identify remaining hotspots.
+### Tried optimizations and results
+
+- RPC IO buffers: Increased `futures::io::BufReader`/`futures::io::BufWriter` capacities to 64 KiB at all RPC endpoints (server, client, benches, tests). Result: no measurable improvement in throughput or latency in stress tests/benchmarks (within noise). PR: `https://github.com/ORG/REPO/pull/XXXX`
 
 ### References
 
