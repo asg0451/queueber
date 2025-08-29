@@ -731,14 +731,16 @@ fn build_lease_entry_message(
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
     lease_entry_builder.set_expiry_ts_index_key(expiry_index_key_bytes);
-    // Write ids unsorted first.
+    // Collect borrowed id slices. For small batches, avoid heap alloc by using SmallVec.
     let n = polled_items.len();
-    // Stable sort without copying id bytes: collect borrowed slices, sort stably, then write
-    let mut borrowed: Vec<&[u8]> = Vec::with_capacity(n);
+    use smallvec::SmallVec;
+    let mut borrowed: SmallVec<[&[u8]; 32]> = SmallVec::with_capacity(n.min(32));
     for item in polled_items.iter() {
         borrowed.push(item.get()?.get_id()?);
     }
-    borrowed.sort(); // stable
+    if n > 1 {
+        borrowed.sort();
+    }
     let mut out_ids = lease_entry_builder.init_ids(n as u32);
     for (i, id) in borrowed.into_iter().enumerate() {
         out_ids.set(i as u32, id);
@@ -1147,6 +1149,58 @@ mod tests {
         assert_eq!(ids.len(), 1);
         assert_eq!(ids.get(0)?, b"42");
 
+        Ok(())
+    }
+
+    #[test]
+    fn build_lease_entry_message_skips_sort_for_single() -> Result<()> {
+        // Create a single polled item
+        let mut msg = Builder::new_default();
+        let mut pi = msg.init_root::<protocol::polled_item::Builder>();
+        pi.set_id(b"z");
+        pi.set_contents(b"c");
+        let typed = msg.into_typed();
+        let owned: PolledItemOwnedReader = typed.into_reader();
+
+        // Build lease entry and read back via serialization
+        let lease_msg = build_lease_entry_message(123, b"k", &[owned])?;
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &lease_msg)?;
+        let msg =
+            serialize::read_message_from_flat_slice(&mut &buf[..], message::ReaderOptions::new())?;
+        let reader = msg.get_root::<protocol::lease_entry::Reader>()?;
+        let ids = reader.get_ids()?;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0)?, b"z");
+        Ok(())
+    }
+
+    #[test]
+    fn build_lease_entry_message_sorts_multiple_ids() -> Result<()> {
+        // Two items out of order by id
+        let mut m1 = Builder::new_default();
+        let mut p1 = m1.init_root::<protocol::polled_item::Builder>();
+        p1.set_id(b"b");
+        p1.set_contents(b"x");
+        let o1: PolledItemOwnedReader = m1.into_typed().into_reader();
+
+        let mut m2 = Builder::new_default();
+        let mut p2 = m2.init_root::<protocol::polled_item::Builder>();
+        p2.set_id(b"a");
+        p2.set_contents(b"y");
+        let o2: PolledItemOwnedReader = m2.into_typed().into_reader();
+
+        // Build lease entry with unsorted inputs [b, a]
+        let lease_msg = build_lease_entry_message(1, b"k", &[o1, o2])?;
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &lease_msg)?;
+        let msg =
+            serialize::read_message_from_flat_slice(&mut &buf[..], message::ReaderOptions::new())?;
+        let reader = msg.get_root::<protocol::lease_entry::Reader>()?;
+        let ids = reader.get_ids()?;
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.get(0)?, b"a");
+        assert_eq!(ids.get(1)?, b"b");
         Ok(())
     }
 
