@@ -1,9 +1,8 @@
 use capnp::message::{self, TypedReader};
 use capnp::serialize;
 use rocksdb::{
-    ColumnFamilyDescriptor, Direction, IteratorMode, OptimisticTransactionDB,
-    OptimisticTransactionOptions, Options, ReadOptions, SliceTransform, WriteBatchWithTransaction,
-    WriteOptions,
+    ColumnFamilyDescriptor, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions,
+    Options, ReadOptions, SliceTransform, WriteBatchWithTransaction, WriteOptions,
 };
 use std::path::Path;
 use uuid::Uuid;
@@ -239,11 +238,11 @@ impl Storage {
 
     /// Return the next visibility timestamp (secs since epoch) among items in the
     /// visibility index, if any. This is determined by reading the first key in
-    /// the `visibility_index/` namespace which is ordered by big-endian timestamp.
+    /// the `visibility_index` CF which is ordered by big-endian timestamp.
     pub fn peek_next_visibility_ts_secs(&self) -> Result<Option<u64>> {
         let mut iter = self
             .db
-            .prefix_iterator_cf(self.cf_visibility_index(), VisibilityIndexKey::PREFIX);
+            .iterator_cf(self.cf_visibility_index(), IteratorMode::Start);
         if let Some(kv) = iter.next() {
             let (idx_key, _) = kv?;
             Ok(Some(VisibilityIndexKey::parse_visible_ts_secs(&idx_key)?))
@@ -286,17 +285,15 @@ impl Storage {
         let snapshot = txn.snapshot();
         let mut ro_iter = ReadOptions::default();
         ro_iter.set_snapshot(&snapshot);
-        ro_iter.set_prefix_same_as_start(true);
         // Upper bound: include all visibility_index entries with timestamp <= now_secs
         // by setting an exclusive upper bound at (now_secs + 1).
-        let mut viz_upper_bound: Vec<u8> = Vec::with_capacity(VisibilityIndexKey::PREFIX.len() + 8);
-        viz_upper_bound.extend_from_slice(VisibilityIndexKey::PREFIX);
+        let mut viz_upper_bound: Vec<u8> = Vec::with_capacity(8);
         viz_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
         ro_iter.set_iterate_upper_bound(viz_upper_bound.clone());
         let mut ro_get = ReadOptions::default();
         ro_get.set_snapshot(&snapshot);
         // Prefix-bounded forward iterator from the prefix start using the snapshot-bound ReadOptions
-        let mode = IteratorMode::From(VisibilityIndexKey::PREFIX, Direction::Forward);
+        let mode = IteratorMode::Start;
         let viz_iter = txn.iterator_cf_opt(self.cf_visibility_index(), ro_iter, mode);
 
         // Stage 1: scan visibility index, lock eligible entries, and collect their main keys.
@@ -471,14 +468,14 @@ impl Storage {
         let txn = self.db.transaction();
         // Validate item exists in in_progress
         if txn
-            .get_pinned_for_update_cf(self.cf_in_progress(), &in_progress_key, true)?
+            .get_pinned_for_update_cf(self.cf_in_progress(), in_progress_key, true)?
             .is_none()
         {
             return Ok(false);
         }
 
         // Validate lease exists
-        let Some(lease_value) = txn.get_pinned_for_update_cf(self.cf_leases(), &lease_key, true)?
+        let Some(lease_value) = txn.get_pinned_for_update_cf(self.cf_leases(), lease_key, true)?
         else {
             tracing::info!("lease entry not found: {:?}", Uuid::from_bytes(*lease));
             return Ok(false);
@@ -566,23 +563,15 @@ impl Storage {
         // Restrict iterator to only keys with expiry_ts <= now by setting an
         // exclusive upper bound at (now + 1).
         let mut ro = ReadOptions::default();
-        ro.set_prefix_same_as_start(true);
-        let mut expiry_upper_bound: Vec<u8> =
-            Vec::with_capacity(LeaseExpiryIndexKey::PREFIX.len() + 8);
-        expiry_upper_bound.extend_from_slice(LeaseExpiryIndexKey::PREFIX);
+        let mut expiry_upper_bound: Vec<u8> = Vec::with_capacity(8);
         expiry_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
         ro.set_iterate_upper_bound(expiry_upper_bound.clone());
-        let mode = IteratorMode::From(LeaseExpiryIndexKey::PREFIX, Direction::Forward);
+        let mode = IteratorMode::Start;
         let iter = txn.iterator_cf_opt(self.cf_lease_expiry(), ro, mode);
         // Avoid deleting keys while iterating; collect expiry index keys to delete later.
         let mut expiry_index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
         for kv in iter {
             let (idx_key, _) = kv?;
-
-            debug_assert_eq!(
-                &idx_key[..LeaseExpiryIndexKey::PREFIX.len()],
-                LeaseExpiryIndexKey::PREFIX
-            );
 
             let _idx_val = txn
                 .get_pinned_for_update_cf(self.cf_lease_expiry(), &idx_key, true)?
@@ -1511,12 +1500,8 @@ mod tests {
         let mut before = 0usize;
         {
             let txn = storage.db.transaction();
-            let mut ro = rocksdb::ReadOptions::default();
-            ro.set_prefix_same_as_start(true);
-            let mode = rocksdb::IteratorMode::From(
-                LeaseExpiryIndexKey::PREFIX,
-                rocksdb::Direction::Forward,
-            );
+            let ro = rocksdb::ReadOptions::default();
+            let mode = rocksdb::IteratorMode::Start;
             let iter = txn.iterator_cf_opt(storage.cf_lease_expiry(), ro, mode);
             for kv in iter {
                 let (idx_key, _val) = kv?;
@@ -1535,12 +1520,8 @@ mod tests {
         let mut after = 0usize;
         {
             let txn = storage.db.transaction();
-            let mut ro = rocksdb::ReadOptions::default();
-            ro.set_prefix_same_as_start(true);
-            let mode = rocksdb::IteratorMode::From(
-                LeaseExpiryIndexKey::PREFIX,
-                rocksdb::Direction::Forward,
-            );
+            let ro = rocksdb::ReadOptions::default();
+            let mode = rocksdb::IteratorMode::Start;
             let iter = txn.iterator_cf_opt(storage.cf_lease_expiry(), ro, mode);
             for kv in iter {
                 let (idx_key, _val) = kv?;
@@ -1610,10 +1591,8 @@ mod tests {
         // Count expiry index entries that reference this lease
         let mut count = 0usize;
         let txn = storage.db.transaction();
-        let mut ro = rocksdb::ReadOptions::default();
-        ro.set_prefix_same_as_start(true);
-        let mode =
-            rocksdb::IteratorMode::From(LeaseExpiryIndexKey::PREFIX, rocksdb::Direction::Forward);
+        let ro = rocksdb::ReadOptions::default();
+        let mode = rocksdb::IteratorMode::Start;
         let iter = txn.iterator_cf_opt(
             storage
                 .db
@@ -1952,8 +1931,7 @@ mod tests {
         // Iterate visibility index and capture the first entry
         let mut ro = rocksdb::ReadOptions::default();
         ro.set_prefix_same_as_start(true);
-        let mode =
-            rocksdb::IteratorMode::From(VisibilityIndexKey::PREFIX, rocksdb::Direction::Forward);
+        let mode = rocksdb::IteratorMode::Start;
         let mut viz_iter = txn.iterator_cf_opt(
             storage
                 .db
