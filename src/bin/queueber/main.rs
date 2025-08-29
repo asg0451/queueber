@@ -138,8 +138,8 @@ async fn main() -> Result<()> {
                                                     )
                                                     .split();
                                                 let network = twoparty::VatNetwork::new(
-                                                    futures::io::BufReader::new(reader),
-                                                    futures::io::BufWriter::new(writer),
+                                                    futures::io::BufReader::with_capacity(queueber::RPC_IO_BUFFER_BYTES, reader),
+                                                    futures::io::BufWriter::with_capacity(queueber::RPC_IO_BUFFER_BYTES, writer),
                                                     rpc_twoparty_capnp::Side::Server,
                                                     Default::default(),
                                                 );

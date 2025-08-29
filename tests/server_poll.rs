@@ -77,8 +77,8 @@ fn start_test_server() -> TestServerHandle {
                                 let (reader, writer) =
                                     tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
                                 let network = twoparty::VatNetwork::new(
-                                    futures::io::BufReader::new(reader),
-                                    futures::io::BufWriter::new(writer),
+                                    futures::io::BufReader::with_capacity(queueber::RPC_IO_BUFFER_BYTES, reader),
+                                    futures::io::BufWriter::with_capacity(queueber::RPC_IO_BUFFER_BYTES, writer),
                                     rpc_twoparty_capnp::Side::Server,
                                     Default::default(),
                                 );
@@ -116,8 +116,8 @@ where
     stream.set_nodelay(true).unwrap();
     let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
     let rpc_network = Box::new(twoparty::VatNetwork::new(
-        futures::io::BufReader::new(reader),
-        futures::io::BufWriter::new(writer),
+        futures::io::BufReader::with_capacity(queueber::RPC_IO_BUFFER_BYTES, reader),
+        futures::io::BufWriter::with_capacity(queueber::RPC_IO_BUFFER_BYTES, writer),
         rpc_twoparty_capnp::Side::Client,
         Default::default(),
     ));

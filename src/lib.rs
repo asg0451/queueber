@@ -10,3 +10,5 @@ pub mod storage;
 // Re-export commonly used types
 pub use crate::storage::RetriedStorage;
 pub use crate::storage::Storage;
+
+pub const RPC_IO_BUFFER_BYTES: usize = 64 * 1024;
