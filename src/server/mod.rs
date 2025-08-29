@@ -131,12 +131,12 @@ impl crate::protocol::queue::Server for Server {
             .map(|_| uuid::Uuid::now_v7().into_bytes())
             .collect();
 
-        let items_owned = items
+        let items_owned: Vec<(Arc<[u8]>, u64)> = items
             .iter()
             .map(|item| -> Result<_> {
-                let contents = item.get_contents()?.to_vec();
+                let contents = item.get_contents()?;
                 let vis = item.get_visibility_timeout_secs();
-                Ok((contents, vis))
+                Ok((Arc::<[u8]>::from(contents), vis))
             })
             .collect::<Result<Vec<_>>>()
             .map_err(Into::<capnp::Error>::into)?;
@@ -151,7 +151,7 @@ impl crate::protocol::queue::Server for Server {
             let iter = ids
                 .iter()
                 .map(|id| id.as_slice())
-                .zip(items_owned.iter().map(|(c, v)| (c.as_slice(), *v)));
+                .zip(items_owned.iter().map(|(c, v)| (c.as_ref(), *v)));
             storage.add_available_items_from_parts(iter).await?;
 
             if any_immediately_visible {
