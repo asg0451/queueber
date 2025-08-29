@@ -391,7 +391,13 @@ impl Storage {
             lease_expiry_index_key.as_bytes(),
             &polled_items,
         )?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
+        // Reuse a scratch buffer for serialization to avoid allocs/copies
+        let mut lease_entry_bs: Vec<u8> = Vec::new();
+        let need = lease_entry.size_in_words() * 8;
+        if lease_entry_bs.capacity() < need {
+            lease_entry_bs.reserve(need - lease_entry_bs.capacity());
+        }
+        lease_entry_bs.clear();
         serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
         // Write the lease entry and its expiry index
