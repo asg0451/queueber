@@ -126,7 +126,10 @@ impl crate::protocol::queue::Server for Server {
         // Generate ids upfront and copy request data into owned memory so we can move
         // it into a blocking task (capnp readers are not Send).
         // Store ids inline as [u8;16] to avoid per-id heap allocations.
-        let ids: Vec<[u8; 16]> = crate::uuid_utils::generate_uuidv7_batch(items.len() as usize);
+        let ids: Vec<[u8; 16]> = items
+            .iter()
+            .map(|_| uuid::Uuid::now_v7().into_bytes())
+            .collect();
 
         let items_owned = items
             .iter()

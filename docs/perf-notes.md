@@ -98,6 +98,7 @@ Recommended fixes (incremental):
   - Prefer `Uuid::new_v4()` (or a fast 128-bit random) for leases unless you need time-sortable IDs; you already index lease expiry by timestamp.
   - Minimize logging in hot paths or gate behind `trace`.
   - Avoid rebuilding Cap’n Proto messages where a lightweight copy/reference suffices.
+  - UUID generation batching (tried, no win): We pre-generated uuidv7 values in a tight loop with preallocated buffers to reduce per-call overhead. Benchmarks and e2e tests showed no measurable throughput or CPU improvement, so this change was reverted. See PR: <INSERT_PR_LINK_HERE>.
 
 ### Larger simplification (optional)
 
