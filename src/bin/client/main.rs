@@ -7,12 +7,12 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     str::FromStr,
-    sync::{Arc, Mutex, atomic},
+    sync::{Arc, atomic},
     time::Duration,
 };
 use tokio::{
-    runtime::Handle,
     time::{Instant, MissedTickBehavior},
+    sync::Semaphore,
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -75,6 +75,161 @@ mod busy_tracker {
             );
         }
     }
+}
+
+// Configuration for async stress testing workers
+#[derive(Clone)]
+struct StressWorkerConfig {
+    addr: SocketAddr,
+    end_time: Instant,
+    polling_clients: u32,
+    adding_clients: u32,
+    rate: u32,
+    max_concurrent_ops: u32,
+    add_count: Arc<atomic::AtomicU64>,
+    poll_count: Arc<atomic::AtomicU64>,
+    remove_count: Arc<atomic::AtomicU64>,
+    extend_count: Arc<atomic::AtomicU64>,
+    unique_leases: Arc<tokio::sync::Mutex<HashSet<[u8; 16]>>>,
+}
+
+// Async stress testing with LocalSet to work around Cap'n Proto threading constraints
+async fn run_async_stress_worker(config: StressWorkerConfig) -> Result<()> {
+    // Use LocalSet to work with Cap'n Proto's single-threaded design
+    let local_set = tokio::task::LocalSet::new();
+    
+    local_set.run_until(async move {
+        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_ops as usize));
+        let mut tasks = Vec::new();
+        
+        // spawn polling tasks
+        for _ in 0..config.polling_clients {
+            let poll_count = Arc::clone(&config.poll_count);
+            let remove_count = Arc::clone(&config.remove_count);
+            let extend_count = Arc::clone(&config.extend_count);
+            let unique_leases = Arc::clone(&config.unique_leases);
+            let semaphore = Arc::clone(&semaphore);
+            let addr = config.addr;
+            let end_time = config.end_time;
+            
+            let task = tokio::task::spawn_local(async move {
+                let _ = with_client(addr, |queue_client| async move {
+                    let mut current_lease: Option<[u8; 16]> = None;
+                    let mut last_extend = Instant::now();
+                    
+                    while Instant::now() < end_time {
+                        let _permit = semaphore.acquire().await.unwrap();
+                        
+                        let mut request = queue_client.poll_request();
+                        let mut req = request.get().init_req();
+                        req.set_lease_validity_secs(30);
+                        req.set_num_items(10);
+                        req.set_timeout_secs(5);
+                        
+                        let poll_res: Result<(), capnp::Error> = async {
+                            let reply = request.send().promise.await?;
+                            let resp = reply.get()?.get_resp()?;
+                            let items = resp.get_items()?;
+                            poll_count.fetch_add(
+                                items.len() as u64,
+                                atomic::Ordering::Relaxed,
+                            );
+
+                            let lease = resp.get_lease()?;
+                            if lease.len() == 16 {
+                                let mut lease_arr = [0u8; 16];
+                                lease_arr.copy_from_slice(lease);
+                                current_lease = Some(lease_arr);
+                                if !items.is_empty() {
+                                    let mut s = unique_leases.lock().await;
+                                    s.insert(lease_arr);
+                                }
+                            }
+
+                            let promises = items.iter().map(|i| {
+                                let mut request = queue_client.remove_request();
+                                let mut req = request.get().init_req();
+                                req.set_id(i.get_id().unwrap());
+                                req.set_lease(lease);
+                                request.send().promise
+                            });
+                            let _ = futures::future::join_all(promises).await;
+                            remove_count.fetch_add(
+                                items.len() as u64,
+                                atomic::Ordering::Relaxed,
+                            );
+                            Ok(())
+                        }.await;
+                        
+                        let _ = busy_tracker::track_and_ignore_busy_error(poll_res);
+
+                        // Occasionally extend the current lease to exercise extend under load.
+                        if last_extend.elapsed() > Duration::from_secs(2)
+                            && let Some(lease_arr) = current_lease {
+                                let mut request = queue_client.extend_request();
+                                let mut req = request.get().init_req();
+                                req.set_lease(&lease_arr);
+                                req.set_lease_validity_secs(30);
+                                let res = request.send().promise.await.map(|_| ());
+                                let _ = busy_tracker::track_and_ignore_busy_error(res);
+                                extend_count.fetch_add(1, atomic::Ordering::Relaxed);
+                                last_extend = Instant::now();
+                            }
+                    }
+                }).await;
+            });
+            tasks.push(task);
+        }
+
+        // spawn adding tasks
+        for _ in 0..config.adding_clients {
+            let add_count = Arc::clone(&config.add_count);
+            let semaphore = Arc::clone(&semaphore);
+            let addr = config.addr;
+            let end_time = config.end_time;
+            let rate = config.rate;
+            
+            let task = tokio::task::spawn_local(async move {
+                let _ = with_client(addr, |queue_client| async move {
+                    let batch_size: u32 = 10;
+                    let mut ticker = compute_batch_interval(rate, batch_size)
+                        .map(tokio::time::interval);
+                    if let Some(ref mut t) = ticker {
+                        t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    }
+                    
+                    while Instant::now() < end_time {
+                        if let Some(t) = &mut ticker {
+                            t.tick().await;
+                        }
+                        
+                        let _permit = semaphore.acquire().await.unwrap();
+                        let mut request = queue_client.add_request();
+                        let req = request.get().init_req();
+                        let mut items = req.init_items(batch_size);
+                        for i in 0..batch_size as usize {
+                            let mut item = items.reborrow().get(i as u32);
+                            item.set_contents(format!("test {}", i).as_bytes());
+                            item.set_visibility_timeout_secs(3);
+                        }
+                        let res = request.send().promise.await.map(|_| ());
+                        let _ = busy_tracker::track_and_ignore_busy_error(res);
+                        add_count.fetch_add(batch_size as u64, atomic::Ordering::Relaxed);
+                    }
+                }).await;
+            });
+            tasks.push(task);
+        }
+
+        // Wait for all tasks to complete
+        for task in tasks {
+            if let Err(e) = task.await {
+                eprintln!("Local task failed: {}", e);
+            }
+        }
+    }).await;
+    
+    Ok(())
 }
 
 fn compute_batch_interval(rate_per_client: u32, batch_size: u32) -> Option<Duration> {
@@ -176,6 +331,12 @@ enum Commands {
         /// How long to run the stress test for (seconds)
         #[arg(short = 'd', long = "duration", default_value_t = 30)]
         duration_secs: u64,
+        /// Number of OS threads to spawn (clients distributed across them)
+        #[arg(short = 't', long = "threads", default_value_t = 0)]
+        num_threads: u32,
+        /// Maximum concurrent operations per thread
+        #[arg(short = 'm', long = "max-concurrent", default_value_t = 1000)]
+        max_concurrent_ops: u32,
     },
 }
 
@@ -339,6 +500,8 @@ async fn main() -> Result<()> {
             adding_clients,
             rate,
             duration_secs,
+            num_threads,
+            max_concurrent_ops,
         } => {
             let start_time = Instant::now();
             let end_time = start_time
@@ -349,7 +512,23 @@ async fn main() -> Result<()> {
             let poll_count = Arc::new(atomic::AtomicU64::new(0));
             let remove_count = Arc::new(atomic::AtomicU64::new(0));
             let extend_count = Arc::new(atomic::AtomicU64::new(0));
-            let unique_leases: Arc<Mutex<HashSet<[u8; 16]>>> = Arc::new(Mutex::new(HashSet::new()));
+            let unique_leases: Arc<tokio::sync::Mutex<HashSet<[u8; 16]>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
+            // Determine number of worker threads - either user-specified or auto-calculated
+            let num_workers = if num_threads > 0 {
+                num_threads as usize
+            } else {
+                // Auto-calculate: prefer more threads for better distribution, but cap at CPU count
+                std::cmp::min(
+                    std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+                    ((polling_clients + adding_clients) / 500).max(1) as usize // 500+ clients per thread
+                ).max(1)
+            };
+            
+            println!("Starting scalable async stress test with {} worker threads...", num_workers);
+            println!("Total: {} polling clients, {} adding clients", polling_clients, adding_clients);
+            println!("Max concurrent operations per worker: {}", max_concurrent_ops / num_workers as u32);
+            println!("Each worker can handle thousands of concurrent operations via async tasks!");
 
             // periodic metrics reporter
             tokio::task::Builder::new()
@@ -387,143 +566,57 @@ async fn main() -> Result<()> {
                 })
                 .unwrap();
 
+            // Use scoped threads to distribute clients across fixed number of threads
             std::thread::scope(|s| {
-                // spawn polling clients
-                for _ in 0..polling_clients {
-                    let poll_count = Arc::clone(&poll_count);
-                    let remove_count = Arc::clone(&remove_count);
-                    let extend_count = Arc::clone(&extend_count);
-                    let unique_leases = Arc::clone(&unique_leases);
-                    let handle = Handle::current();
+                for worker_id in 0..num_workers {
+                    // Distribute clients evenly across workers
+                    let worker_polling_clients = if worker_id < polling_clients as usize % num_workers {
+                        polling_clients / num_workers as u32 + 1
+                    } else {
+                        polling_clients / num_workers as u32
+                    };
+                    
+                    let worker_adding_clients = if worker_id < adding_clients as usize % num_workers {
+                        adding_clients / num_workers as u32 + 1
+                    } else {
+                        adding_clients / num_workers as u32
+                    };
+                    
+                    let worker_max_concurrent = max_concurrent_ops / num_workers as u32;
+                    
+                    let worker_config = StressWorkerConfig {
+                        addr,
+                        end_time,
+                        polling_clients: worker_polling_clients,
+                        adding_clients: worker_adding_clients,
+                        rate,
+                        max_concurrent_ops: worker_max_concurrent,
+                        add_count: Arc::clone(&add_count),
+                        poll_count: Arc::clone(&poll_count),
+                        remove_count: Arc::clone(&remove_count),
+                        extend_count: Arc::clone(&extend_count),
+                        unique_leases: Arc::clone(&unique_leases),
+                    };
+                    
                     s.spawn(move || {
-                        handle.block_on(async move {
-                            tokio::task::LocalSet::new()
-                                .run_until(async move {
-                                    let _ = with_client(addr, |queue_client| async move {
-                                        let mut current_lease: Option<[u8; 16]> = None;
-                                        let mut last_extend = Instant::now();
-                                        while Instant::now() < end_time {
-                                            let mut request = queue_client.poll_request();
-                                            let mut req = request.get().init_req();
-                                            req.set_lease_validity_secs(30);
-                                            req.set_num_items(10);
-                                            req.set_timeout_secs(5);
-                                            let poll_res: Result<(), capnp::Error> = async {
-                                                let reply = request.send().promise.await?;
-                                                let resp = reply.get()?.get_resp()?;
-                                                let items = resp.get_items()?;
-                                                poll_count.fetch_add(
-                                                    items.len() as u64,
-                                                    atomic::Ordering::Relaxed,
-                                                );
-
-                                                let lease = resp.get_lease()?;
-                                                if lease.len() == 16 {
-                                                    let mut lease_arr = [0u8; 16];
-                                                    lease_arr.copy_from_slice(lease);
-                                                    current_lease = Some(lease_arr);
-                                                    if !items.is_empty()
-                                                        && let Ok(mut s) = unique_leases.lock()
-                                                    {
-                                                        s.insert(lease_arr);
-                                                    }
-                                                }
-
-                                                let promises = items.iter().map(|i| {
-                                                    let mut request = queue_client.remove_request();
-                                                    let mut req = request.get().init_req();
-                                                    req.set_id(i.get_id().unwrap());
-                                                    req.set_lease(lease);
-                                                    request.send().promise
-                                                });
-                                                let _ = futures::future::join_all(promises).await;
-                                                remove_count.fetch_add(
-                                                    items.len() as u64,
-                                                    atomic::Ordering::Relaxed,
-                                                );
-                                                Ok(())
-                                            }
-                                            .await;
-                                            let _ =
-                                                busy_tracker::track_and_ignore_busy_error(poll_res);
-
-                                            // Occasionally extend the current lease to exercise extend under load.
-                                            if last_extend.elapsed() > Duration::from_secs(2) {
-                                                if let Some(lease_arr) = current_lease {
-                                                    let mut request = queue_client.extend_request();
-                                                    let mut req = request.get().init_req();
-                                                    req.set_lease(&lease_arr);
-                                                    req.set_lease_validity_secs(30);
-                                                    let res =
-                                                        request.send().promise.await.map(|_| ());
-                                                    let _ =
-                                                        busy_tracker::track_and_ignore_busy_error(
-                                                            res,
-                                                        );
-                                                    extend_count
-                                                        .fetch_add(1, atomic::Ordering::Relaxed);
-                                                }
-                                                last_extend = Instant::now();
-                                            }
-                                        }
-                                    })
-                                    .await;
-                                })
-                                .await;
-                        });
-                    });
-                }
-
-                // spawn adding clients
-                for _ in 0..adding_clients {
-                    let add_count = Arc::clone(&add_count);
-                    let handle = Handle::current();
-                    s.spawn(move || {
-                        handle.block_on(async move {
-                            tokio::task::LocalSet::new()
-                                .run_until(async move {
-                                    let _ = with_client(addr, |queue_client| async move {
-                                        let batch_size: u32 = 10;
-                                        let mut ticker = compute_batch_interval(rate, batch_size)
-                                            .map(tokio::time::interval);
-                                        if let Some(ref mut t) = ticker {
-                                            t.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                                        }
-                                        while Instant::now() < end_time {
-                                            if let Some(t) = &mut ticker {
-                                                t.tick().await;
-                                            }
-                                            let mut request = queue_client.add_request();
-                                            let req = request.get().init_req();
-                                            let mut items = req.init_items(batch_size);
-                                            for i in 0..batch_size as usize {
-                                                let mut item = items.reborrow().get(i as u32);
-                                                item.set_contents(format!("test {}", i).as_bytes());
-                                                item.set_visibility_timeout_secs(3);
-                                            }
-                                            let res = request.send().promise.await.map(|_| ());
-                                            let _ = busy_tracker::track_and_ignore_busy_error(res);
-                                            add_count.fetch_add(
-                                                batch_size as u64,
-                                                atomic::Ordering::Relaxed,
-                                            );
-                                        }
-                                    })
-                                    .await;
-                                })
-                                .await;
+                        // Create a dedicated tokio runtime for this thread to avoid "no runtime" errors
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async move {
+                            if let Err(e) = run_async_stress_worker(worker_config).await {
+                                eprintln!("Worker {} failed: {}", worker_id, e);
+                            }
                         });
                     });
                 }
             });
+            
             println!("stress test completed");
             // Report unique leases observed across all polling clients
-            if let Ok(s) = unique_leases.lock() {
-                println!(
-                    "Unique leases observed (proxy for coalesced polls): {}",
-                    s.len()
-                );
-            }
+            let s = unique_leases.lock().await;
+            println!(
+                "Unique leases observed (proxy for coalesced polls): {}",
+                s.len()
+            );
             busy_tracker::report_and_reset("client-stress");
         }
     }
