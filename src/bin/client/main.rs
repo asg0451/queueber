@@ -99,16 +99,18 @@ async fn run_async_stress_worker(config: StressWorkerConfig) -> Result<()> {
     let local_set = tokio::task::LocalSet::new();
     
     local_set.run_until(async move {
-        let semaphore = Arc::new(Semaphore::new(max_concurrent_ops as usize));
+        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_ops as usize));
         let mut tasks = Vec::new();
         
         // spawn polling tasks
-        for _ in 0..polling_clients {
-            let poll_count = Arc::clone(&poll_count);
-            let remove_count = Arc::clone(&remove_count);
-            let extend_count = Arc::clone(&extend_count);
-            let unique_leases = Arc::clone(&unique_leases);
+        for _ in 0..config.polling_clients {
+            let poll_count = Arc::clone(&config.poll_count);
+            let remove_count = Arc::clone(&config.remove_count);
+            let extend_count = Arc::clone(&config.extend_count);
+            let unique_leases = Arc::clone(&config.unique_leases);
             let semaphore = Arc::clone(&semaphore);
+            let addr = config.addr;
+            let end_time = config.end_time;
             
             let task = tokio::task::spawn_local(async move {
                 let _ = with_client(addr, |queue_client| async move {
@@ -162,8 +164,8 @@ async fn run_async_stress_worker(config: StressWorkerConfig) -> Result<()> {
                         let _ = busy_tracker::track_and_ignore_busy_error(poll_res);
 
                         // Occasionally extend the current lease to exercise extend under load.
-                        if last_extend.elapsed() > Duration::from_secs(2) {
-                            if let Some(lease_arr) = current_lease {
+                        if last_extend.elapsed() > Duration::from_secs(2)
+                            && let Some(lease_arr) = current_lease {
                                 let mut request = queue_client.extend_request();
                                 let mut req = request.get().init_req();
                                 req.set_lease(&lease_arr);
@@ -173,7 +175,6 @@ async fn run_async_stress_worker(config: StressWorkerConfig) -> Result<()> {
                                 extend_count.fetch_add(1, atomic::Ordering::Relaxed);
                                 last_extend = Instant::now();
                             }
-                        }
                     }
                 }).await;
             });
@@ -181,9 +182,12 @@ async fn run_async_stress_worker(config: StressWorkerConfig) -> Result<()> {
         }
 
         // spawn adding tasks
-        for _ in 0..adding_clients {
-            let add_count = Arc::clone(&add_count);
+        for _ in 0..config.adding_clients {
+            let add_count = Arc::clone(&config.add_count);
             let semaphore = Arc::clone(&semaphore);
+            let addr = config.addr;
+            let end_time = config.end_time;
+            let rate = config.rate;
             
             let task = tokio::task::spawn_local(async move {
                 let _ = with_client(addr, |queue_client| async move {
@@ -327,10 +331,10 @@ enum Commands {
         /// How long to run the stress test for (seconds)
         #[arg(short = 'd', long = "duration", default_value_t = 30)]
         duration_secs: u64,
-        /// Connection pool size (max concurrent connections)
-        #[arg(short = 'c', long = "connections", default_value_t = 100)]
-        connection_pool_size: u32,
-        /// Maximum concurrent operations per connection pool
+        /// Number of OS threads to spawn (clients distributed across them)
+        #[arg(short = 't', long = "threads", default_value_t = 0)]
+        num_threads: u32,
+        /// Maximum concurrent operations per thread
         #[arg(short = 'm', long = "max-concurrent", default_value_t = 1000)]
         max_concurrent_ops: u32,
     },
@@ -496,7 +500,7 @@ async fn main() -> Result<()> {
             adding_clients,
             rate,
             duration_secs,
-            connection_pool_size: _,
+            num_threads,
             max_concurrent_ops,
         } => {
             let start_time = Instant::now();
@@ -510,12 +514,16 @@ async fn main() -> Result<()> {
             let extend_count = Arc::new(atomic::AtomicU64::new(0));
             let unique_leases: Arc<tokio::sync::Mutex<HashSet<[u8; 16]>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
 
-            // Calculate optimal number of worker threads 
-            // Use fewer threads but each handles many async operations via LocalSet
-            let num_workers = std::cmp::min(
-                std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
-                ((polling_clients + adding_clients) / 1000).max(1) as usize // 1000+ clients per thread
-            ).max(1);
+            // Determine number of worker threads - either user-specified or auto-calculated
+            let num_workers = if num_threads > 0 {
+                num_threads as usize
+            } else {
+                // Auto-calculate: prefer more threads for better distribution, but cap at CPU count
+                std::cmp::min(
+                    std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+                    ((polling_clients + adding_clients) / 500).max(1) as usize // 500+ clients per thread
+                ).max(1)
+            };
             
             println!("Starting scalable async stress test with {} worker threads...", num_workers);
             println!("Total: {} polling clients, {} adding clients", polling_clients, adding_clients);
@@ -558,16 +566,10 @@ async fn main() -> Result<()> {
                 })
                 .unwrap();
 
-            // Use scoped threads for better efficiency than the old approach
+            // Use scoped threads to distribute clients across fixed number of threads
             std::thread::scope(|s| {
                 for worker_id in 0..num_workers {
-                    let add_count = Arc::clone(&add_count);
-                    let poll_count = Arc::clone(&poll_count);
-                    let remove_count = Arc::clone(&remove_count);
-                    let extend_count = Arc::clone(&extend_count);
-                    let unique_leases = Arc::clone(&unique_leases);
-                    
-                    // Distribute clients across workers
+                    // Distribute clients evenly across workers
                     let worker_polling_clients = if worker_id < polling_clients as usize % num_workers {
                         polling_clients / num_workers as u32 + 1
                     } else {
@@ -582,21 +584,25 @@ async fn main() -> Result<()> {
                     
                     let worker_max_concurrent = max_concurrent_ops / num_workers as u32;
                     
+                    let worker_config = StressWorkerConfig {
+                        addr,
+                        end_time,
+                        polling_clients: worker_polling_clients,
+                        adding_clients: worker_adding_clients,
+                        rate,
+                        max_concurrent_ops: worker_max_concurrent,
+                        add_count: Arc::clone(&add_count),
+                        poll_count: Arc::clone(&poll_count),
+                        remove_count: Arc::clone(&remove_count),
+                        extend_count: Arc::clone(&extend_count),
+                        unique_leases: Arc::clone(&unique_leases),
+                    };
+                    
                     s.spawn(move || {
-                        tokio::runtime::Handle::current().block_on(async move {
-                            if let Err(e) = run_async_stress_worker(
-                                addr,
-                                end_time,
-                                worker_polling_clients,
-                                worker_adding_clients,
-                                rate,
-                                worker_max_concurrent,
-                                add_count,
-                                poll_count,
-                                remove_count,
-                                extend_count,
-                                unique_leases,
-                            ).await {
+                        // Create a dedicated tokio runtime for this thread to avoid "no runtime" errors
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async move {
+                            if let Err(e) = run_async_stress_worker(worker_config).await {
                                 eprintln!("Worker {} failed: {}", worker_id, e);
                             }
                         });
