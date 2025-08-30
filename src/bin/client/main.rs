@@ -77,8 +77,9 @@ mod busy_tracker {
     }
 }
 
-// Async stress testing with LocalSet to work around Cap'n Proto threading constraints
-async fn run_async_stress_worker(
+// Configuration for async stress testing workers
+#[derive(Clone)]
+struct StressWorkerConfig {
     addr: SocketAddr,
     end_time: Instant,
     polling_clients: u32,
@@ -90,7 +91,10 @@ async fn run_async_stress_worker(
     remove_count: Arc<atomic::AtomicU64>,
     extend_count: Arc<atomic::AtomicU64>,
     unique_leases: Arc<tokio::sync::Mutex<HashSet<[u8; 16]>>>,
-) -> Result<()> {
+}
+
+// Async stress testing with LocalSet to work around Cap'n Proto threading constraints
+async fn run_async_stress_worker(config: StressWorkerConfig) -> Result<()> {
     // Use LocalSet to work with Cap'n Proto's single-threaded design
     let local_set = tokio::task::LocalSet::new();
     
