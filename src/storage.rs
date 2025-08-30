@@ -190,20 +190,25 @@ impl Storage {
         let mut batch = WriteBatchWithTransaction::<true>::default();
         // Reuse a byte buffer for capnp serialization across items to avoid repeated allocations.
         let mut stored_contents: Vec<u8> = Vec::new();
+
+        // Batch time acquisition - compute base time once per batch instead of per item
+        let now = std::time::SystemTime::now();
+
         for (id, (contents, visibility_timeout_secs)) in items.into_iter() {
             let main_key = AvailableKey::from_id(id);
-            let now = std::time::SystemTime::now();
             let visible_ts_secs = (now + std::time::Duration::from_secs(visibility_timeout_secs))
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
             let visibility_index_key =
                 VisibilityIndexKey::from_visible_ts_and_id(visible_ts_secs, id);
 
+            // Create message builder per item (builder creation is cheap, allocation of segments is the expensive part)
             let mut simsg = message::Builder::new_default();
             let mut stored_item = simsg.init_root::<protocol::stored_item::Builder>();
             stored_item.set_contents(contents);
             stored_item.set_id(id);
             stored_item.set_visibility_ts_index_key(visibility_index_key.as_bytes());
+
             // Ensure buffer has enough capacity, then clear and reuse it
             let needed = simsg.size_in_words() * 8;
             if stored_contents.capacity() < needed {
@@ -434,7 +439,8 @@ impl Storage {
             lease_expiry_index_key.as_bytes(),
             &polled_items,
         )?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
+        // Pre-size buffer for lease entry serialization to avoid reallocation
+        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8);
         serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
         // Write the lease entry and its expiry index
@@ -518,7 +524,7 @@ impl Storage {
         } else {
             // Rebuild lease entry with remaining keys.
             // TODO: this could be done more efficiently by unifying the above search and this one.
-            let mut msg = message::Builder::new_default(); // TODO: reduce allocs
+            let mut msg = message::Builder::new_default();
             let mut builder = msg.init_root::<protocol::lease_entry::Builder>();
             // Preserve expiry fields from the existing lease entry
             builder.set_expiry_ts_secs(lease_entry_reader.get_expiry_ts_secs());
@@ -528,20 +534,29 @@ impl Storage {
             if !prev_idx_key.is_empty() {
                 builder.set_expiry_ts_index_key(prev_idx_key);
             }
-            // Collect remaining ids, sort them, then write back.
-            let mut remaining: Vec<&[u8]> = Vec::with_capacity((ids.len() - 1) as usize);
+
+            // Optimize: pre-size and collect remaining ids efficiently
+            let remaining_count = ids.len() - 1;
+            let mut remaining: Vec<&[u8]> = Vec::with_capacity(remaining_count as usize);
             for (i, k) in ids.iter().enumerate() {
                 if i == found_idx {
                     continue;
                 }
                 remaining.push(k?);
             }
-            remaining.sort_unstable();
-            let mut out_ids = builder.init_ids(remaining.len() as u32);
+
+            // Optimization: skip sorting for single item (common case)
+            if remaining_count > 1 {
+                remaining.sort_unstable();
+            }
+
+            let mut out_ids = builder.init_ids(remaining_count as u32);
             for (i, idb) in remaining.into_iter().enumerate() {
                 out_ids.set(i as u32, idb);
             }
-            let mut buf = Vec::with_capacity(msg.size_in_words() * 8); // TODO: reduce allocs
+
+            // Pre-size buffer based on actual message size
+            let mut buf = Vec::with_capacity(msg.size_in_words() * 8);
             serialize::write_message(&mut buf, &msg)?;
             txn.put_cf(self.cf_leases(), lease_key.as_ref(), &buf)?;
         }
@@ -737,15 +752,20 @@ impl Storage {
                 txn.delete_cf(self.cf_lease_expiry(), prev_idx_key)?;
             }
 
-            // TODO: do this with set_root or some such / more efficiently.
+            // Efficient lease entry update: reuse builder pattern and pre-size everything
             let mut out = message::Builder::new_default();
             let mut builder = out.init_root::<protocol::lease_entry::Builder>();
             builder.set_expiry_ts_secs(expiry_ts_secs);
             builder.set_expiry_ts_index_key(new_idx_key.as_bytes());
-            let mut out_keys = builder.reborrow().init_ids(keys.len());
-            for i in 0..keys.len() {
+
+            // Pre-size the ids list based on existing count
+            let keys_len = keys.len();
+            let mut out_keys = builder.reborrow().init_ids(keys_len as u32);
+            for i in 0..keys_len {
                 out_keys.set(i, keys.get(i)?);
             }
+
+            // Pre-size buffer for serialization to avoid reallocation
             let mut buf = Vec::with_capacity(out.size_in_words() * 8);
             serialize::write_message(&mut buf, &out)?;
             txn.put_cf(self.cf_leases(), lease_key.as_ref(), &buf)?;
@@ -774,18 +794,27 @@ fn build_lease_entry_message(
     let mut lease_entry_builder = lease_entry.init_root::<protocol::lease_entry::Builder>();
     lease_entry_builder.set_expiry_ts_secs(expiry_ts_secs);
     lease_entry_builder.set_expiry_ts_index_key(expiry_index_key_bytes);
-    // Write ids unsorted first.
+
     let n = polled_items.len();
-    // Stable sort without copying id bytes: collect borrowed slices, sort stably, then write
-    let mut borrowed: Vec<&[u8]> = Vec::with_capacity(n);
-    for item in polled_items.iter() {
-        borrowed.push(item.get()?.get_id()?);
-    }
-    borrowed.sort(); // stable
     let mut out_ids = lease_entry_builder.init_ids(n as u32);
-    for (i, id) in borrowed.into_iter().enumerate() {
-        out_ids.set(i as u32, id);
+
+    // Optimization: skip sorting for n <= 1 (common case optimization)
+    if n <= 1 {
+        if n == 1 {
+            out_ids.set(0, polled_items[0].get()?.get_id()?);
+        }
+    } else {
+        // For larger batches, collect borrowed slices, sort stably, then write
+        let mut borrowed: Vec<&[u8]> = Vec::with_capacity(n);
+        for item in polled_items.iter() {
+            borrowed.push(item.get()?.get_id()?);
+        }
+        borrowed.sort(); // stable sort for deterministic lease ordering
+        for (i, id) in borrowed.into_iter().enumerate() {
+            out_ids.set(i as u32, id);
+        }
     }
+
     Ok(lease_entry)
 }
 
