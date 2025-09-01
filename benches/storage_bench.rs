@@ -106,6 +106,7 @@ mod lease_tracker {
 
 fn bench_add_messages(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_add");
+    group.measurement_time(std::time::Duration::from_secs(20));
 
     // Keep it simple and reasonably fast for CI
     let num_items: usize = 500;
@@ -142,6 +143,7 @@ fn bench_add_messages(c: &mut Criterion) {
 
 fn bench_remove_messages(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_remove");
+    group.measurement_time(std::time::Duration::from_secs(20));
 
     // Keep it simple and reasonably fast for CI
     let num_items: usize = 500;
@@ -196,6 +198,7 @@ fn bench_remove_messages(c: &mut Criterion) {
 
 fn bench_poll_messages_storage(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_poll");
+    group.measurement_time(std::time::Duration::from_secs(20));
 
     let num_items: usize = 500;
 
@@ -349,7 +352,7 @@ where
 
 fn bench_e2e_add_poll_remove(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e_rpc");
-    group.measurement_time(std::time::Duration::from_secs(15));
+    group.measurement_time(std::time::Duration::from_secs(20));
     let num_items: u32 = 200;
     let handle = ensure_server_started();
     let addr = handle.addr;
@@ -492,7 +495,8 @@ fn bench_e2e_add_poll_remove(c: &mut Criterion) {
 
 fn bench_e2e_stress_like(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e_rpc");
-    group.measurement_time(std::time::Duration::from_secs(15));
+    group.measurement_time(std::time::Duration::from_secs(20));
+
     // Parameters inspired by stress.sh defaults but with bounded total work per iteration.
     let adding_clients: u32 = 2;
     let polling_clients: u32 = 2;

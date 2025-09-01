@@ -157,21 +157,6 @@ impl Storage {
         )
     }
 
-    pub fn add_available_items<'i>(
-        &self,
-        items: impl Iterator<Item = (&'i [u8], protocol::item::Reader<'i>)>,
-    ) -> Result<()> {
-        // Delegate to the single-item owned-part API to avoid code duplication.
-        for (id, item) in items {
-            self.add_available_item_from_parts(
-                id,
-                item.get_contents()?,
-                item.get_visibility_timeout_secs(),
-            )?;
-        }
-        Ok(())
-    }
-
     // Convenience helpers for feeding from owned parts when capnp Readers are not Send.
     pub fn add_available_item_from_parts(
         &self,
