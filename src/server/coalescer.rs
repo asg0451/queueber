@@ -118,28 +118,19 @@ impl PollCoalescer {
                         }
                     };
 
-                    // distribute the items to the pending polls.
-                    // TODO: simplify this
-                    // TODO: reuse across loops
+                    // distribute the items to the pending polls fairly (round-robin)
                     let mut distributed: Vec<PolledItems> =
                         (0..batch.len()).map(|_| Vec::new()).collect();
                     let mut remaining: Vec<usize> = batch.iter().map(|p| p.num_items).collect();
-                    let mut idx = 0usize;
+                    let mut active: VecDeque<usize> =
+                        (0..batch.len()).filter(|&i| remaining[i] > 0).collect();
+
                     for item in items.into_iter() {
-                        let mut placed = false;
-                        for _ in 0..batch.len() {
-                            let target = idx % batch.len();
-                            if remaining[target] > 0 {
-                                distributed[target].push(item);
-                                remaining[target] -= 1;
-                                idx = idx.wrapping_add(1);
-                                placed = true;
-                                break;
-                            }
-                            idx = idx.wrapping_add(1);
-                        }
-                        if !placed {
-                            break;
+                        let Some(idx) = active.pop_front() else { break };
+                        distributed[idx].push(item);
+                        remaining[idx] -= 1;
+                        if remaining[idx] > 0 {
+                            active.push_back(idx);
                         }
                     }
 
