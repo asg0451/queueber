@@ -38,15 +38,15 @@ struct Args {
     #[arg(long = "workers")]
     workers: Option<usize>,
 
-    /// Max concurrent poll requests batched per DB call
+    /// Max concurrent poll requests batched per DB call (default: 64)
     #[arg(long = "coalesce-max-batch-size")]
     coalesce_max_batch_size: Option<usize>,
 
-    /// Max total items returned per batched DB call
+    /// Max total items returned per batched DB call (default: 512)
     #[arg(long = "coalesce-max-batch-items")]
     coalesce_max_batch_items: Option<usize>,
 
-    /// Max batching window in milliseconds
+    /// Max batching window in milliseconds (default: 1)
     #[arg(long = "coalesce-batch-window-ms")]
     coalesce_batch_window_ms: Option<u64>,
 }
