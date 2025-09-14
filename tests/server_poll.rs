@@ -58,7 +58,14 @@ fn start_test_server() -> TestServerHandle {
                 Arc::clone(&notify),
                 shutdown_tx.clone(),
             );
-            let server = Server::new(storage, notify, shutdown_tx.clone());
+            // Use a longer coalescing window in tests to increase batching and reduce flakiness.
+            // 50ms is a reasonable tradeoff for deterministic coalescing without slowing tests too much.
+            let server = Server::new_with_coalescing_window_ms(
+                storage,
+                notify,
+                shutdown_tx.clone(),
+                50,
+            );
             let queue_client: QueueClient = capnp_rpc::new_client(server);
 
             // Indicate that the server is ready to accept connections
@@ -434,6 +441,84 @@ async fn coalesced_concurrent_polls_distribute_items() {
 
         // It's okay if leases are shared; at least one non-empty lease must be present
         assert!(!leases.is_empty(), "at least one poll should receive items");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn coalesced_polls_round_robin_fairness_unequal_demands() {
+    let handle = start_test_server();
+    let addr = handle.addr;
+
+    with_client(addr, |queue_client| async move {
+        // Add 6 immediately visible items
+        let mut add = queue_client.add_request();
+        {
+            let req = add.get().init_req();
+            let mut items = req.init_items(6);
+            for i in 0..6 {
+                let mut item = items.reborrow().get(i as u32);
+                item.set_contents(format!("fair-{i}").as_bytes());
+                item.set_visibility_timeout_secs(0);
+            }
+        }
+        let _ = add.send().promise.await.unwrap();
+
+        // Spawn 3 concurrent polls with unequal demands: 5, 3, 1
+        // Round-robin fairness should distribute the 6 items as counts {3,2,1} (in some order).
+        let quotas = [5u32, 3u32, 1u32];
+        let mut handles = Vec::new();
+        for idx in 0..quotas.len() {
+            let q = quotas[idx];
+            let client = queue_client.clone();
+            handles.push(tokio::task::spawn_local(async move {
+                let mut poll = client.poll_request();
+                {
+                    let mut req = poll.get().init_req();
+                    req.set_lease_validity_secs(30);
+                    req.set_num_items(q);
+                    req.set_timeout_secs(1);
+                }
+                let reply = poll.send().promise.await.unwrap();
+                let resp = reply.get().unwrap().get_resp().unwrap();
+                let items = resp.get_items().unwrap();
+                (idx, items.len() as usize)
+            }));
+        }
+
+        // Gather per-poll counts
+        let mut counts: Vec<(usize, usize)> = Vec::new();
+        for h in handles {
+            counts.push(h.await.unwrap());
+        }
+
+        // Ensure total items returned sums to 6
+        let total_returned: usize = counts.iter().map(|(_, c)| *c).sum();
+        assert_eq!(
+            total_returned, 6,
+            "all 6 items should be distributed across polls"
+        );
+
+        // Fairness assertion: with quotas [5,3,1] and 6 items total, round-robin distribution
+        // yields the multiset of delivered counts {3,2,1} regardless of poll arrival order.
+        let mut delivered: Vec<usize> = counts.iter().map(|(_, c)| *c).collect();
+        delivered.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        assert_eq!(
+            delivered,
+            vec![3, 2, 1],
+            "expected fair round-robin distribution {{3,2,1}}"
+        );
+
+        // Also assert no poll exceeded its requested num_items
+        for (i, c) in counts.iter() {
+            assert!(
+                *c as u32 <= quotas[*i],
+                "poll {} received {} which exceeds its quota {}",
+                i,
+                c,
+                quotas[*i]
+            );
+        }
     })
     .await;
 }
