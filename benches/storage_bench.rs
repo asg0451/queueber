@@ -6,11 +6,14 @@ use futures::AsyncReadExt;
 use queueber::protocol;
 use queueber::protocol::queue;
 use queueber::storage::{RetriedStorage, Storage};
+use rand::Rng;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, atomic};
 use std::thread::JoinHandle;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod busy_tracker {
     use std::sync::OnceLock;
@@ -653,6 +656,7 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
     busy_tracker::report_and_reset("bench_e2e_stress_like");
     lease_tracker::report_and_reset("bench_e2e_stress_like");
 }
+
 
 criterion_group!(
     benches,
