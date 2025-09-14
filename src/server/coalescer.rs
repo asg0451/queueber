@@ -38,7 +38,7 @@ struct PendingPoll {
 pub struct PollCoalescer {
     pub(crate) storage: Arc<RetriedStorage<Storage>>,
     cfg: PollCoalescingConfig,
-    state: Arc<tokio::sync::Mutex<VecDeque<PendingPoll>>>, // pending batch
+    pending: Arc<tokio::sync::Mutex<VecDeque<PendingPoll>>>, // pending batch
     wake: Arc<Notify>,
 }
 
@@ -47,7 +47,7 @@ impl PollCoalescer {
         let this = Self {
             storage,
             cfg: PollCoalescingConfig::default(),
-            state: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            pending: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             wake: Arc::new(Notify::new()),
         };
         this.spawn_batcher();
@@ -57,24 +57,28 @@ impl PollCoalescer {
     fn spawn_batcher(&self) {
         let storage = Arc::clone(&self.storage);
         let cfg = self.cfg;
-        let state = Arc::clone(&self.state);
+        let pending = Arc::clone(&self.pending);
         let wake = Arc::clone(&self.wake);
         tokio::task::Builder::new()
             .name("poll_coalescer")
             .spawn(async move {
                 loop {
-                    if state.lock().await.is_empty() {
+                    // wait until there are pending polls
+                    if pending.lock().await.is_empty() {
                         wake.notified().await;
                     }
 
+                    // wait until the batch window is elapsed to increase batch size
                     tokio::time::sleep(Duration::from_millis(cfg.batch_window_ms)).await;
 
+                    // get a batch of pending polls
+                    // TODO: reuse across loops
                     let mut batch: Vec<PendingPoll> = Vec::new();
                     {
-                        let mut guard = state.lock().await;
-                        let take_n = guard.len().min(cfg.max_batch_size);
+                        let mut pending = pending.lock().await;
+                        let take_n = pending.len().min(cfg.max_batch_size);
                         for _ in 0..take_n {
-                            if let Some(p) = guard.pop_front() {
+                            if let Some(p) = pending.pop_front() {
                                 batch.push(p);
                             }
                         }
@@ -107,12 +111,15 @@ impl PollCoalescer {
                         Err(e) => {
                             let shared = std::sync::Arc::new(e);
                             for p in batch {
-                                let _ = p.tx.send(Err(shared.clone()));
+                                let _ = p.tx.send(Err(Arc::clone(&shared)));
                             }
                             continue;
                         }
                     };
 
+                    // distribute the items to the pending polls.
+                    // TODO: simplify this
+                    // TODO: reuse across loops
                     let mut distributed: Vec<PolledItems> =
                         (0..batch.len()).map(|_| Vec::new()).collect();
                     let mut remaining: Vec<usize> = batch.iter().map(|p| p.num_items).collect();
@@ -151,8 +158,8 @@ impl PollCoalescer {
     pub async fn poll(&self, num_items: usize, lease_validity_secs: u64) -> CoalescedPollResult {
         let (tx, rx) = oneshot::channel();
         {
-            let mut guard = self.state.lock().await;
-            guard.push_back(PendingPoll {
+            let mut pending = self.pending.lock().await;
+            pending.push_back(PendingPoll {
                 num_items: if num_items == 0 { 1 } else { num_items },
                 lease_validity_secs,
                 tx,
