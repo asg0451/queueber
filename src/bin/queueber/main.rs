@@ -39,16 +39,16 @@ struct Args {
     workers: Option<usize>,
 
     /// Max concurrent poll requests batched per DB call
-    #[arg(long = "coalesce-max-batch-size", default_value_t = 64)]
-    coalesce_max_batch_size: usize,
+    #[arg(long = "coalesce-max-batch-size")]
+    coalesce_max_batch_size: Option<usize>,
 
     /// Max total items returned per batched DB call
-    #[arg(long = "coalesce-max-batch-items", default_value_t = 512)]
-    coalesce_max_batch_items: usize,
+    #[arg(long = "coalesce-max-batch-items")]
+    coalesce_max_batch_items: Option<usize>,
 
     /// Max batching window in milliseconds
-    #[arg(long = "coalesce-batch-window-ms", default_value_t = 1)]
-    coalesce_batch_window_ms: u64,
+    #[arg(long = "coalesce-batch-window-ms")]
+    coalesce_batch_window_ms: Option<u64>,
 }
 
 // NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
@@ -104,11 +104,16 @@ async fn main() -> Result<()> {
         let shutdown_tx_cloned = shutdown_tx.clone();
         let mut shutdown_rx_worker = shutdown_rx.clone();
         let addr_for_worker: SocketAddr = addr;
-        let coalesce_cfg = PollCoalescingConfig::new(
-            args.coalesce_max_batch_size,
-            args.coalesce_max_batch_items,
-            args.coalesce_batch_window_ms,
-        );
+        let mut coalesce_cfg = PollCoalescingConfig::default();
+        if let Some(v) = args.coalesce_max_batch_size {
+            coalesce_cfg.max_batch_size = v;
+        }
+        if let Some(v) = args.coalesce_max_batch_items {
+            coalesce_cfg.max_batch_items = v;
+        }
+        if let Some(v) = args.coalesce_batch_window_ms {
+            coalesce_cfg.batch_window_ms = v;
+        }
 
         let thread_name = format!("rpc-worker-{}", i);
         let handle = std::thread::Builder::new()
