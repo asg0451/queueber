@@ -468,8 +468,7 @@ async fn coalesced_polls_round_robin_fairness_unequal_demands() {
         // Round-robin fairness should distribute the 6 items as counts {3,2,1} (in some order).
         let quotas = [5u32, 3u32, 1u32];
         let mut handles = Vec::new();
-        for idx in 0..quotas.len() {
-            let q = quotas[idx];
+        for (idx, &q) in quotas.iter().enumerate() {
             let client = queue_client.clone();
             handles.push(tokio::task::spawn_local(async move {
                 let mut poll = client.poll_request();
