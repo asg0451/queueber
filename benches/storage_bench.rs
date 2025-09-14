@@ -6,12 +6,14 @@ use futures::AsyncReadExt;
 use queueber::protocol;
 use queueber::protocol::queue;
 use queueber::storage::{RetriedStorage, Storage};
-use queueber::worker::{WorkerConfig, connect_queue_client, run_worker_batch};
+use rand::Rng;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, atomic};
 use std::thread::JoinHandle;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod busy_tracker {
     use std::sync::OnceLock;
@@ -704,6 +706,132 @@ fn bench_e2e_workers(c: &mut Criterion) {
     );
 
     group.finish();
+}
+
+// ================= Worker helpers (bench-scoped; not part of main crate) =================
+
+#[derive(Clone, Debug)]
+struct WorkerConfig {
+    poll_batch_size: u32,
+    lease_validity_secs: u64,
+    process_time_min_ms: u64,
+    process_time_max_ms: u64,
+    poll_timeout_secs: u64,
+}
+
+fn compute_extend_interval(lease_validity_secs: u64) -> Duration {
+    if lease_validity_secs == 0 {
+        return Duration::from_millis(200);
+    }
+    let half_secs = lease_validity_secs / 2;
+    Duration::from_secs(half_secs.max(1))
+}
+
+async fn connect_queue_client(addr: SocketAddr) -> queue::Client {
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+    let rpc_network = Box::new(twoparty::VatNetwork::new(
+        futures::io::BufReader::new(reader),
+        futures::io::BufWriter::new(writer),
+        rpc_twoparty_capnp::Side::Client,
+        Default::default(),
+    ));
+    let mut rpc_system = RpcSystem::new(rpc_network, None);
+    let queue_client: queue::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let _jh = tokio::task::Builder::new()
+                .name("rpc_system")
+                .spawn_local(rpc_system)
+                .unwrap();
+            queue_client
+        })
+        .await
+}
+
+async fn run_worker_batch(
+    queue_client: queue::Client,
+    cfg: &WorkerConfig,
+) -> Result<usize, capnp::Error> {
+    let mut poll_req = queue_client.poll_request();
+    {
+        let mut req = poll_req.get().init_req();
+        req.set_lease_validity_secs(cfg.lease_validity_secs);
+        req.set_num_items(cfg.poll_batch_size);
+        req.set_timeout_secs(cfg.poll_timeout_secs);
+    }
+    let poll_reply = poll_req.send().promise.await?;
+    let poll_resp = poll_reply.get()?.get_resp()?;
+    let lease = poll_resp.get_lease()?;
+    let items = poll_resp.get_items()?;
+    if items.is_empty() {
+        return Ok(0);
+    }
+
+    let mut lease_arr = [0u8; 16];
+    if lease.len() != 16 {
+        return Ok(0);
+    }
+    lease_arr.copy_from_slice(lease);
+
+    let cancel = CancellationToken::new();
+    let child = cancel.child_token();
+    let extender_client = queue_client.clone();
+    let extender_lease = lease_arr;
+    let extender_validity = cfg.lease_validity_secs;
+    let extend_interval = compute_extend_interval(cfg.lease_validity_secs);
+    let extender = tokio::task::Builder::new()
+        .name("worker_lease_extender")
+        .spawn_local(async move {
+            let mut interval = tokio::time::interval(extend_interval);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = child.cancelled() => break,
+                    _ = interval.tick() => {
+                        let mut req = extender_client.extend_request();
+                        let mut r = req.get().init_req();
+                        r.set_lease(&extender_lease);
+                        r.set_lease_validity_secs(extender_validity);
+                        let _ = req.send().promise.await;
+                    }
+                }
+            }
+        })
+        .expect("spawn extender");
+
+    let min_ms = cfg.process_time_min_ms.min(cfg.process_time_max_ms);
+    let max_ms = cfg.process_time_max_ms.max(cfg.process_time_min_ms);
+    let mut tasks = Vec::with_capacity(items.len() as usize);
+    for i in 0..items.len() {
+        let id = items.get(i).get_id()?.to_vec();
+        let lease_bytes = lease.to_vec();
+        let client = queue_client.clone();
+        let sleep_ms = if max_ms == min_ms {
+            min_ms
+        } else {
+            rand::thread_rng().gen_range(min_ms..=max_ms)
+        };
+        tasks.push(
+            tokio::task::Builder::new()
+                .name("worker_job")
+                .spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    let mut req = client.remove_request();
+                    let mut r = req.get().init_req();
+                    r.set_id(&id);
+                    r.set_lease(&lease_bytes);
+                    let _ = req.send().promise.await;
+                })?,
+        );
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
+    cancel.cancel();
+    let _ = extender.await;
+    Ok(items.len() as usize)
 }
 
 criterion_group!(
