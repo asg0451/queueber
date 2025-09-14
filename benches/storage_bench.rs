@@ -6,6 +6,7 @@ use futures::AsyncReadExt;
 use queueber::protocol;
 use queueber::protocol::queue;
 use queueber::storage::{RetriedStorage, Storage};
+use queueber::worker::{WorkerConfig, connect_queue_client, run_worker_batch};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
@@ -654,12 +655,64 @@ fn bench_e2e_stress_like(c: &mut Criterion) {
     lease_tracker::report_and_reset("bench_e2e_stress_like");
 }
 
+fn bench_e2e_workers(c: &mut Criterion) {
+    let mut group = c.benchmark_group("e2e_rpc");
+    group.measurement_time(std::time::Duration::from_secs(20));
+
+    let workers: usize = 4;
+    let total_batches: usize = 200;
+
+    let handle = ensure_server_started();
+    let addr = handle.addr;
+
+    group.bench_function(
+        format!("rpc_workers_n{}_batches{}", workers, total_batches),
+        |b| {
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    for _ in 0..workers {
+                        s.spawn(|| {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_io()
+                                .enable_time()
+                                .build()
+                                .unwrap();
+                            rt.block_on(async move {
+                                tokio::task::LocalSet::new()
+                                    .run_until(async move {
+                                        let cfg = WorkerConfig {
+                                            poll_batch_size: 16,
+                                            lease_validity_secs: 10,
+                                            process_time_min_ms: 1,
+                                            process_time_max_ms: 10,
+                                            poll_timeout_secs: 1,
+                                        };
+                                        let client = connect_queue_client(addr).await;
+                                        let mut processed_batches = 0usize;
+                                        while processed_batches < total_batches {
+                                            let _ = run_worker_batch(client.clone(), &cfg).await;
+                                            processed_batches += 1;
+                                        }
+                                    })
+                                    .await;
+                            });
+                        });
+                    }
+                });
+            })
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_add_messages,
     bench_remove_messages,
     bench_poll_messages_storage,
     bench_e2e_add_poll_remove,
-    bench_e2e_stress_like
+    bench_e2e_stress_like,
+    bench_e2e_workers
 );
 criterion_main!(benches);
