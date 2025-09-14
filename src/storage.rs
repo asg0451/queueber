@@ -598,8 +598,6 @@ impl Storage {
                 continue;
             };
 
-            // TODO: ensure extend doesnt create multiple index entries for the same lease.
-
             // Parse lease entry keys
             let lease_msg = serialize::read_message_from_flat_slice(
                 &mut &lease_value[..],
@@ -610,9 +608,14 @@ impl Storage {
             // If the lease entry itself indicates an expiry in the future, this
             // expiry index key is stale (e.g., the lease was extended). In that
             // case, clean up the stale index key and skip expiring this lease.
+            // NOTE: I don't think this can actually happen due to the snapshot-consistent reads.
             let lease_expiry_ts_secs = lease_entry_reader.get_expiry_ts_secs();
             if lease_expiry_ts_secs > now_secs {
                 // Delete the stale index entry and continue. Do not count as processed.
+                tracing::debug!(
+                    "cleaning up stale lease expiry index key: {:?}",
+                    Uuid::from_slice(lease_bytes).unwrap_or_default()
+                );
                 expiry_index_keys_to_delete.push(idx_key.to_vec());
                 continue;
             }
