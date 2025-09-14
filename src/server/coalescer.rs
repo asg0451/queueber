@@ -62,6 +62,8 @@ impl PollCoalescer {
         tokio::task::Builder::new()
             .name("poll_coalescer")
             .spawn(async move {
+                let mut batch: Vec<PendingPoll> = Vec::with_capacity(cfg.max_batch_size);
+
                 loop {
                     // wait until there are pending polls
                     if pending.lock().await.is_empty() {
@@ -72,8 +74,7 @@ impl PollCoalescer {
                     tokio::time::sleep(Duration::from_millis(cfg.batch_window_ms)).await;
 
                     // get a batch of pending polls
-                    // TODO: reuse across loops
-                    let mut batch: Vec<PendingPoll> = Vec::new();
+                    batch.clear();
                     {
                         let mut pending = pending.lock().await;
                         let take_n = pending.len().min(cfg.max_batch_size);
@@ -97,7 +98,7 @@ impl PollCoalescer {
                     total_items = total_items.min(cfg.max_batch_items);
 
                     if total_items == 0 {
-                        for p in batch {
+                        for p in batch.drain(..) {
                             let _ = p.tx.send(Ok(None));
                         }
                         continue;
@@ -110,7 +111,7 @@ impl PollCoalescer {
                         Ok(v) => v,
                         Err(e) => {
                             let shared = std::sync::Arc::new(e);
-                            for p in batch {
+                            for p in batch.drain(..) {
                                 let _ = p.tx.send(Err(Arc::clone(&shared)));
                             }
                             continue;
@@ -142,7 +143,7 @@ impl PollCoalescer {
                         }
                     }
 
-                    for (pos, p) in batch.into_iter().enumerate() {
+                    for (pos, p) in batch.drain(..).enumerate() {
                         let items_for_req = std::mem::take(&mut distributed[pos]);
                         let _ = if items_for_req.is_empty() {
                             p.tx.send(Ok(None))
