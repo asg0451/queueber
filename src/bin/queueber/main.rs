@@ -38,10 +38,6 @@ struct Args {
     #[arg(long = "workers")]
     workers: Option<usize>,
 
-    /// Enable poll request coalescing
-    #[arg(long = "coalesce", default_value_t = true)]
-    coalesce: bool,
-
     /// Max concurrent poll requests batched per DB call
     #[arg(long = "coalesce-max-batch-size", default_value_t = 64)]
     coalesce_max_batch_size: usize,
@@ -108,7 +104,6 @@ async fn main() -> Result<()> {
         let shutdown_tx_cloned = shutdown_tx.clone();
         let mut shutdown_rx_worker = shutdown_rx.clone();
         let addr_for_worker: SocketAddr = addr;
-        let coalesce_enabled = args.coalesce;
         let coalesce_cfg = PollCoalescingConfig::new(
             args.coalesce_max_batch_size,
             args.coalesce_max_batch_items,
@@ -124,16 +119,12 @@ async fn main() -> Result<()> {
                     .build()
                     .expect("build worker runtime");
                 rt.block_on(async move {
-                    let server = if coalesce_enabled {
-                        Server::new_with_coalescer_config(
-                            storage_cloned,
-                            notify_cloned,
-                            shutdown_tx_cloned,
-                            coalesce_cfg,
-                        )
-                    } else {
-                        Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned)
-                    };
+                    let server = Server::new_with_coalescer_config(
+                        storage_cloned,
+                        notify_cloned,
+                        shutdown_tx_cloned,
+                        coalesce_cfg,
+                    );
                     let queue_client: queueber::protocol::queue::Client =
                         capnp_rpc::new_client(server);
                     // Each worker owns one Server; clone client per-connection.

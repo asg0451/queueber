@@ -53,6 +53,25 @@ impl Server {
             coalescer,
         }
     }
+
+    /// Build a server with a custom coalescing window (ms) for polling.
+    pub fn new_with_coalescing_window_ms(
+        storage: Arc<RetriedStorage<Storage>>,
+        notify: Arc<Notify>,
+        shutdown_tx: watch::Sender<bool>,
+        batch_window_ms: u64,
+    ) -> Self {
+        let coalescer = Arc::new(PollCoalescer::with_batch_window_ms(
+            Arc::clone(&storage),
+            batch_window_ms,
+        ));
+        Self {
+            storage,
+            notify,
+            shutdown_tx,
+            coalescer,
+        }
+    }
 }
 
 const BACKGROUND_LEASE_EXPIRY_INTERVAL_SECS: u64 = 1;

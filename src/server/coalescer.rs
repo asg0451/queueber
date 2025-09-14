@@ -4,13 +4,14 @@ use tokio::time::Duration;
 
 use capnp::message::{Builder, HeapAllocator, TypedReader};
 
+use crate::errors;
 use crate::storage::{RetriedStorage, Storage};
 use std::collections::VecDeque;
 
 pub type PolledItems =
     Vec<TypedReader<Builder<HeapAllocator>, crate::protocol::polled_item::Owned>>;
 pub type CoalescedPollResult =
-    std::result::Result<Option<([u8; 16], PolledItems)>, std::sync::Arc<crate::errors::Error>>;
+    std::result::Result<Option<([u8; 16], PolledItems)>, std::sync::Arc<errors::Error>>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PollCoalescingConfig {
@@ -68,6 +69,24 @@ impl PollCoalescer {
         let this = Self {
             storage,
             cfg,
+            pending: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            wake: Arc::new(Notify::new()),
+        };
+        this.spawn_batcher();
+        this
+    }
+
+    /// Create a coalescer with a custom batch window in milliseconds (tests/tuning).
+    pub fn with_batch_window_ms(
+        storage: Arc<RetriedStorage<Storage>>,
+        batch_window_ms: u64,
+    ) -> Self {
+        let this = Self {
+            storage,
+            cfg: PollCoalescingConfig {
+                batch_window_ms,
+                ..PollCoalescingConfig::default()
+            },
             pending: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             wake: Arc::new(Notify::new()),
         };
@@ -139,28 +158,21 @@ impl PollCoalescer {
                         }
                     };
 
-                    // distribute the items to the pending polls.
-                    // TODO: simplify this
-                    // TODO: reuse across loops
+                    // distribute the items to the pending polls fairly (round-robin)
                     let mut distributed: Vec<PolledItems> =
                         (0..batch.len()).map(|_| Vec::new()).collect();
                     let mut remaining: Vec<usize> = batch.iter().map(|p| p.num_items).collect();
-                    let mut idx = 0usize;
+                    let mut active: VecDeque<usize> =
+                        (0..batch.len()).filter(|&i| remaining[i] > 0).collect();
+
                     for item in items.into_iter() {
-                        let mut placed = false;
-                        for _ in 0..batch.len() {
-                            let target = idx % batch.len();
-                            if remaining[target] > 0 {
-                                distributed[target].push(item);
-                                remaining[target] -= 1;
-                                idx = idx.wrapping_add(1);
-                                placed = true;
-                                break;
-                            }
-                            idx = idx.wrapping_add(1);
-                        }
-                        if !placed {
-                            break;
+                        let Some(idx) = active.pop_front() else {
+                            panic!( "invariant violated: active is empty; this means we requested more items than we wanted");
+                        };
+                        distributed[idx].push(item);
+                        remaining[idx] -= 1;
+                        if remaining[idx] > 0 {
+                            active.push_back(idx);
                         }
                     }
 

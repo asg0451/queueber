@@ -548,17 +548,20 @@ impl Storage {
         let mut processed = 0usize;
 
         let txn = self.db.transaction();
+        let mut ro = ReadOptions::default();
+        ro.set_snapshot(&txn.snapshot());
         // Restrict iterator to only keys with expiry_ts <= now by setting an
         // exclusive upper bound at (now + 1).
-        let mut ro = ReadOptions::default();
-        ro.set_prefix_same_as_start(true);
+        let mut iter_ro = ReadOptions::default();
+        iter_ro.set_snapshot(&txn.snapshot());
+        iter_ro.set_prefix_same_as_start(true);
         let mut expiry_upper_bound: Vec<u8> =
             Vec::with_capacity(LeaseExpiryIndexKey::PREFIX.len() + 8);
         expiry_upper_bound.extend_from_slice(LeaseExpiryIndexKey::PREFIX);
         expiry_upper_bound.extend_from_slice(&(now_secs.saturating_add(1)).to_be_bytes());
-        ro.set_iterate_upper_bound(expiry_upper_bound.clone());
+        iter_ro.set_iterate_upper_bound(expiry_upper_bound.clone());
         let mode = IteratorMode::From(LeaseExpiryIndexKey::PREFIX, Direction::Forward);
-        let iter = txn.iterator_cf_opt(self.cf_lease_expiry(), ro, mode);
+        let iter = txn.iterator_cf_opt(self.cf_lease_expiry(), iter_ro, mode);
         // Avoid deleting keys while iterating; collect expiry index keys to delete later.
         let mut expiry_index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
         for kv in iter {
@@ -570,7 +573,7 @@ impl Storage {
             );
 
             let _idx_val = txn
-                .get_pinned_for_update_cf(self.cf_lease_expiry(), &idx_key, true)?
+                .get_pinned_for_update_cf_opt(self.cf_lease_expiry(), &idx_key, true, &ro)?
                 .ok_or_else(|| {
                 Error::assertion_failed("visibility index entry not found after we scanned it. expiry should be the only one deleting leases (once expiry is single flighted... TODO)")
             })?;
@@ -586,7 +589,7 @@ impl Storage {
 
             // Load the lease entry. If it's not found, we lost the race with another call and that's fine; move on.
             let Some(lease_value) =
-                txn.get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
+                txn.get_pinned_for_update_cf_opt(self.cf_leases(), lease_key.as_ref(), true, &ro)?
             else {
                 tracing::debug!(
                     "lease entry not found after we scanned it. ignoring. lease: {:?}",
@@ -595,14 +598,28 @@ impl Storage {
                 continue;
             };
 
-            // TODO: ensure extend doesnt create multiple index entries for the same lease.
-
             // Parse lease entry keys
             let lease_msg = serialize::read_message_from_flat_slice(
                 &mut &lease_value[..],
                 message::ReaderOptions::new(),
             )?;
             let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+
+            // If the lease entry itself indicates an expiry in the future, this
+            // expiry index key is stale (e.g., the lease was extended). In that
+            // case, clean up the stale index key and skip expiring this lease.
+            // NOTE: I don't think this can actually happen due to the snapshot-consistent reads.
+            let lease_expiry_ts_secs = lease_entry_reader.get_expiry_ts_secs();
+            if lease_expiry_ts_secs > now_secs {
+                // Delete the stale index entry and continue. Do not count as processed.
+                tracing::debug!(
+                    "cleaning up stale lease expiry index key: {:?}",
+                    Uuid::from_slice(lease_bytes).unwrap_or_default()
+                );
+                expiry_index_keys_to_delete.push(idx_key.to_vec());
+                continue;
+            }
+
             let keys = lease_entry_reader.get_ids()?;
 
             // Reuse capnp builder and output buffer across items to reduce allocations.
@@ -613,10 +630,11 @@ impl Storage {
             for id in keys.iter() {
                 let id = id?;
                 let in_progress_key = InProgressKey::from_id(id);
-                let Some(item_value) = txn.get_pinned_for_update_cf(
+                let Some(item_value) = txn.get_pinned_for_update_cf_opt(
                     self.cf_in_progress(),
                     in_progress_key.as_ref(),
                     true,
+                    &ro,
                 )?
                 else {
                     // Item has already been removed or re-queued; skip.
@@ -675,11 +693,13 @@ impl Storage {
     /// Returns false if the lease does not exist.
     pub fn extend_lease(&self, lease: &Lease, lease_validity_secs: u64) -> Result<bool> {
         let txn = self.db.transaction();
+        let mut ro = ReadOptions::default();
+        ro.set_snapshot(&txn.snapshot());
         // Validate lease exists; if not, do nothing
         let lease_key = LeaseKey::from_lease_bytes(lease);
         {
             let Some(lease_value) =
-                txn.get_pinned_for_update_cf(self.cf_leases(), lease_key.as_ref(), true)?
+                txn.get_pinned_for_update_cf_opt(self.cf_leases(), lease_key.as_ref(), true, &ro)?
             else {
                 return Ok(false);
             };
