@@ -603,6 +603,17 @@ impl Storage {
                 message::ReaderOptions::new(),
             )?;
             let lease_entry_reader = lease_msg.get_root::<protocol::lease_entry::Reader>()?;
+
+            // If the lease entry itself indicates an expiry in the future, this
+            // expiry index key is stale (e.g., the lease was extended). In that
+            // case, clean up the stale index key and skip expiring this lease.
+            let lease_expiry_ts_secs = lease_entry_reader.get_expiry_ts_secs();
+            if lease_expiry_ts_secs > now_secs {
+                // Delete the stale index entry and continue. Do not count as processed.
+                expiry_index_keys_to_delete.push(idx_key.to_vec());
+                continue;
+            }
+
             let keys = lease_entry_reader.get_ids()?;
 
             // Reuse capnp builder and output buffer across items to reduce allocations.
