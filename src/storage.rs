@@ -817,18 +817,6 @@ impl RetriedStorage<Storage> {
 }
 
 impl RetriedStorage<Storage> {
-    #[inline]
-    fn run_blocking_maybe_inline<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle)
-                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread =>
-            {
-                f()
-            }
-            _ => tokio::task::block_in_place(f),
-        }
-    }
-
     async fn run_blocking_on_pool<T: Send + 'static>(
         f: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -895,14 +883,9 @@ impl RetriedStorage<Storage> {
                     })
                     .await
                 } else {
-                    Self::run_blocking_maybe_inline(|| {
-                        inner_ref.add_available_item_from_parts(
-                            id,
-                            contents,
-                            visibility_timeout_secs,
-                        )
-                    })
-                    .map(|_| ())
+                    inner_ref
+                        .add_available_item_from_parts(id, contents, visibility_timeout_secs)
+                        .map(|_| ())
                 };
 
                 {
@@ -961,11 +944,10 @@ impl RetriedStorage<Storage> {
                     })
                     .await
                 } else {
-                    Self::run_blocking_maybe_inline(|| {
-                        let iter = borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
-                        inner_ref.add_available_items_from_parts(iter)
-                    })
-                    .map(|_| ())
+                    let iter = borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
+                    inner_ref
+                        .add_available_items_from_parts(iter)
+                        .map(|_| ())
                 };
 
                 {
@@ -1056,9 +1038,7 @@ impl RetriedStorage<Storage> {
                     })
                     .await?
                 } else {
-                    Self::run_blocking_maybe_inline(|| {
-                        inner_ref.remove_in_progress_item(id, &lease_copy)
-                    })?
+                    inner_ref.remove_in_progress_item(id, &lease_copy)?
                 };
 
                 {
