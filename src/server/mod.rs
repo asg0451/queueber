@@ -12,6 +12,7 @@ use crate::protocol::queue::{
 use crate::storage::{RetriedStorage, Storage};
 mod coalescer;
 use coalescer::PollCoalescer;
+pub use coalescer::PollCoalescingConfig;
 
 // https://github.com/capnproto/capnproto-rust/tree/master/capnp-rpc
 // https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/server.rs
@@ -30,6 +31,21 @@ impl Server {
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
         let coalescer = Arc::new(PollCoalescer::new(Arc::clone(&storage)));
+        Self {
+            storage,
+            notify,
+            shutdown_tx,
+            coalescer,
+        }
+    }
+
+    pub fn new_with_coalescer_config(
+        storage: Arc<RetriedStorage<Storage>>,
+        notify: Arc<Notify>,
+        shutdown_tx: watch::Sender<bool>,
+        cfg: PollCoalescingConfig,
+    ) -> Self {
+        let coalescer = Arc::new(PollCoalescer::with_config(Arc::clone(&storage), cfg));
         Self {
             storage,
             notify,

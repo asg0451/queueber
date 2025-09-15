@@ -8,7 +8,7 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::AsyncReadExt;
 use queueber::{
-    server::Server,
+    server::{PollCoalescingConfig, Server},
     storage::{RetriedStorage, Storage},
 };
 use socket2::{Domain, Protocol, Socket, Type};
@@ -37,6 +37,18 @@ struct Args {
     /// Number of RPC worker threads. Defaults to available_parallelism.
     #[arg(long = "workers")]
     workers: Option<usize>,
+
+    /// Max concurrent poll requests batched per DB call
+    #[arg(long = "coalesce-max-batch-size", default_value_t = PollCoalescingConfig::DEFAULT_MAX_BATCH_SIZE)]
+    coalesce_max_batch_size: usize,
+
+    /// Max total items returned per batched DB call
+    #[arg(long = "coalesce-max-batch-items", default_value_t = PollCoalescingConfig::DEFAULT_MAX_BATCH_ITEMS)]
+    coalesce_max_batch_items: usize,
+
+    /// Max batching window in milliseconds
+    #[arg(long = "coalesce-batch-window-ms", default_value_t = PollCoalescingConfig::DEFAULT_BATCH_WINDOW_MS)]
+    coalesce_batch_window_ms: u64,
 }
 
 // NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
@@ -92,6 +104,11 @@ async fn main() -> Result<()> {
         let shutdown_tx_cloned = shutdown_tx.clone();
         let mut shutdown_rx_worker = shutdown_rx.clone();
         let addr_for_worker: SocketAddr = addr;
+        let coalesce_cfg = PollCoalescingConfig::new(
+            args.coalesce_max_batch_size,
+            args.coalesce_max_batch_items,
+            args.coalesce_batch_window_ms,
+        );
 
         let thread_name = format!("rpc-worker-{}", i);
         let handle = std::thread::Builder::new()
@@ -102,7 +119,12 @@ async fn main() -> Result<()> {
                     .build()
                     .expect("build worker runtime");
                 rt.block_on(async move {
-                    let server = Server::new(storage_cloned, notify_cloned, shutdown_tx_cloned);
+                    let server = Server::new_with_coalescer_config(
+                        storage_cloned,
+                        notify_cloned,
+                        shutdown_tx_cloned,
+                        coalesce_cfg,
+                    );
                     let queue_client: queueber::protocol::queue::Client =
                         capnp_rpc::new_client(server);
                     // Each worker owns one Server; clone client per-connection.

@@ -13,19 +13,33 @@ pub type PolledItems =
 pub type CoalescedPollResult =
     std::result::Result<Option<([u8; 16], PolledItems)>, std::sync::Arc<errors::Error>>;
 
-#[derive(Clone, Copy)]
-struct PollCoalescingConfig {
-    max_batch_size: usize,
-    max_batch_items: usize,
-    batch_window_ms: u64,
+#[derive(Clone, Copy, Debug)]
+pub struct PollCoalescingConfig {
+    pub max_batch_size: usize,
+    pub max_batch_items: usize,
+    pub batch_window_ms: u64,
+}
+
+impl PollCoalescingConfig {
+    pub const DEFAULT_MAX_BATCH_SIZE: usize = 64;
+    pub const DEFAULT_MAX_BATCH_ITEMS: usize = 512;
+    pub const DEFAULT_BATCH_WINDOW_MS: u64 = 1;
+
+    pub fn new(max_batch_size: usize, max_batch_items: usize, batch_window_ms: u64) -> Self {
+        Self {
+            max_batch_size,
+            max_batch_items,
+            batch_window_ms,
+        }
+    }
 }
 
 impl Default for PollCoalescingConfig {
     fn default() -> Self {
         Self {
-            max_batch_size: 64,
-            max_batch_items: 512,
-            batch_window_ms: 1,
+            max_batch_size: Self::DEFAULT_MAX_BATCH_SIZE,
+            max_batch_items: Self::DEFAULT_MAX_BATCH_ITEMS,
+            batch_window_ms: Self::DEFAULT_BATCH_WINDOW_MS,
         }
     }
 }
@@ -48,6 +62,17 @@ impl PollCoalescer {
         let this = Self {
             storage,
             cfg: PollCoalescingConfig::default(),
+            pending: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            wake: Arc::new(Notify::new()),
+        };
+        this.spawn_batcher();
+        this
+    }
+
+    pub fn with_config(storage: Arc<RetriedStorage<Storage>>, cfg: PollCoalescingConfig) -> Self {
+        let this = Self {
+            storage,
+            cfg,
             pending: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             wake: Arc::new(Notify::new()),
         };
@@ -183,5 +208,37 @@ impl PollCoalescer {
             Ok(res) => res,
             Err(_canceled) => Ok(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn config(&self) -> PollCoalescingConfig {
+        self.cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn with_config_sets_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(RetriedStorage::new(Storage::new(dir.path()).unwrap()));
+        let cfg = PollCoalescingConfig::new(10, 100, 5);
+        let c = PollCoalescer::with_config(Arc::clone(&storage), cfg);
+        let got = c.config();
+        assert_eq!(got.max_batch_size, 10);
+        assert_eq!(got.max_batch_items, 100);
+        assert_eq!(got.batch_window_ms, 5);
+    }
+
+    #[tokio::test]
+    async fn default_config_is_reasonable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(RetriedStorage::new(Storage::new(dir.path()).unwrap()));
+        let c = PollCoalescer::new(storage);
+        let got = c.config();
+        assert!(got.max_batch_size >= 1);
+        assert!(got.max_batch_items >= 1);
     }
 }
