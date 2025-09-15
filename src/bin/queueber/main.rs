@@ -38,17 +38,17 @@ struct Args {
     #[arg(long = "workers")]
     workers: Option<usize>,
 
-    /// Max concurrent poll requests batched per DB call (default: 64)
-    #[arg(long = "coalesce-max-batch-size")]
-    coalesce_max_batch_size: Option<usize>,
+    /// Max concurrent poll requests batched per DB call
+    #[arg(long = "coalesce-max-batch-size", default_value_t = PollCoalescingConfig::DEFAULT_MAX_BATCH_SIZE)]
+    coalesce_max_batch_size: usize,
 
-    /// Max total items returned per batched DB call (default: 512)
-    #[arg(long = "coalesce-max-batch-items")]
-    coalesce_max_batch_items: Option<usize>,
+    /// Max total items returned per batched DB call
+    #[arg(long = "coalesce-max-batch-items", default_value_t = PollCoalescingConfig::DEFAULT_MAX_BATCH_ITEMS)]
+    coalesce_max_batch_items: usize,
 
-    /// Max batching window in milliseconds (default: 1)
-    #[arg(long = "coalesce-batch-window-ms")]
-    coalesce_batch_window_ms: Option<u64>,
+    /// Max batching window in milliseconds
+    #[arg(long = "coalesce-batch-window-ms", default_value_t = PollCoalescingConfig::DEFAULT_BATCH_WINDOW_MS)]
+    coalesce_batch_window_ms: u64,
 }
 
 // NOTE: to use the console you need "RUST_LOG=tokio=trace,runtime=trace"
@@ -104,16 +104,11 @@ async fn main() -> Result<()> {
         let shutdown_tx_cloned = shutdown_tx.clone();
         let mut shutdown_rx_worker = shutdown_rx.clone();
         let addr_for_worker: SocketAddr = addr;
-        let mut coalesce_cfg = PollCoalescingConfig::default();
-        if let Some(v) = args.coalesce_max_batch_size {
-            coalesce_cfg.max_batch_size = v;
-        }
-        if let Some(v) = args.coalesce_max_batch_items {
-            coalesce_cfg.max_batch_items = v;
-        }
-        if let Some(v) = args.coalesce_batch_window_ms {
-            coalesce_cfg.batch_window_ms = v;
-        }
+        let coalesce_cfg = PollCoalescingConfig::new(
+            args.coalesce_max_batch_size,
+            args.coalesce_max_batch_items,
+            args.coalesce_batch_window_ms,
+        );
 
         let thread_name = format!("rpc-worker-{}", i);
         let handle = std::thread::Builder::new()

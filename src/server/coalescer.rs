@@ -20,22 +20,26 @@ pub struct PollCoalescingConfig {
     pub batch_window_ms: u64,
 }
 
-impl Default for PollCoalescingConfig {
-    fn default() -> Self {
-        Self {
-            max_batch_size: 64,
-            max_batch_items: 512,
-            batch_window_ms: 1,
-        }
-    }
-}
-
 impl PollCoalescingConfig {
+    pub const DEFAULT_MAX_BATCH_SIZE: usize = 64;
+    pub const DEFAULT_MAX_BATCH_ITEMS: usize = 512;
+    pub const DEFAULT_BATCH_WINDOW_MS: u64 = 1;
+
     pub fn new(max_batch_size: usize, max_batch_items: usize, batch_window_ms: u64) -> Self {
         Self {
             max_batch_size,
             max_batch_items,
             batch_window_ms,
+        }
+    }
+}
+
+impl Default for PollCoalescingConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: Self::DEFAULT_MAX_BATCH_SIZE,
+            max_batch_items: Self::DEFAULT_MAX_BATCH_ITEMS,
+            batch_window_ms: Self::DEFAULT_BATCH_WINDOW_MS,
         }
     }
 }
