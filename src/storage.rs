@@ -71,6 +71,7 @@ impl Storage {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        db_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
 
         // Prefix extractor: treat the namespace segment up to and including the first '/'
         // as the prefix across our keyspaces.
