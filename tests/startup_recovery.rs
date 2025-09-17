@@ -27,7 +27,7 @@ fn storage_durability_reopen_persists_available_items() {
     // Reopen and verify items are still present
     let storage = Storage::new(tmp.path()).expect("storage reopen");
     let (_lease, items) = storage
-        .get_next_available_entries(2)
+        .get_next_available_entries_with_lease(2, 30)
         .expect("poll after reopen");
     assert_eq!(items.len(), 2, "expected two items after reopen");
 }

@@ -169,7 +169,9 @@ fn bench_remove_messages(c: &mut Criterion) {
                         .expect("add_available_item");
                 }
 
-                let (lease, polled) = storage.get_next_available_entries(num_items).expect("poll");
+                let (lease, polled) = storage
+                    .get_next_available_entries_with_lease(num_items, 30)
+                    .expect("poll");
 
                 let mut ids: Vec<Vec<u8>> = Vec::with_capacity(polled.len());
                 for typed in polled.into_iter() {
@@ -223,7 +225,7 @@ fn bench_poll_messages_storage(c: &mut Criterion) {
             },
             |(_dir, storage)| {
                 let res = storage
-                    .get_next_available_entries(num_items)
+                    .get_next_available_entries_with_lease(num_items, 30)
                     .map(|(lease, items)| {
                         if !items.is_empty() {
                             lease_tracker::record_lease(&lease);

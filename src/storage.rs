@@ -238,15 +238,6 @@ impl Storage {
         }
     }
 
-    // used in tests only
-    pub fn get_next_available_entries(
-        &self,
-        n: usize,
-    ) -> Result<(Lease, Vec<PolledItemOwnedReader>)> {
-        // default lease validity of 30 seconds for callers that don't provide it
-        self.get_next_available_entries_with_lease(n, 30)
-    }
-
     pub fn get_next_available_entries_with_lease(
         &self,
         n: usize,
@@ -994,10 +985,11 @@ impl RetriedStorage<Storage> {
         with_rocksdb_busy_retry_async("get_next_available_entries", || {
             let inner_ref = std::sync::Arc::clone(&inner);
             async move {
-                let out =
-                    tokio::task::spawn_blocking(move || inner_ref.get_next_available_entries(n))
-                        .await
-                        .map_err(Into::<Error>::into)??;
+                let out = tokio::task::spawn_blocking(move || {
+                    inner_ref.get_next_available_entries_with_lease(n, 30)
+                })
+                .await
+                .map_err(Into::<Error>::into)??;
                 Ok(out)
             }
         })
@@ -1171,7 +1163,7 @@ mod tests {
         let mut message = Builder::new_default();
         let item = make_item(&mut message);
         storage.add_available_item((b"42", item)).unwrap();
-        let (lease, entries) = storage.get_next_available_entries(1)?;
+        let (lease, entries) = storage.get_next_available_entries_with_lease(1, 30)?;
         assert!(!lease.iter().all(|b| *b == 0));
         assert_eq!(entries.len(), 1);
         let si = entries[0].get()?;
@@ -1219,7 +1211,7 @@ mod tests {
         storage.add_available_item((b"id2", item2)).unwrap();
 
         // poll two items
-        let (lease, entries) = storage.get_next_available_entries(2)?;
+        let (lease, entries) = storage.get_next_available_entries_with_lease(2, 30)?;
         assert!(!lease.iter().all(|b| *b == 0));
         assert_eq!(entries.len(), 2);
 
@@ -1317,7 +1309,7 @@ mod tests {
         storage.add_available_item((b"id2", item2)).unwrap();
 
         // poll both
-        let (lease, entries) = storage.get_next_available_entries(2)?;
+        let (lease, entries) = storage.get_next_available_entries_with_lease(2, 30)?;
         assert_eq!(entries.len(), 2);
 
         // remove id1 under the lease
@@ -1383,7 +1375,7 @@ mod tests {
         let mut msg = Builder::new_default();
         let item = make_item(&mut msg);
         storage.add_available_item((b"only", item)).unwrap();
-        let (lease, entries) = storage.get_next_available_entries(1)?;
+        let (lease, entries) = storage.get_next_available_entries_with_lease(1, 30)?;
         assert_eq!(entries.len(), 1);
 
         // remove under lease
@@ -1430,7 +1422,7 @@ mod tests {
         let mut msg = Builder::new_default();
         let item = make_item(&mut msg);
         storage.add_available_item((b"only", item)).unwrap();
-        let (lease, entries) = storage.get_next_available_entries(1)?;
+        let (lease, entries) = storage.get_next_available_entries_with_lease(1, 30)?;
         assert_eq!(entries.len(), 1);
 
         // attempt removal with a different lease (non-existent)
@@ -1690,7 +1682,7 @@ mod tests {
         storage.add_available_item((id, item)).unwrap();
 
         // Poll should return no items yet
-        let (_lease, entries) = storage.get_next_available_entries(1)?;
+        let (_lease, entries) = storage.get_next_available_entries_with_lease(1, 30)?;
         assert_eq!(entries.len(), 0);
 
         // The item should still be in available, not in in_progress, and its index should remain
@@ -1778,7 +1770,7 @@ mod tests {
 
         tracing::debug!("getting next available entries");
         let total = (writers * per_writer) as usize;
-        let (_lease, items) = storage.get_next_available_entries(total)?;
+        let (_lease, items) = storage.get_next_available_entries_with_lease(total, 30)?;
         assert_eq!(items.len(), total);
 
         Ok(())
@@ -1801,7 +1793,7 @@ mod tests {
         let n = storage.expire_due_leases()?;
         assert!(n >= 1);
 
-        let (_lease2, items2) = storage.get_next_available_entries(1)?;
+        let (_lease2, items2) = storage.get_next_available_entries_with_lease(1, 30)?;
         assert_eq!(items2.len(), 1);
         Ok(())
     }
@@ -2026,7 +2018,7 @@ mod tests {
         }
 
         // poll three items into one lease
-        let (lease, entries) = storage.get_next_available_entries(3)?;
+        let (lease, entries) = storage.get_next_available_entries_with_lease(3, 30)?;
         assert_eq!(entries.len(), 3);
 
         // read lease entry directly
