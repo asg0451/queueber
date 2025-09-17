@@ -359,6 +359,11 @@ impl Storage {
 
         // Stage 3: decode, build response items, and move entries to in_progress within the txn.
         let mut polled_items = Vec::with_capacity(fetched_values.len().min(n));
+        let mut lease_entry_bs = Vec::with_capacity(
+            (LEASE_NUM_BYTES
+                + (InProgressKey::PREFIX.len() + LIKELY_ID_NUM_BYTES) * locked_pairs.len())
+            .min(1024),
+        );
         for (i, (idx_key, main_key)) in locked_pairs.into_iter().enumerate() {
             if polled_items.len() >= n {
                 break;
@@ -411,7 +416,7 @@ impl Storage {
             lease_expiry_index_key.as_bytes(),
             &polled_items,
         )?;
-        let mut lease_entry_bs = Vec::with_capacity(lease_entry.size_in_words() * 8); // TODO: avoid allocation
+        lease_entry_bs.clear();
         serialize::write_message(&mut lease_entry_bs, &lease_entry)?;
 
         // Write the lease entry and its expiry index
@@ -755,7 +760,9 @@ impl Storage {
 }
 
 /// uuidv7 bytes
-type Lease = [u8; 16];
+const LEASE_NUM_BYTES: usize = 16;
+const LIKELY_ID_NUM_BYTES: usize = 16; // IDs are uuidv7s even though it's not clear here. shouldnt be used for correctness
+type Lease = [u8; LEASE_NUM_BYTES];
 
 type PolledItemOwnedReader =
     TypedReader<capnp::message::Builder<message::HeapAllocator>, protocol::polled_item::Owned>;
@@ -1426,7 +1433,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
 
         // attempt removal with a different lease (non-existent)
-        let wrong_lease: [u8; 16] = Uuid::now_v7().into_bytes();
+        let wrong_lease: Lease = Uuid::now_v7().into_bytes();
         assert_ne!(lease, wrong_lease);
         let removed = storage.remove_in_progress_item(b"only", &wrong_lease)?;
         assert!(!removed);
