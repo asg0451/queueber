@@ -796,6 +796,11 @@ fn build_lease_entry_message(
 }
 
 // Retry wrapper that composes busy-retry behavior around a `Storage` instance.
+struct RetryState<O> {
+    attempt: u32,
+    owned: Option<O>,
+}
+
 pub struct RetriedStorage<S> {
     inner: std::sync::Arc<S>,
 }
@@ -813,30 +818,54 @@ impl RetriedStorage<Storage> {
 }
 
 impl RetriedStorage<Storage> {
+    async fn run_blocking_on_pool<T: Send + 'static>(
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let res: Result<T> = tokio::task::spawn_blocking(f)
+            .await
+            .map_err(Into::<Error>::into)?;
+        res
+    }
+
+    async fn busy_retry_with_state<T, O, Fut, F>(
+        name: &str,
+        state: std::sync::Arc<std::sync::Mutex<RetryState<O>>>,
+        f: F,
+    ) -> Result<T>
+    where
+        O: Send,
+        T: Send,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+        F: Fn(std::sync::Arc<std::sync::Mutex<RetryState<O>>>) -> Fut + Send + Sync + Clone,
+    {
+        let state_ref = std::sync::Arc::clone(&state);
+        let f_outer = f.clone();
+        with_rocksdb_busy_retry_async(name, move || {
+            let state_inner = std::sync::Arc::clone(&state_ref);
+            let f_cloned = f_outer.clone();
+            async move { f_cloned(state_inner).await }
+        })
+        .await
+    }
+
     pub async fn add_available_item_from_parts(
         &self,
         id: &[u8],
         contents: &[u8],
         visibility_timeout_secs: u64,
     ) -> Result<()> {
+        type Owned = (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>);
         let inner = std::sync::Arc::clone(&self.inner);
-
-        type OwnedBuffers = (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>);
-        struct State {
-            attempt: u32,
-            owned: Option<OwnedBuffers>,
-        }
-        let state = std::sync::Arc::new(std::sync::Mutex::new(State {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(RetryState::<Owned> {
             attempt: 0,
             owned: None,
         }));
 
-        with_rocksdb_busy_retry_async("add_available_item_from_parts", || {
+        Self::busy_retry_with_state("add_available_item_from_parts", state.clone(), move |st| {
             let inner_ref = std::sync::Arc::clone(&inner);
-            let state_ref = std::sync::Arc::clone(&state);
             async move {
                 {
-                    let mut guard = state_ref.lock().unwrap();
+                    let mut guard = st.lock().unwrap();
                     if guard.attempt > 0 && guard.owned.is_none() {
                         guard.owned = Some((
                             std::sync::Arc::<[u8]>::from(id.to_vec()),
@@ -844,48 +873,27 @@ impl RetriedStorage<Storage> {
                         ));
                     }
                 }
-                if let Some((id_arc, contents_arc)) = {
-                    let guard = state_ref.lock().unwrap();
-                    guard.owned.as_ref().cloned()
-                } {
-                    tokio::task::spawn_blocking(move || {
+
+                let res = if let Some(owned) = { st.lock().unwrap().owned.as_ref().cloned() } {
+                    Self::run_blocking_on_pool(move || {
                         inner_ref.add_available_item_from_parts(
-                            &id_arc,
-                            &contents_arc,
+                            &owned.0,
+                            &owned.1,
                             visibility_timeout_secs,
                         )
                     })
                     .await
-                    .map_err(Into::<Error>::into)??;
-                    let mut guard = state_ref.lock().unwrap();
-                    guard.attempt = guard.attempt.saturating_add(1);
-                    Ok(())
                 } else {
-                    // First attempt: zero-copy direct or block_in_place depending on runtime
-                    let res = match tokio::runtime::Handle::try_current() {
-                        Ok(handle)
-                            if handle.runtime_flavor()
-                                == tokio::runtime::RuntimeFlavor::CurrentThread =>
-                        {
-                            inner_ref.add_available_item_from_parts(
-                                id,
-                                contents,
-                                visibility_timeout_secs,
-                            )
-                        }
-                        _ => tokio::task::block_in_place(move || {
-                            inner_ref.add_available_item_from_parts(
-                                id,
-                                contents,
-                                visibility_timeout_secs,
-                            )
-                        }),
-                    };
-                    // Increment attempt after finishing
-                    let mut guard = state_ref.lock().unwrap();
-                    guard.attempt = guard.attempt.saturating_add(1);
-                    res.map(|_| ())
+                    inner_ref
+                        .add_available_item_from_parts(id, contents, visibility_timeout_secs)
+                        .map(|_| ())
+                };
+
+                {
+                    let mut g = st.lock().unwrap();
+                    g.attempt = g.attempt.saturating_add(1);
                 }
+                res
             }
         })
         .await
@@ -902,22 +910,18 @@ impl RetriedStorage<Storage> {
         let inner = std::sync::Arc::clone(&self.inner);
         let borrowed_arc = std::sync::Arc::new(borrowed);
 
-        struct State {
-            attempt: u32,
-            owned: Option<std::sync::Arc<Vec<OwnedItem>>>,
-        }
-        let state = std::sync::Arc::new(std::sync::Mutex::new(State {
+        type Owned = std::sync::Arc<Vec<OwnedItem>>;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(RetryState::<Owned> {
             attempt: 0,
             owned: None,
         }));
 
-        with_rocksdb_busy_retry_async("add_available_items_from_parts", || {
+        Self::busy_retry_with_state("add_available_items_from_parts", state.clone(), move |st| {
             let inner_ref = std::sync::Arc::clone(&inner);
-            let state_ref = std::sync::Arc::clone(&state);
             let borrowed_ref = std::sync::Arc::clone(&borrowed_arc);
             async move {
                 {
-                    let mut guard = state_ref.lock().unwrap();
+                    let mut guard = st.lock().unwrap();
                     if guard.attempt > 0 && guard.owned.is_none() {
                         let owned_vec: Vec<OwnedItem> = borrowed_ref
                             .iter()
@@ -932,40 +936,26 @@ impl RetriedStorage<Storage> {
                     }
                 }
 
-                if let Some(owned_ref) = { state_ref.lock().unwrap().owned.as_ref().cloned() } {
-                    tokio::task::spawn_blocking(move || {
+                let res = if let Some(owned_ref) = { st.lock().unwrap().owned.as_ref().cloned() } {
+                    Self::run_blocking_on_pool(move || {
                         let iter = owned_ref
                             .iter()
                             .map(|(id, (c, v))| (id.as_ref(), (c.as_ref(), *v)));
                         inner_ref.add_available_items_from_parts(iter)
                     })
                     .await
-                    .map_err(Into::<Error>::into)??;
-                    let mut guard = state_ref.lock().unwrap();
-                    guard.attempt = guard.attempt.saturating_add(1);
-                    Ok(())
                 } else {
-                    let res = match tokio::runtime::Handle::try_current() {
-                        Ok(handle)
-                            if handle.runtime_flavor()
-                                == tokio::runtime::RuntimeFlavor::CurrentThread =>
-                        {
-                            let iter = borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
-                            inner_ref.add_available_items_from_parts(iter)
-                        }
-                        _ => {
-                            let borrowed_ref = std::sync::Arc::clone(&borrowed_ref);
-                            tokio::task::block_in_place(move || {
-                                let iter =
-                                    borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
-                                inner_ref.add_available_items_from_parts(iter)
-                            })
-                        }
-                    };
-                    let mut guard = state_ref.lock().unwrap();
-                    guard.attempt = guard.attempt.saturating_add(1);
-                    res.map(|_| ())
+                    let iter = borrowed_ref.iter().map(|(id, (c, v))| ((*id), ((*c), *v)));
+                    inner_ref
+                        .add_available_items_from_parts(iter)
+                        .map(|_| ())
+                };
+
+                {
+                    let mut g = st.lock().unwrap();
+                    g.attempt = g.attempt.saturating_add(1);
                 }
+                res
             }
         })
         .await
@@ -1025,54 +1015,38 @@ impl RetriedStorage<Storage> {
     }
 
     pub async fn remove_in_progress_item(&self, id: &[u8], lease: &Lease) -> Result<bool> {
+        type Owned = std::sync::Arc<[u8]>;
         let lease_copy = *lease;
         let inner = std::sync::Arc::clone(&self.inner);
-
-        struct State {
-            attempt: u32,
-            owned_id: Option<std::sync::Arc<[u8]>>,
-        }
-        let state = std::sync::Arc::new(std::sync::Mutex::new(State {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(RetryState::<Owned> {
             attempt: 0,
-            owned_id: None,
+            owned: None,
         }));
 
-        with_rocksdb_busy_retry_async("remove_in_progress_item", || {
+        Self::busy_retry_with_state("remove_in_progress_item", state.clone(), move |st| {
             let inner_ref = std::sync::Arc::clone(&inner);
-            let state_ref = std::sync::Arc::clone(&state);
             async move {
                 {
-                    let mut guard = state_ref.lock().unwrap();
-                    if guard.attempt > 0 && guard.owned_id.is_none() {
-                        guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id.to_vec()));
+                    let mut guard = st.lock().unwrap();
+                    if guard.attempt > 0 && guard.owned.is_none() {
+                        guard.owned = Some(std::sync::Arc::<[u8]>::from(id.to_vec()));
                     }
                 }
 
-                if let Some(id_arc) = { state_ref.lock().unwrap().owned_id.as_ref().cloned() } {
-                    let out = tokio::task::spawn_blocking(move || {
+                let out = if let Some(id_arc) = { st.lock().unwrap().owned.as_ref().cloned() } {
+                    Self::run_blocking_on_pool(move || {
                         inner_ref.remove_in_progress_item(&id_arc, &lease_copy)
                     })
-                    .await
-                    .map_err(Into::<Error>::into)??;
-                    let mut guard = state_ref.lock().unwrap();
-                    guard.attempt = guard.attempt.saturating_add(1);
-                    Ok(out)
+                    .await?
                 } else {
-                    let out = match tokio::runtime::Handle::try_current() {
-                        Ok(handle)
-                            if handle.runtime_flavor()
-                                == tokio::runtime::RuntimeFlavor::CurrentThread =>
-                        {
-                            inner_ref.remove_in_progress_item(id, &lease_copy)
-                        }
-                        _ => tokio::task::block_in_place(move || {
-                            inner_ref.remove_in_progress_item(id, &lease_copy)
-                        }),
-                    }?;
-                    let mut guard = state_ref.lock().unwrap();
-                    guard.attempt = guard.attempt.saturating_add(1);
-                    Ok(out)
+                    inner_ref.remove_in_progress_item(id, &lease_copy)?
+                };
+
+                {
+                    let mut g = st.lock().unwrap();
+                    g.attempt = g.attempt.saturating_add(1);
                 }
+                Ok(out)
             }
         })
         .await
