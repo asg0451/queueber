@@ -12,24 +12,55 @@ use tokio::sync::watch;
 fn storage_durability_reopen_persists_available_items() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    // Open, add items, then drop
-    {
+    let (pre_restart_lease, pre_restart_leased_ids) = {
         let storage = Storage::new(tmp.path()).expect("storage open");
         storage
-            .add_available_item_from_parts(b"id1", b"a", 0)
-            .expect("add 1");
-        storage
-            .add_available_item_from_parts(b"id2", b"b", 0)
-            .expect("add 2");
+            .add_available_items_from_parts(vec![
+                (&b"id1"[..], (&b"a"[..], 0u64)),
+                (&b"id2"[..], (&b"b"[..], 0u64)),
+                (&b"id3"[..], (&b"c"[..], 0u64)),
+                (&b"id4"[..], (&b"d"[..], 0u64)),
+                (&b"id5"[..], (&b"e"[..], 0u64)),
+            ])
+            .expect("batch add");
+
+        // Pre-restart: lease a subset so they become in-progress
+        let (lease, items) = storage
+            .get_next_available_entries_with_lease(3, 30)
+            .expect("pre-restart lease");
+        let leased_ids: Vec<Vec<u8>> = items
+            .iter()
+            .map(|it| it.get().unwrap().get_id().unwrap().to_vec())
+            .collect();
+
         // Drop storage by leaving scope
+        (lease, leased_ids)
+    };
+
+    // Reopen and verify:
+    // 1) leased items are still leased and removable with the same lease
+    // 2) unleased items remain available
+    let storage = Storage::new(tmp.path()).expect("storage reopen");
+    for id in &pre_restart_leased_ids {
+        let removed = storage
+            .remove_in_progress_item(id, &pre_restart_lease)
+            .expect("remove after reopen");
+        assert!(
+            removed,
+            "expected leased id to be removable after reopen: {:?}",
+            std::str::from_utf8(id).unwrap_or("<non-utf8>")
+        );
     }
 
-    // Reopen and verify items are still present
-    let storage = Storage::new(tmp.path()).expect("storage reopen");
-    let (_lease, items) = storage
-        .get_next_available_entries_with_lease(2, 30)
-        .expect("poll after reopen");
-    assert_eq!(items.len(), 2, "expected two items after reopen");
+    // Now only the unleased items should be available (we added 5, leased 3, so expect 2)
+    let (_new_lease, remaining) = storage
+        .get_next_available_entries_with_lease(10, 30)
+        .expect("poll remaining after reopen");
+    assert_eq!(
+        remaining.len(),
+        2,
+        "expected two unleased items after reopen"
+    );
 }
 
 struct TestServerHandle {
