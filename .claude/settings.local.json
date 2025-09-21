@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(mkdir:*)",
-      "Bash(act push:*)"
+      "Bash(act push:*)",
+      "Bash(cargo build:*)",
+      "Bash(./target/debug/client --help)",
+      "Bash(./target/debug/client:*)",
+      "Bash(cargo run:*)"
     ],
     "deny": [],
     "ask": []

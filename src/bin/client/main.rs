@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex, atomic},
     time::Duration,
 };
+use rand::Rng;
 use tokio::{
     runtime::Handle,
     time::{Instant, MissedTickBehavior},
@@ -74,6 +75,55 @@ mod busy_tracker {
                 context, b, t, pct
             );
         }
+    }
+}
+
+// Connection limiter - limits concurrent connections instead of pooling non-Send clients
+struct ConnectionLimiter {
+    semaphore: tokio::sync::Semaphore,
+    addr: SocketAddr,
+}
+
+impl ConnectionLimiter {
+    fn new(addr: SocketAddr, max_concurrent: usize) -> Self {
+        Self {
+            semaphore: tokio::sync::Semaphore::new(max_concurrent),
+            addr,
+        }
+    }
+
+    async fn with_client<F, Fut, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(queue::Client) -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        // Acquire permit to limit concurrent connections
+        let _permit = self.semaphore.acquire().await.map_err(|e| {
+            color_eyre::eyre::eyre!("Failed to acquire connection permit: {}", e)
+        })?;
+
+        // Create client connection
+        let stream = tokio::net::TcpStream::connect(self.addr).await?;
+        stream.set_nodelay(true)?;
+        let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+        let rpc_network = Box::new(twoparty::VatNetwork::new(
+            futures::io::BufReader::new(reader),
+            futures::io::BufWriter::new(writer),
+            rpc_twoparty_capnp::Side::Client,
+            Default::default(),
+        ));
+        let mut rpc_system = RpcSystem::new(rpc_network, None);
+        let queue_client: queue::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
+
+        // Use the LocalSet pattern like the original with_client function
+        Ok(tokio::task::LocalSet::new()
+            .run_until(async move {
+                let _jh = tokio::task::Builder::new()
+                    .name("rpc_system_limited")
+                    .spawn_local(rpc_system);
+                f(queue_client).await
+            })
+            .await)
     }
 }
 
@@ -176,6 +226,39 @@ enum Commands {
         /// How long to run the stress test for (seconds)
         #[arg(short = 'd', long = "duration", default_value_t = 30)]
         duration_secs: u64,
+    },
+    /// Realistic workload simulator with N workers processing M tasks each
+    WorkloadSim {
+        /// Number of concurrent workers
+        #[arg(short = 'w', long = "workers", default_value_t = 4)]
+        workers: u32,
+        /// Maximum tasks each worker polls for at once
+        #[arg(short = 'm', long = "tasks-per-worker", default_value_t = 5)]
+        tasks_per_worker: u32,
+        /// Number of concurrent task producers
+        #[arg(short = 'p', long = "producers", default_value_t = 2)]
+        producers: u32,
+        /// Tasks produced per second per producer
+        #[arg(short = 'r', long = "production-rate", default_value_t = 10)]
+        production_rate: u32,
+        /// Minimum task execution time in milliseconds
+        #[arg(long = "min-exec-time", default_value_t = 100)]
+        min_execution_time_ms: u64,
+        /// Maximum task execution time in milliseconds
+        #[arg(long = "max-exec-time", default_value_t = 2000)]
+        max_execution_time_ms: u64,
+        /// Probability (0.0-1.0) that a worker extends a lease during processing
+        #[arg(long = "extend-prob", default_value_t = 0.3)]
+        extend_probability: f64,
+        /// Probability (0.0-1.0) that a task is allowed to expire
+        #[arg(long = "expiry-prob", default_value_t = 0.05)]
+        expiry_probability: f64,
+        /// How long to run the simulation in seconds
+        #[arg(short = 'd', long = "duration", default_value_t = 60)]
+        duration_secs: u64,
+        /// Lease validity in seconds for polled tasks
+        #[arg(short = 'l', long = "lease-validity", default_value_t = 30)]
+        lease_validity_secs: u64,
     },
 }
 
@@ -526,7 +609,370 @@ async fn main() -> Result<()> {
             }
             busy_tracker::report_and_reset("client-stress");
         }
+        Commands::WorkloadSim {
+            workers,
+            tasks_per_worker,
+            producers,
+            production_rate,
+            min_execution_time_ms,
+            max_execution_time_ms,
+            extend_probability,
+            expiry_probability,
+            duration_secs,
+            lease_validity_secs,
+        } => {
+            run_workload_simulation(
+                addr,
+                workers,
+                tasks_per_worker,
+                producers,
+                production_rate,
+                min_execution_time_ms,
+                max_execution_time_ms,
+                extend_probability,
+                expiry_probability,
+                duration_secs,
+                lease_validity_secs,
+            )
+            .await?;
+        }
     }
+    Ok(())
+}
+
+async fn run_workload_simulation(
+    addr: SocketAddr,
+    workers: u32,
+    tasks_per_worker: u32,
+    producers: u32,
+    production_rate: u32,
+    min_execution_time_ms: u64,
+    max_execution_time_ms: u64,
+    extend_probability: f64,
+    expiry_probability: f64,
+    duration_secs: u64,
+    lease_validity_secs: u64,
+) -> Result<()> {
+    let start_time = Instant::now();
+    let end_time = start_time
+        .checked_add(Duration::from_secs(duration_secs))
+        .unwrap();
+
+    // Shared metrics counters
+    let tasks_produced = Arc::new(atomic::AtomicU64::new(0));
+    let tasks_polled = Arc::new(atomic::AtomicU64::new(0));
+    let tasks_processed = Arc::new(atomic::AtomicU64::new(0));
+    let tasks_removed = Arc::new(atomic::AtomicU64::new(0));
+    let tasks_expired = Arc::new(atomic::AtomicU64::new(0));
+    let leases_extended = Arc::new(atomic::AtomicU64::new(0));
+    let unique_leases: Arc<Mutex<HashSet<[u8; 16]>>> = Arc::new(Mutex::new(HashSet::new()));
+    let execution_time_sum_ms = Arc::new(atomic::AtomicU64::new(0));
+
+    println!(
+        "Starting workload simulation: {} workers (max {} tasks each), {} producers ({} tasks/s each)",
+        workers, tasks_per_worker, producers, production_rate
+    );
+    println!(
+        "Task execution: {}-{}ms, extend prob: {:.1}%, expiry prob: {:.1}%, duration: {}s",
+        min_execution_time_ms,
+        max_execution_time_ms,
+        extend_probability * 100.0,
+        expiry_probability * 100.0,
+        duration_secs
+    );
+
+    // Create separate connection limiters for workers and producers to prevent starvation
+    let total_connections = std::cmp::min(200, (workers + producers) / 4).max(20) as usize;
+    let producer_connections = std::cmp::max(producers as usize, total_connections / 5); // At least 20% or producer count
+    let worker_connections = total_connections - producer_connections;
+
+    let worker_connection_limiter = Arc::new(ConnectionLimiter::new(addr, worker_connections));
+    let producer_connection_limiter = Arc::new(ConnectionLimiter::new(addr, producer_connections));
+
+    println!(
+        "Using connection limiters: {} for workers, {} for producers (total: {})",
+        worker_connections, producer_connections, total_connections
+    );
+
+    // Periodic metrics reporter
+    tokio::task::Builder::new()
+        .name("metrics_reporter")
+        .spawn({
+            let tasks_produced = Arc::clone(&tasks_produced);
+            let tasks_polled = Arc::clone(&tasks_polled);
+            let tasks_processed = Arc::clone(&tasks_processed);
+            let tasks_removed = Arc::clone(&tasks_removed);
+            let tasks_expired = Arc::clone(&tasks_expired);
+            let leases_extended = Arc::clone(&leases_extended);
+            let execution_time_sum_ms = Arc::clone(&execution_time_sum_ms);
+            async move {
+                let mut last_time = Instant::now();
+                while Instant::now() < end_time {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let now = Instant::now();
+                    let produced = tasks_produced.swap(0, atomic::Ordering::Relaxed);
+                    let polled = tasks_polled.swap(0, atomic::Ordering::Relaxed);
+                    let processed = tasks_processed.swap(0, atomic::Ordering::Relaxed);
+                    let removed = tasks_removed.swap(0, atomic::Ordering::Relaxed);
+                    let expired = tasks_expired.swap(0, atomic::Ordering::Relaxed);
+                    let extended = leases_extended.swap(0, atomic::Ordering::Relaxed);
+                    let exec_sum = execution_time_sum_ms.swap(0, atomic::Ordering::Relaxed);
+
+                    let duration = now.duration_since(last_time);
+                    last_time = now;
+                    let secs = duration.as_secs_f64().max(1.0);
+
+                    let avg_exec_time = if processed > 0 { exec_sum / processed } else { 0 };
+
+                    println!(
+                        "produced: {} ({:.1}/s), polled: {} ({:.1}/s), processed: {} ({:.1}/s), removed: {} ({:.1}/s), expired: {} ({:.1}/s), extended: {} ({:.1}/s), avg exec: {}ms",
+                        produced, produced as f64 / secs,
+                        polled, polled as f64 / secs,
+                        processed, processed as f64 / secs,
+                        removed, removed as f64 / secs,
+                        expired, expired as f64 / secs,
+                        extended, extended as f64 / secs,
+                        avg_exec_time
+                    );
+                }
+            }
+        })
+        .unwrap();
+
+    // Use LocalSet with local tasks to support 10k+ workers without OS thread limits
+    let local_set = tokio::task::LocalSet::new();
+
+    // Clone all Arc references before moving them into the async closure
+    let tasks_produced_clone = Arc::clone(&tasks_produced);
+    let tasks_polled_clone = Arc::clone(&tasks_polled);
+    let tasks_processed_clone = Arc::clone(&tasks_processed);
+    let tasks_removed_clone = Arc::clone(&tasks_removed);
+    let tasks_expired_clone = Arc::clone(&tasks_expired);
+    let leases_extended_clone = Arc::clone(&leases_extended);
+    let unique_leases_clone = Arc::clone(&unique_leases);
+    let execution_time_sum_ms_clone = Arc::clone(&execution_time_sum_ms);
+
+    local_set.run_until(async move {
+        let mut worker_tasks = Vec::new();
+
+        // Spawn local worker tasks
+        for worker_id in 0..workers {
+            let tasks_polled = Arc::clone(&tasks_polled_clone);
+            let tasks_processed = Arc::clone(&tasks_processed_clone);
+            let tasks_removed = Arc::clone(&tasks_removed_clone);
+            let tasks_expired = Arc::clone(&tasks_expired_clone);
+            let leases_extended = Arc::clone(&leases_extended_clone);
+            let unique_leases = Arc::clone(&unique_leases_clone);
+            let execution_time_sum_ms = Arc::clone(&execution_time_sum_ms_clone);
+            let worker_connection_limiter = Arc::clone(&worker_connection_limiter);
+
+            let worker_task = tokio::task::Builder::new()
+                .name(&format!("worker_{}", worker_id))
+                .spawn_local(async move {
+                    while Instant::now() < end_time {
+                        let tasks_polled = Arc::clone(&tasks_polled);
+                        let tasks_expired = Arc::clone(&tasks_expired);
+                        let leases_extended = Arc::clone(&leases_extended);
+                        let tasks_processed = Arc::clone(&tasks_processed);
+                        let execution_time_sum_ms = Arc::clone(&execution_time_sum_ms);
+                        let tasks_removed = Arc::clone(&tasks_removed);
+                        let unique_leases = Arc::clone(&unique_leases);
+
+                        let _ = worker_connection_limiter
+                            .with_client(|queue_client| async move {
+                                let mut rng = rand::thread_rng();
+                                let poll_result: Result<(), capnp::Error> = async {
+                                    // Poll for tasks
+                                    let mut request = queue_client.poll_request();
+                                    let mut req = request.get().init_req();
+                                    req.set_lease_validity_secs(lease_validity_secs);
+                                    req.set_num_items(tasks_per_worker);
+                                    req.set_timeout_secs(5); // Wait up to 5 seconds for tasks
+
+                                    let reply = request.send().promise.await?;
+                                    let resp = reply.get()?.get_resp()?;
+                                    let items = resp.get_items()?;
+                                    let lease = resp.get_lease()?;
+
+                                    if items.is_empty() {
+                                        // No tasks available, continue polling
+                                        return Ok(());
+                                    }
+
+                                    tasks_polled.fetch_add(items.len() as u64, atomic::Ordering::Relaxed);
+
+                                    // Track unique leases
+                                    if lease.len() == 16 {
+                                        let mut lease_arr = [0u8; 16];
+                                        lease_arr.copy_from_slice(lease);
+                                        if let Ok(mut s) = unique_leases.lock() {
+                                            s.insert(lease_arr);
+                                        }
+                                    }
+
+                                    // Process each task
+                                    for item in items.iter() {
+                                        let item_id = item.get_id()?;
+                                        let _contents = item.get_contents()?;
+
+                                        // Decide if this task should expire
+                                        if rng.gen_range(0.0..1.0) < expiry_probability {
+                                            // Let this task expire - don't process or remove it
+                                            tasks_expired.fetch_add(1, atomic::Ordering::Relaxed);
+                                            continue;
+                                        }
+
+                                        // Simulate task processing time
+                                        let exec_time_ms = rng.gen_range(min_execution_time_ms..=max_execution_time_ms);
+                                        let exec_duration = Duration::from_millis(exec_time_ms);
+
+                                        // Start processing
+                                        let process_start = Instant::now();
+
+                                        // Check if we should extend the lease during processing
+                                        let should_extend = rng.gen_range(0.0..1.0) < extend_probability;
+                                        let extend_at = if should_extend {
+                                            Some(process_start.checked_add(exec_duration / 2).unwrap())
+                                        } else {
+                                            None
+                                        };
+
+                                        // Simulate processing with potential lease extension
+                                        while process_start.elapsed() < exec_duration {
+                                            if let Some(extend_time) = extend_at {
+                                                if Instant::now() >= extend_time {
+                                                    // Extend the lease
+                                                    let mut extend_request = queue_client.extend_request();
+                                                    let mut extend_req = extend_request.get().init_req();
+                                                    extend_req.set_lease(lease);
+                                                    extend_req.set_lease_validity_secs(lease_validity_secs);
+
+                                                    let res = extend_request.send().promise.await.map(|_| ());
+                                                    let _ = busy_tracker::track_and_ignore_busy_error(res);
+                                                    leases_extended.fetch_add(1, atomic::Ordering::Relaxed);
+                                                    break; // Only extend once
+                                                }
+                                            }
+
+                                            // Small sleep to simulate work
+                                            tokio::time::sleep(Duration::from_millis(50)).await;
+                                        }
+
+                                        tasks_processed.fetch_add(1, atomic::Ordering::Relaxed);
+                                        execution_time_sum_ms.fetch_add(exec_time_ms, atomic::Ordering::Relaxed);
+
+                                        // Remove the completed task
+                                        let mut remove_request = queue_client.remove_request();
+                                        let mut remove_req = remove_request.get().init_req();
+                                        remove_req.set_id(item_id);
+                                        remove_req.set_lease(lease);
+
+                                        let res = remove_request.send().promise.await.map(|_| ());
+                                        let _ = busy_tracker::track_and_ignore_busy_error(res);
+                                        tasks_removed.fetch_add(1, atomic::Ordering::Relaxed);
+                                    }
+
+                                    Ok(())
+                                }.await;
+
+                                let _ = busy_tracker::track_and_ignore_busy_error(poll_result);
+                                Ok::<(), Box<dyn std::error::Error>>(())
+                            })
+                            .await;
+                    }
+                });
+
+            worker_tasks.push(worker_task);
+        }
+
+        // Spawn local producer tasks
+        let mut producer_tasks = Vec::new();
+        for producer_id in 0..producers {
+            let tasks_produced = Arc::clone(&tasks_produced_clone);
+            let producer_connection_limiter = Arc::clone(&producer_connection_limiter);
+
+            let producer_task = tokio::task::Builder::new()
+                .name(&format!("producer_{}", producer_id))
+                .spawn_local(async move {
+                    let batch_size: u32 = 10;
+                    let mut ticker = compute_batch_interval(production_rate, batch_size)
+                        .map(tokio::time::interval);
+                    if let Some(ref mut t) = ticker {
+                        t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    }
+
+                    while Instant::now() < end_time {
+                        if let Some(t) = &mut ticker {
+                            t.tick().await;
+                        }
+
+                        let tasks_produced = Arc::clone(&tasks_produced);
+                        let _ = producer_connection_limiter
+                            .with_client(|queue_client| async move {
+                                let mut request = queue_client.add_request();
+                                let req = request.get().init_req();
+                                let mut items = req.init_items(batch_size);
+
+                                for i in 0..batch_size as usize {
+                                    let mut item = items.reborrow().get(i as u32);
+                                    item.set_contents(format!("workload_task_{}", i).as_bytes());
+                                    item.set_visibility_timeout_secs(5); // 5 second initial visibility timeout
+                                }
+
+                                let res = request.send().promise.await.map(|_| ());
+                                let _ = busy_tracker::track_and_ignore_busy_error(res);
+                                tasks_produced.fetch_add(batch_size as u64, atomic::Ordering::Relaxed);
+
+                                Ok::<(), Box<dyn std::error::Error>>(())
+                            })
+                            .await;
+                    }
+                });
+
+            producer_tasks.push(producer_task);
+        }
+
+        // Wait for all tasks to complete
+        for task in worker_tasks {
+            if let Ok(handle) = task {
+                let _ = handle.await;
+            }
+        }
+        for task in producer_tasks {
+            if let Ok(handle) = task {
+                let _ = handle.await;
+            }
+        }
+    }).await;
+
+    println!("Workload simulation completed");
+
+    // Final report
+    if let Ok(s) = unique_leases.lock() {
+        println!("Unique leases observed: {}", s.len());
+    }
+
+    // Final metrics (may have some remaining counts)
+    let final_produced = tasks_produced.load(atomic::Ordering::Relaxed);
+    let final_polled = tasks_polled.load(atomic::Ordering::Relaxed);
+    let final_processed = tasks_processed.load(atomic::Ordering::Relaxed);
+    let final_removed = tasks_removed.load(atomic::Ordering::Relaxed);
+    let final_expired = tasks_expired.load(atomic::Ordering::Relaxed);
+    let final_extended = leases_extended.load(atomic::Ordering::Relaxed);
+    let final_exec_sum = execution_time_sum_ms.load(atomic::Ordering::Relaxed);
+
+    let final_avg_exec = if final_processed > 0 { final_exec_sum / final_processed } else { 0 };
+
+    println!("Final totals:");
+    println!("  Tasks produced: {}", final_produced);
+    println!("  Tasks polled: {}", final_polled);
+    println!("  Tasks processed: {}", final_processed);
+    println!("  Tasks removed: {}", final_removed);
+    println!("  Tasks expired: {}", final_expired);
+    println!("  Leases extended: {}", final_extended);
+    println!("  Average execution time: {}ms", final_avg_exec);
+
+    busy_tracker::report_and_reset("workload-simulation");
     Ok(())
 }
 
