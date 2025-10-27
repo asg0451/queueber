@@ -24,6 +24,7 @@ console-subscriber = "0.4"
 uuid = { version = "1.18.0", features = ["std", "v4", "v7", "zerocopy"] }
 rand = "0.8"
 socket2 = "0.5"
+smallvec = { version = "1.13" }
 
 [build-dependencies]
 capnpc = "0.21.2"
