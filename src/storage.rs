@@ -837,8 +837,8 @@ impl RetriedStorage<Storage> {
                     let mut guard = state_ref.lock().unwrap();
                     if guard.attempt > 0 && guard.owned.is_none() {
                         guard.owned = Some((
-                            std::sync::Arc::<[u8]>::from(id.to_vec()),
-                            std::sync::Arc::<[u8]>::from(contents.to_vec()),
+                            std::sync::Arc::<[u8]>::from(id),
+                            std::sync::Arc::<[u8]>::from(contents),
                         ));
                     }
                 }
@@ -1043,7 +1043,7 @@ impl RetriedStorage<Storage> {
                 {
                     let mut guard = state_ref.lock().unwrap();
                     if guard.attempt > 0 && guard.owned_id.is_none() {
-                        guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id.to_vec()));
+                        guard.owned_id = Some(std::sync::Arc::<[u8]>::from(id));
                     }
                 }
 
