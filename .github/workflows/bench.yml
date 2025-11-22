@@ -119,7 +119,7 @@ jobs:
 
       - name: Download latest master benchmark artifact
         if: github.event_name == 'pull_request'
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
           workflow: bench.yml
